@@ -1,0 +1,12 @@
+
+services:
+  migrate:
+    build: !reset null
+  agent-computer:
+    build: !reset null
+  supervisor:
+    build: !reset null
+  agent-bot:
+    build: !reset null
+  agent-langgraph:
+    build: !reset null
