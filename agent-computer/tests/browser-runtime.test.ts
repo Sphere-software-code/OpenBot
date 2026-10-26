@@ -44,6 +44,32 @@ describe("the configured browser runtime", () => {
     },
   );
 
+  test("kernel attaches to a browser per Bot and starts no display", () => {
+    expect(
+      browserRuntimeFromEnv(
+        {
+          COMPUTER_BROWSER_BACKEND: "kernel",
+          // The supervisor forwards this to every computer; it must not be read as a contradiction.
+          COMPUTER_BROWSER_MODE: "headless",
+        },
+        "linux",
+      ),
+    ).toEqual({
+      backend: "kernel",
+      channel: "chromium",
+      mode: "headed",
+      useVirtualDisplay: false,
+      allowExec: true,
+      cdpUrl: "http://kernel-{bot}:9222",
+    });
+    expect(
+      browserRuntimeFromEnv({
+        COMPUTER_BROWSER_BACKEND: "kernel",
+        COMPUTER_KERNEL_CDP_URL: "http://browsers:9222",
+      }).cdpUrl,
+    ).toBe("http://browsers:9222");
+  });
+
   test("rejects unknown backends and incompatible local modes", () => {
     expect(() =>
       browserRuntimeFromEnv({ COMPUTER_BROWSER_BACKEND: "cdp" }),

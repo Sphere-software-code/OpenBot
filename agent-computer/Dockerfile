@@ -3,7 +3,9 @@
 # The image tag and Playwright dependency must be pinned to the same exact version. Bump both or
 # neither.
 FROM node:24.18.1-bookworm-slim AS node-toolchain
-FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS bun-toolchain
+# At least 1.4: under 1.3.14 Playwright's `connectOverCDP` never completes its WebSocket handshake
+# (the server answers 101 and Bun does not hand the upgrade over), and the kernel backend is that call.
+FROM oven/bun:1.4.3@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7b48be39c598 AS bun-toolchain
 
 FROM ubuntu:24.04
 
@@ -35,6 +37,12 @@ COPY shared/file-download.ts /shared/file-download.ts
 # Durable working directory. Bot-produced files that must survive replacement live here.
 RUN mkdir -p /workspace
 ENV WORKSPACE_DIR=/workspace
+
+# Which browser this computer drives: `managed` starts Chromium here, `kernel` attaches over CDP to a
+# kernel container per Bot (see src/browser-runtime.ts). Chosen at build time because the supervisor
+# forwards a fixed set of settings to the computers it creates, and this is not one of them.
+ARG COMPUTER_BROWSER_BACKEND=managed
+ENV COMPUTER_BROWSER_BACKEND=${COMPUTER_BROWSER_BACKEND}
 
 ENV PORT=4100
 EXPOSE 4100

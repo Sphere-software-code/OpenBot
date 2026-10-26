@@ -39,7 +39,7 @@ import { type BrowserContext, chromium, type Page } from "playwright";
 import { profileDirectoryFor } from "./bot-id";
 import { chooseEvictions, chooseIdle } from "./browser-eviction";
 import { browserRuntimeFromEnv } from "./browser-runtime";
-import { egressFor, egressLabel } from "./egress";
+import { egressFor, egressLabel, egressPolicyFor, upstreamFor } from "./egress";
 import { numberFromEnv, settleWithin } from "./env";
 import { chooseLivePage } from "./live-page";
 import { botIdsIn } from "./profile-listing";
@@ -97,6 +97,11 @@ const SINGLETON_FILES = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
  */
 const BROWSER_RUNTIME = browserRuntimeFromEnv(process.env);
 const LOCAL_CHROME = BROWSER_RUNTIME.backend === "local-chrome";
+/*
+ * A kernel browser runs in a container of its own, with its own profile volume, sandbox setting and
+ * flags. This process attaches to it over CDP and never starts or stops Chromium.
+ */
+const KERNEL = BROWSER_RUNTIME.backend === "kernel";
 // Native Chrome has no container boundary. Always retain its own process sandbox and OS keychain.
 const SANDBOX_ENABLED = LOCAL_CHROME || process.env.COMPUTER_SANDBOX === "on";
 
@@ -213,9 +218,79 @@ export type ProfileSummary = {
  * would rather lose the last few seconds of cookies than never restart.
  */
 async function closeAndWait(context: BrowserContext): Promise<void> {
-  await context.close().catch(() => undefined);
+  await release(context).catch(() => undefined);
+  // Nothing of ours is writing a profile when the browser is kernel's.
+  if (KERNEL) return;
   // A fixed settle is used because persistent contexts do not expose a reliable browser-exit signal.
   await new Promise((resolve) => setTimeout(resolve, CLOSE_SETTLE_MS));
+}
+
+/**
+ * Let go of a browser.
+ *
+ * For kernel that is the CDP connection only. Closing the default context of a connected browser is
+ * Playwright's request to close the browser itself, and the browser is kernel's to keep running.
+ */
+async function release(context: BrowserContext): Promise<void> {
+  if (KERNEL) {
+    await context.browser()?.close();
+    return;
+  }
+  await context.close();
+}
+
+/**
+ * Why this Bot may not use its kernel browser right now, or null when it may.
+ *
+ * A kernel browser's traffic leaves from kernel's container, so neither the configured upstream proxy
+ * nor this computer's network-policy filter ever sees it. For a Bot whose policy allows every
+ * destination and which goes out directly, that loses nothing the server does not still check on
+ * every navigation. For any other it is the whole boundary, so it is refused rather than quietly
+ * bypassed. Asked on every use rather than once, because the policy is pushed live and a browser
+ * connected under "allow all" must not outlive a narrower one.
+ */
+function kernelEgressProblem(botId: string): string | null {
+  if (upstreamFor(botId, process.env)) {
+    return `An egress proxy is configured for ${botId}, and a kernel browser does not go through it. Set --proxy-server in that kernel's flags and remove the proxy here.`;
+  }
+  const policy = egressPolicyFor(botId);
+  if (!policy) {
+    // The same gap the filter refuses in: the server pushes a policy before a Bot acts.
+    const required = !["0", "false"].includes(
+      process.env.EGRESS_POLICY_REQUIRED ?? "",
+    );
+    return required
+      ? "No network policy has reached this computer yet, so nothing may leave it."
+      : null;
+  }
+  if (policy.mode !== "allow_all") {
+    return `The network policy for ${botId} is ${policy.mode}, which a kernel browser cannot enforce because its traffic does not pass this computer's filter. Allow all network access for this Bot, or run it on the managed browser.`;
+  }
+  return null;
+}
+
+/**
+ * Attach to this Bot's kernel browser.
+ *
+ * Its persistent context is the one kernel already has, on kernel's profile volume. Pages there carry
+ * no viewport of ours, so each is pinned to {@link VIEWPORT}: a person's clicks and the screenshot
+ * sizes are relative to it, and kernel's screen is whatever size its display was started at.
+ */
+async function connectKernel(botId: string): Promise<BrowserContext> {
+  const problem = kernelEgressProblem(botId);
+  if (problem) throw new Error(problem);
+  const url = (BROWSER_RUNTIME.cdpUrl ?? "").replaceAll("{bot}", botId);
+  const browser = await chromium.connectOverCDP(url);
+  const context = browser.contexts()[0];
+  if (!context) {
+    await browser.close();
+    throw new Error(`The kernel browser at ${url} has no default context.`);
+  }
+  const pin = (page: Page) =>
+    page.setViewportSize(VIEWPORT).catch(() => undefined);
+  await Promise.all(context.pages().map(pin));
+  context.on("page", (page) => void pin(page));
+  return context;
 }
 
 /**
@@ -431,6 +506,17 @@ export function createProfiles(root: string, onClosed: BrowserClosed) {
       // Only when something is closing: an unconditional await would let a stop slip in ahead of the launch.
       const closingNow = closing.get(botId);
       if (closingNow) await closingNow;
+      if (KERNEL) {
+        // Before the running browser is handed back, so a policy narrowed since it connected closes it.
+        const problem = kernelEgressProblem(botId);
+        if (problem) {
+          await evict(
+            botId,
+            "its network policy no longer allows a kernel browser",
+          );
+          throw new Error(problem);
+        }
+      }
       /*
        * One launch at a time per Bot. Calls that arrive during a launch wait for that launch instead
        * of starting another browser against the same profile directory.
@@ -459,7 +545,7 @@ export function createProfiles(root: string, onClosed: BrowserClosed) {
         // a browser being swapped rather than one going away. Telling the viewer here would end a
         // screen that is about to be fine, which is the opposite of what the announcement is for.
         await existing.sessionCookies?.stop();
-        await existing.context.close().catch(() => undefined);
+        await release(existing.context).catch(() => undefined);
         live.delete(botId);
       }
 
@@ -467,41 +553,45 @@ export function createProfiles(root: string, onClosed: BrowserClosed) {
         const dir = directoryFor(botId);
         // A second native helper can target the same data root on another port. Do not remove an
         // active Chrome profile's lock; Chrome reports contention and handles its own stale locks.
-        if (!LOCAL_CHROME) {
+        if (!LOCAL_CHROME && !KERNEL) {
           await sweepLocks(dir);
           await keepWebRtcInsideProxy(dir);
         }
         const proxy = egressFor(botId, process.env);
-        const context = await chromium.launchPersistentContext(dir, {
-          channel: BROWSER_RUNTIME.channel,
-          headless: BROWSER_RUNTIME.mode === "headless",
-          args: LAUNCH_ARGS,
-          // Playwright launches with `--enable-automation`, which sets `navigator.webdriver` and the
-          // "controlled by automated software" banner. Dropped for the same reason as the flag above:
-          // a person who takes the wheel should be able to sign in. Named explicitly so the sandbox
-          // default args Playwright still supplies are otherwise left intact.
-          ignoreDefaultArgs: ["--enable-automation"],
-          // Playwright adds `--no-sandbox` on its own unless told otherwise, so leaving this out
-          // means the flag above decides nothing and a deployment that asked for the sandbox does
-          // not get one. Verified by reading the launched process arguments, not by trusting either.
-          chromiumSandbox: SANDBOX_ENABLED,
-          viewport: VIEWPORT,
-          // This process owns shutdown. Playwright's signal handlers kill Chromium immediately on
-          // SIGTERM, before pending cookie writes have time to flush.
-          handleSIGTERM: false,
-          handleSIGINT: false,
-          handleSIGHUP: false,
-          ...(proxy ? { proxy } : {}),
-        });
+        const context = KERNEL
+          ? await connectKernel(botId)
+          : await chromium.launchPersistentContext(dir, {
+              channel: BROWSER_RUNTIME.channel,
+              headless: BROWSER_RUNTIME.mode === "headless",
+              args: LAUNCH_ARGS,
+              // Playwright launches with `--enable-automation`, which sets `navigator.webdriver` and the
+              // "controlled by automated software" banner. Dropped for the same reason as the flag above:
+              // a person who takes the wheel should be able to sign in. Named explicitly so the sandbox
+              // default args Playwright still supplies are otherwise left intact.
+              ignoreDefaultArgs: ["--enable-automation"],
+              // Playwright adds `--no-sandbox` on its own unless told otherwise, so leaving this out
+              // means the flag above decides nothing and a deployment that asked for the sandbox does
+              // not get one. Verified by reading the launched process arguments, not by trusting either.
+              chromiumSandbox: SANDBOX_ENABLED,
+              viewport: VIEWPORT,
+              // This process owns shutdown. Playwright's signal handlers kill Chromium immediately on
+              // SIGTERM, before pending cookie writes have time to flush.
+              handleSIGTERM: false,
+              handleSIGINT: false,
+              handleSIGHUP: false,
+              ...(proxy ? { proxy } : {}),
+            });
         /*
          * Session cookies back before anything navigates, so the first request a site sees from this
          * launch is already signed in. Not for a native Chrome: its cookies are protected by the OS
          * keychain, and a plain file beside them would undo that. The container profile uses the
          * basic password store, so the file adds no exposure the volume did not already have.
          */
-        const sessionCookies = LOCAL_CHROME
-          ? undefined
-          : sessionCookieKeeper(botId, dir, context);
+        // Nor for kernel, whose profile is in kernel's container: the file would sit in this one.
+        const sessionCookies =
+          LOCAL_CHROME || KERNEL
+            ? undefined
+            : sessionCookieKeeper(botId, dir, context);
         if (sessionCookies) {
           await sessionCookies.restore().catch((error: unknown) => {
             console.info(
