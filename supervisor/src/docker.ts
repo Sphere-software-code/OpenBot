@@ -1,4 +1,5 @@
 import Docker from "dockerode";
+import { kernelNetworkFor } from "./kernel-network";
 import {
   BOT_LABEL,
   type ComputerNames,
@@ -50,6 +51,18 @@ const COMPUTER_PORT = "4100/tcp";
  * Passed here, the engine is told what to run instead of asked what it inherited, which is also
  * true on Docker and one less thing that depends on how an image was built. Podman honours an
  * explicit healthcheck: it is how every service in `docker-compose.yml` reports healthy there.
+ *
+ * Every second until the computer first answers, then every thirty. The one reader is
+ * {@link waitUntilAnswering}, which asks only while a computer starts, but the engine probes for
+ * the life of the container, and each probe is an exec through dockerd, containerd and runc. At
+ * every 2 s, six computers cost about a third of the CPU of the small host they ran on.
+ * `StartInterval` is what keeps readiness at about a second: inside `StartPeriod`, until the first
+ * success, the engine probes at that rate instead of at `Interval`.
+ *
+ * An engine that ignores `StartInterval` (Docker before 25, or a client pinned below API 1.44)
+ * probes at `Interval` from the start, so the first answer comes about 30 s after a start and every
+ * cold start waits that long. That is still inside the default ready timeout if the computer is up
+ * by then. If it is not, the next probe comes at about 60 s, which is when the wait gives up.
  */
 const COMPUTER_HEALTHCHECK = {
   Test: [
@@ -57,10 +70,11 @@ const COMPUTER_HEALTHCHECK = {
     `bun -e "const r = await fetch('http://localhost:${COMPUTER_PORT.split("/")[0]}/health'); process.exit(r.ok ? 0 : 1)"`,
   ],
   // Nanoseconds, which is what the API takes. The same numbers the Dockerfile states.
-  Interval: 2_000_000_000,
-  Timeout: 3_000_000_000,
-  StartPeriod: 2_000_000_000,
-  Retries: 30,
+  Interval: 30_000_000_000,
+  Timeout: 10_000_000_000,
+  StartPeriod: 60_000_000_000,
+  StartInterval: 1_000_000_000,
+  Retries: 3,
 };
 
 /**
@@ -384,6 +398,11 @@ export type EnsureOptions = {
   /** A network to join, when the supervisor runs alongside a compose stack. */
   network?: string;
   /**
+   * The network this Bot's kernel browser is on, with `{bot}` standing for the Bot id. Joined when
+   * the computer is created, if it exists. See {@link joinKernelNetwork}.
+   */
+  kernelNetwork?: string;
+  /**
    * The container runtime. Left unset this is Docker's default, which shares the host kernel.
    * Setting `runsc` runs each computer under gVisor, which intercepts syscalls in user space and is
    * the pragmatic middle ground for untrusted Bot code. A deployment that wants a kernel per Bot
@@ -459,6 +478,30 @@ function hostConfig(names: ComputerNames, options: EnsureOptions) {
 }
 
 /**
+ * Put a computer that has just been created on its kernel browser's network, when there is one.
+ *
+ * Before it starts, which Docker allows, so its first lookup of `kernel-<botId>` already resolves
+ * instead of failing until something outside OpenBot reconnects it. See `kernel-network.ts`.
+ *
+ * Never fatal. No such network is the ordinary answer on a deployment without kernels and is not
+ * worth a word. Anything else is logged and the computer starts as it would have before, without its
+ * kernel: still a workspace and a shell, which a failed ensure is not.
+ */
+async function joinKernelNetwork(
+  container: string,
+  network: string,
+): Promise<void> {
+  try {
+    await docker.getNetwork(network).connect({ Container: container });
+  } catch (error) {
+    if (statusOf(error) === 404) return;
+    console.warn(
+      `Could not connect ${container} to ${network}, so it starts without its kernel browser: ${String(error)}`,
+    );
+  }
+}
+
+/**
  * Make sure this Bot has a computer, and say where to reach it.
  *
  * Idempotent because the caller is a request handler that can run concurrently with itself: two
@@ -530,6 +573,13 @@ export async function ensure(
           Healthcheck: COMPUTER_HEALTHCHECK,
           HostConfig: hostConfig(names, options),
         });
+        // Only by the request that created it, and never fatal: see `joinKernelNetwork`.
+        const kernelNetwork = kernelNetworkFor(
+          options.kernelNetwork,
+          names.botId,
+        );
+        if (kernelNetwork)
+          await joinKernelNetwork(names.container, kernelNetwork);
       } catch (error) {
         if (statusOf(error) !== 409) {
           throw new DockerUnavailableError(String(error));

@@ -1,5 +1,9 @@
-import { describe, expect, test } from "bun:test";
-import { chooseEvictions, chooseIdle } from "../src/browser-eviction";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  chooseEvictions,
+  chooseIdle,
+  idleTimeoutMsFor,
+} from "../src/browser-eviction";
 import { numberFromEnv } from "../src/env";
 
 /**
@@ -151,6 +155,66 @@ describe("reading the limits an operator set", () => {
     } finally {
       if (previous === undefined) delete process.env.COMPUTER_BROWSER_IDLE_MS;
       else process.env.COMPUTER_BROWSER_IDLE_MS = previous;
+    }
+  });
+});
+
+/**
+ * How long a browser may sit idle depends on whose browser it is.
+ *
+ * Closing one this process started frees the memory it holds here. Closing a kernel browser frees
+ * nothing, because Chromium keeps running in kernel's container; it only drops the connection, and
+ * with it the Bot's run, a hand-back in progress, and the Playwright that would have dismissed a
+ * page's dialog. So a kernel connection stays unless an operator says otherwise.
+ */
+describe("the idle timeout each backend gets", () => {
+  const IDLE = "COMPUTER_BROWSER_IDLE_MS";
+  const previous = process.env[IDLE];
+  afterEach(() => {
+    if (previous === undefined) delete process.env[IDLE];
+    else process.env[IDLE] = previous;
+  });
+
+  test("a browser this process starts is closed after thirty minutes untouched", () => {
+    delete process.env[IDLE];
+    expect(idleTimeoutMsFor("managed")).toBe(30 * 60_000);
+    expect(idleTimeoutMsFor("local-chrome")).toBe(30 * 60_000);
+  });
+
+  test("a kernel browser's connection is kept by default", () => {
+    delete process.env[IDLE];
+    expect(idleTimeoutMsFor("kernel")).toBe(0);
+    // Read the way the sweep reads it: nothing is ever idle enough to close.
+    const now = Date.now();
+    expect(
+      chooseIdle(
+        running(now - 24 * 60 * 60_000),
+        idleTimeoutMsFor("kernel"),
+        now,
+      ),
+    ).toEqual([]);
+  });
+
+  test("an operator's setting wins on either backend", () => {
+    process.env[IDLE] = "600000";
+    expect(idleTimeoutMsFor("kernel")).toBe(600_000);
+    expect(idleTimeoutMsFor("managed")).toBe(600_000);
+    process.env[IDLE] = "0";
+    expect(idleTimeoutMsFor("managed")).toBe(0);
+  });
+
+  test("a blank variable from a compose file leaves each backend its own default", () => {
+    // `COMPUTER_BROWSER_IDLE_MS: ${COMPUTER_BROWSER_IDLE_MS:-}` arrives as an empty string.
+    process.env[IDLE] = "";
+    expect(idleTimeoutMsFor("kernel")).toBe(0);
+    expect(idleTimeoutMsFor("managed")).toBe(30 * 60_000);
+  });
+
+  test("a value that is not a length of time leaves each backend its own default", () => {
+    for (const bad of ["soon", "-5", "0.5"]) {
+      process.env[IDLE] = bad;
+      expect(idleTimeoutMsFor("kernel")).toBe(0);
+      expect(idleTimeoutMsFor("managed")).toBe(30 * 60_000);
     }
   });
 });

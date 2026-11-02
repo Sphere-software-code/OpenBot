@@ -63,11 +63,14 @@ function unreachable(method: string): never {
 
 function harness(options: {
   context?: RoutineRunContext | null;
+  /** What every read of the run context after the first returns, for a change made mid-wait. */
+  later?: RoutineRunContext | null;
   channel?: AgentChannel | null;
   failures?: number;
   runTurn?: TurnRunner;
   recordActivity?: () => Promise<void>;
 }) {
+  let contextReads = 0;
   const recorded: Recorded = {
     finished: [],
     activity: [],
@@ -86,6 +89,8 @@ function harness(options: {
 
     async runContext(runId) {
       expect(runId).toBe(RUN_ID);
+      contextReads += 1;
+      if (contextReads > 1 && options.later !== undefined) return options.later;
       return options.context === undefined ? CONTEXT : options.context;
     },
     async finishRun(runId, status, error) {
@@ -133,13 +138,45 @@ function harness(options: {
 
   return {
     recorded,
-    runner: createRoutineRunner({ routineStore, channelStore, runTurn }),
+    runner: createRoutineRunner({
+      routineStore,
+      channelStore,
+      runTurn,
+      // Milliseconds rather than minutes, so the waiting is real and the suite still takes no time.
+      busyThread: { waitMs: 40, pollMs: 5 },
+    }),
   };
 }
 
 const throwingTurn: TurnRunner = async () => {
   throw new Error("the model refused");
 };
+
+/**
+ * The platform's refusal of a thread another turn holds, as `run-turn.ts` lets it out: a
+ * `PlatformRequestError` with the 409 on it, matched by name and status since the class is not
+ * exported. The message is the client's own, which is what reached the channel before.
+ */
+function threadBusy(): Error {
+  const error = new Error(
+    'Intelligence platform error 409: {"error":{"code":"THREAD_LOCK_FAILED","message":"Thread is already locked by another runner.","category":"conflict","retryable":true}}',
+  );
+  error.name = "PlatformRequestError";
+  (error as Error & { status?: number }).status = 409;
+  return error;
+}
+
+/** A turn refused as busy the first `times` times it is asked, and answering after that. */
+function busyFor(times: number): TurnRunner {
+  let refused = 0;
+  return async () => {
+    if (refused < times) {
+      refused += 1;
+      throw threadBusy();
+    }
+    return { replyText: "Three people are blocked." };
+  };
+}
 
 describe("createRoutineRunner", () => {
   test("runs the owner's thread and records the reply exactly once", async () => {
@@ -317,6 +354,67 @@ describe("createRoutineRunner", () => {
     // surrogate: the string stays well-formed and a code-point split round-trips cleanly.
     expect(reasonPart.isWellFormed()).toBe(true);
     expect(Array.from(reasonPart).join("")).toBe(reasonPart);
+  });
+
+  test("waits for a conversation another turn holds, and runs once it is free", async () => {
+    const { runner, recorded } = harness({ runTurn: busyFor(2) });
+
+    await runner.run(RUN_ID);
+
+    expect(recorded.turns).toHaveLength(3);
+    expect(recorded.finished).toEqual([
+      { runId: RUN_ID, status: "succeeded", error: undefined },
+    ]);
+    expect(recorded.activity).toHaveLength(1);
+    expect(recorded.activity[0]?.activity.text).toBe(
+      "Three people are blocked.",
+    );
+  });
+
+  test("gives up on a conversation that stays busy, and says so in words", async () => {
+    const { runner, recorded } = harness({
+      runTurn: busyFor(Number.POSITIVE_INFINITY),
+      failures: 1,
+    });
+
+    await runner.run(RUN_ID);
+
+    // Asked again while it waited, then stopped asking.
+    expect(recorded.turns.length).toBeGreaterThan(1);
+    expect(recorded.finished).toHaveLength(1);
+    expect(recorded.finished[0]?.status).toBe("failed");
+    const said = recorded.activity[0]?.activity.text ?? "";
+    expect(said).toStartWith("This routine failed: ");
+    expect(said).toContain("busy with another turn");
+    // Not the platform's JSON, which is what the channel used to be handed.
+    expect(said).not.toContain("409");
+    expect(said).not.toContain("THREAD_LOCK_FAILED");
+  });
+
+  test("does not ask again after a failure that is not a busy conversation", async () => {
+    const { runner, recorded } = harness({
+      runTurn: throwingTurn,
+      failures: 1,
+    });
+
+    await runner.run(RUN_ID);
+
+    expect(recorded.turns).toHaveLength(1);
+  });
+
+  test("a routine switched off while it waited does not run", async () => {
+    const { runner, recorded } = harness({
+      runTurn: busyFor(1),
+      later: { ...CONTEXT, enabled: false },
+    });
+
+    await runner.run(RUN_ID);
+
+    expect(recorded.turns).toHaveLength(1);
+    expect(recorded.activity).toEqual([]);
+    expect(recorded.finished).toEqual([
+      { runId: RUN_ID, status: "skipped", error: "the routine is paused" },
+    ]);
   });
 
   test("posts a thrown non-Error value with String(error)", async () => {

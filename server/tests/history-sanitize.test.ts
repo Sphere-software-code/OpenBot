@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { Message } from "@ag-ui/client";
-import { sanitizeSeededHistory } from "../src/agents/history-sanitize";
+import {
+  hoistSystemRows,
+  sanitizeSeededHistory,
+} from "../src/agents/history-sanitize";
 
 /**
  * The filter itself, asserted as a function rather than through either turn path.
@@ -287,5 +290,52 @@ describe("a call answered elsewhere survives", () => {
     expect(sanitizeSeededHistory(rows, new Set())).toEqual(
       sanitizeSeededHistory(rows),
     );
+  });
+});
+
+describe("hoistSystemRows", () => {
+  test("moves a skill's instructions ahead of the conversation, in order", () => {
+    expect(
+      hoistSystemRows(
+        history([
+          { id: "m1", role: "user", content: "Earlier question." },
+          { id: "m2", role: "assistant", content: "Earlier answer." },
+          { id: "s1", role: "system", content: "Research the brand." },
+          { id: "s2", role: "system", content: "Then build the site." },
+          { id: "m3", role: "user", content: "/research-a-brand acme" },
+        ]),
+      ),
+    ).toEqual(
+      history([
+        { id: "s1", role: "system", content: "Research the brand." },
+        { id: "s2", role: "system", content: "Then build the site." },
+        { id: "m1", role: "user", content: "Earlier question." },
+        { id: "m2", role: "assistant", content: "Earlier answer." },
+        { id: "m3", role: "user", content: "/research-a-brand acme" },
+      ]),
+    );
+  });
+
+  test("leaves the standing role and the holdings to the prompt", () => {
+    expect(
+      hoistSystemRows(
+        history([
+          { id: "standing-role:bot", role: "system", content: "You are Bot." },
+          { id: "granted-tools:bot", role: "system", content: "You hold X." },
+          { id: "m1", role: "user", content: "Hello." },
+        ]),
+      ),
+    ).toEqual(history([{ id: "m1", role: "user", content: "Hello." }]));
+  });
+
+  test("keeps a call and its answer together once a system row is out of the way", () => {
+    const rows = history([
+      { id: "m1", role: "user", content: "Look it up." },
+      { id: "m2", role: "assistant", content: "", toolCalls: [call("c1")] },
+      { id: "s1", role: "system", content: "A skill picked mid-turn." },
+      { id: "m3", role: "tool", toolCallId: "c1", content: "found" },
+    ]);
+    const hoisted = hoistSystemRows(sanitizeSeededHistory(rows, new Set()));
+    expect(hoisted.map((row) => row.id)).toEqual(["s1", "m1", "m2", "m3"]);
   });
 });

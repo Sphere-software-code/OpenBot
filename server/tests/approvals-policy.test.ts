@@ -224,6 +224,52 @@ describe("built-in safety requirements", () => {
       ),
     ).toBeUndefined();
   });
+
+  test("a tool named as content has its arguments spared, never its name", async () => {
+    const script = candidate({
+      toolRef: "social-video/validate_social_script",
+      scope: "social-video",
+      args: {
+        script: {
+          scenes: [
+            { say: "Someone types the order again into the billing system." },
+          ],
+        },
+      },
+    });
+    // Not named, a script that mentions billing reads as a payment whatever the rules say.
+    expect(safetyRequirement(script)?.id).toBe("payments");
+    expect(safetyRequirement(script, ["social-video/*"])).toBeUndefined();
+    expect(
+      await decideAction({
+        ...base,
+        candidate: script,
+        team: [team("allow", { toolRef: "social-video/*" })],
+        contentTools: ["social-video/*"],
+      }),
+    ).toMatchObject({ behaviour: "allow", source: "team_rule" });
+    // The tool's own name is still read.
+    expect(
+      safetyRequirement(
+        candidate({
+          toolRef: "social-video/purchase_music",
+          scope: "social-video",
+          args: {},
+        }),
+        ["social-video/*"],
+      )?.id,
+    ).toBe("payments");
+    // Anything not named is read as before.
+    expect(
+      safetyRequirement(
+        candidate({
+          toolRef: "computer_type",
+          args: { button: "Place order", url: "https://shop.example/checkout" },
+        }),
+        ["social-video/*"],
+      )?.id,
+    ).toBe("payments");
+  });
 });
 
 describe("the reviewer's safety classification", () => {

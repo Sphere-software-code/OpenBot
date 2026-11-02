@@ -133,6 +133,8 @@ export function createApprovalService(
   options: {
     /** The deployment's configured model, for auto-review and pre-approval checks. */
     review?: ReviewModel;
+    /** `APPROVAL_CONTENT_TOOLS`: tools whose arguments the safety keywords do not read. */
+    contentTools?: readonly string[];
   } = {},
 ) {
   /**
@@ -173,6 +175,7 @@ export function createApprovalService(
       autoReview: preferences.autoReview || team.enforceAutoReview,
       askBeforeChanges: preferences.enabled,
       ...(options.review ? { model: options.review } : {}),
+      ...(options.contentTools ? { contentTools: options.contentTools } : {}),
     });
     // An unremarkable read is not a verdict anybody asked for; everything else is on the trail.
     if (

@@ -218,6 +218,53 @@ describe("a name held by somebody else", () => {
   }, 90_000);
 });
 
+describe("a kernel browser's network", () => {
+  /*
+   * A kernel-backed computer reaches its browser by name on a network made outside OpenBot, so every
+   * computer this supervisor created came up off it, and each browser action failed until a cron
+   * job reconnected it. No such network is the ordinary case for a deployment without kernels, and
+   * must not cost it a computer.
+   */
+  test("is joined when the computer is created, and skipped when there is none", async () => {
+    const kernelNetwork = `${namespace}-kernel-{bot}`;
+    const network = `${namespace}-kernel-${BOT}`;
+
+    await withDocker().supervisor.ensure(names, {
+      image: IMAGE,
+      environment: [],
+      kernelNetwork,
+    });
+    const without = await withDocker()
+      .docker.getContainer(names.container)
+      .inspect();
+    expect(Object.keys(without.NetworkSettings.Networks)).not.toContain(
+      network,
+    );
+    await remove(names.container);
+
+    const created = await withDocker().docker.createNetwork({
+      Name: network,
+      Labels: { "openbot.test-fixture": namespace },
+    });
+    try {
+      await withDocker().supervisor.ensure(names, {
+        image: IMAGE,
+        environment: [],
+        kernelNetwork,
+      });
+      const joined = await withDocker()
+        .docker.getContainer(names.container)
+        .inspect();
+      expect(Object.keys(joined.NetworkSettings.Networks)).toContain(network);
+      expect(joined.State.Health?.Status).toBe("healthy");
+    } finally {
+      // The computer first: a network with a container on it cannot be removed.
+      await remove(names.container);
+      await created.remove();
+    }
+  }, 180_000);
+});
+
 describe("a computer that never answers", () => {
   test("fails instead of being handed out as ready", async () => {
     // A wait that cannot fail is a sleep: every computer that never came up was reported ready, and

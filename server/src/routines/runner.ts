@@ -75,6 +75,45 @@ const FATIGUE_LIMIT = 10;
 const SWITCHED_OFF =
   "This routine has failed ten times in a row, so I have switched it off. Ask me to turn it back on when whatever it needs is working.";
 
+/**
+ * How long a firing waits for its channel's conversation to be free, and how often it asks.
+ *
+ * The platform runs one turn per conversation and refuses a second for as long as the first holds
+ * the thread. A routine posts into a channel its owner also talks in, so a firing that landed while
+ * they were mid-conversation was refused, failed for the day, and put the platform's 409 into the
+ * channel as the reason: no retry comes back for a firing whose dispatch was accepted. A person's
+ * turn lets go of the thread when it ends, so the firing asks again until it does.
+ *
+ * Four minutes, because the clock is already running: the sweep's reaper closes a run row ten minutes
+ * old (`ABANDONED_RUN_MS` in `./sweep`), and the turn may still take five once it starts
+ * (`DEFAULT_TURN_TIMEOUT_MS` in `./run-turn`). Asking again is safe because a refused turn has run
+ * nothing and written nothing, and it reads the thread afresh, so the Bot sees what was just said.
+ */
+const BUSY_THREAD_WAIT_MS = 4 * 60_000;
+const BUSY_THREAD_POLL_MS = 15_000;
+
+/**
+ * Whether a turn was refused because another turn holds its thread.
+ *
+ * Matched on the shape, as `isMissingThread` in `../copilot` matches a 404 and for its reason: the
+ * platform's `PlatformRequestError` is not exported to test against, but every instance carries its
+ * name and `status`. 409 is the lock's refusal, `THREAD_LOCK_FAILED`; of the platform calls a turn
+ * makes before the lock, the only other that can answer 409 is `getOrCreateThread`, which settles its
+ * own create race.
+ */
+function isBusyThread(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.name === "PlatformRequestError" &&
+    (error as { status?: unknown }).status === 409
+  );
+}
+
+function minutes(ms: number): string {
+  const count = Math.max(1, Math.round(ms / 60_000));
+  return `${count} minute${count === 1 ? "" : "s"}`;
+}
+
 /** Measured in code points, like every other cap in this area, so nothing is cut mid-pair. */
 function shorten(reason: string): string {
   const codePoints = Array.from(reason);
@@ -90,8 +129,14 @@ export function createRoutineRunner(options: {
   routineStore: RoutineStore;
   channelStore: ChannelStore;
   runTurn: TurnRunner;
+  /** See {@link BUSY_THREAD_WAIT_MS}. Injectable so a test can wait milliseconds instead. */
+  busyThread?: { waitMs: number; pollMs: number };
 }): RoutineRunner {
   const { routineStore, channelStore, runTurn } = options;
+  const { waitMs, pollMs } = options.busyThread ?? {
+    waitMs: BUSY_THREAD_WAIT_MS,
+    pollMs: BUSY_THREAD_POLL_MS,
+  };
 
   async function runOnce(routineRunId: string): Promise<void> {
     const context = await routineStore.runContext(routineRunId);
@@ -168,15 +213,55 @@ export function createRoutineRunner(options: {
       await routineStore.finishRun(routineRunId, "skipped", BOT_PAUSED_REASON);
       return;
     }
+    /*
+     * The turn, asked again while the conversation is busy (see BUSY_THREAD_WAIT_MS). Undefined when
+     * the routine or its Bot was paused during the wait, which is recorded as a skip, the same as a
+     * pause noticed before the first try: whoever paused it has said what they want.
+     */
+    const turnWhenFree = async () => {
+      const giveUpAt = Date.now() + waitMs;
+      for (;;) {
+        try {
+          return await runTurn({
+            ownerUserId,
+            routineId,
+            agentId,
+            threadId: channel.threadId,
+            instruction,
+          });
+        } catch (error) {
+          if (!isBusyThread(error)) throw error;
+          if (Date.now() + pollMs > giveUpAt)
+            throw new Error(
+              `the conversation in this channel was busy with another turn for ${minutes(waitMs)}, so it could not start`,
+            );
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        const now = await routineStore.runContext(routineRunId);
+        if (!now || now.enabled === false) {
+          await routineStore.finishRun(
+            routineRunId,
+            "skipped",
+            "the routine is paused",
+          );
+          return undefined;
+        }
+        if (await isBotPaused(ownerUserId, agentId)) {
+          await routineStore.finishRun(
+            routineRunId,
+            "skipped",
+            BOT_PAUSED_REASON,
+          );
+          return undefined;
+        }
+      }
+    };
+
     let replyText: string;
     try {
-      ({ replyText } = await runTurn({
-        ownerUserId,
-        routineId,
-        agentId,
-        threadId: channel.threadId,
-        instruction,
-      }));
+      const turn = await turnWhenFree();
+      if (!turn) return;
+      ({ replyText } = turn);
     } catch (error) {
       if (error instanceof HeadlessToolSuspension) {
         await routineStore.finishRun(

@@ -109,6 +109,7 @@ function harness(options: {
   heartbeatMs?: number;
   lockTtlSeconds?: number;
   learningContainerId?: string;
+  freshContextBots?: ReadonlySet<string>;
 }) {
   const order: string[] = [];
   const calls = {
@@ -237,15 +238,19 @@ function harness(options: {
     ...(options.lockTtlSeconds === undefined
       ? {}
       : { lockTtlSeconds: options.lockTtlSeconds }),
+    ...(options.freshContextBots === undefined
+      ? {}
+      : { freshContextBots: options.freshContextBots }),
   });
 
-  const run = () =>
+  const run = (overrides: Partial<Parameters<typeof runTurn>[0]> = {}) =>
     runTurn({
       ownerUserId: OWNER,
       routineId: ROUTINE_ID,
       agentId: AGENT_ID,
       threadId: THREAD_ID,
       instruction: INSTRUCTION,
+      ...overrides,
     });
 
   return { run, agent, calls, order, builtFor };
@@ -617,6 +622,168 @@ describe("persistedInputMessages is the subtraction", () => {
     expect(request?.persistedInputMessages?.length).toBe(
       request?.input.messages.length,
     );
+  });
+});
+
+/**
+ * A Bot named in `freshContextBots` starts each firing from the instruction alone.
+ *
+ * Found on a live firing: Outreach's list showed five leads with no draft and it wrote none, saying
+ * it had saved them on earlier runs. What must NOT change with it is everything else this file pins:
+ * the thread is still read, because the subtraction needs it; the one new message is still what
+ * persists; and the lock is taken and released the same way. The tests that matter most are the
+ * Bot that is not named and the resumed approval, because those are what a careless version breaks.
+ */
+describe("a Bot named for a fresh context", () => {
+  const FRESH = new Set([AGENT_ID]);
+  const THREAD: HistoryRow[] = [
+    { id: "m1", role: "user", content: frameFiring(INSTRUCTION) },
+    {
+      id: "m2",
+      role: "assistant",
+      content: "Saved a draft for lead 200.",
+      toolCalls: [
+        { id: "call_1", name: "save_draft", args: '{"lead_id":200}' },
+      ],
+    },
+    { id: "m3", role: "tool", content: "saved", toolCallId: "call_1" },
+    { id: "m4", role: "assistant", content: "One draft saved." },
+  ];
+
+  test("is handed this turn's message and nothing from the thread", async () => {
+    const { run, calls, agent } = harness({
+      history: THREAD,
+      freshContextBots: FRESH,
+    });
+
+    await run();
+
+    const seeded = calls.runs[0]?.input.messages ?? [];
+    expect(seeded).toHaveLength(1);
+    expect((seeded[0] as { content?: unknown }).content).toBe(
+      frameFiring(INSTRUCTION),
+    );
+    // On the agent as well, which is where the runner actually reads them from.
+    const onAgent = agent.messages.map((message) => message.id);
+    for (const row of THREAD) expect(onAgent).not.toContain(row.id);
+  });
+
+  test("still reads the thread, and persists exactly the one new message", async () => {
+    const { run, calls, order } = harness({
+      history: THREAD,
+      freshContextBots: FRESH,
+    });
+
+    await run();
+
+    expect(order).toContain("getThreadMessages");
+    const [request] = calls.runs;
+    expect(request?.persistedInputMessages).toHaveLength(1);
+    expect(request?.persistedInputMessages?.[0]?.id).toBe(
+      request?.input.messages[0]?.id ?? "",
+    );
+  });
+
+  test("returns only what this run said", async () => {
+    const { run } = harness({ history: THREAD, freshContextBots: FRESH });
+
+    expect(await run()).toEqual({ replyText: "Three things happened." });
+  });
+
+  test("takes and releases the lock as any other turn does", async () => {
+    const { run, calls } = harness({
+      history: THREAD,
+      freshContextBots: FRESH,
+    });
+
+    await run();
+
+    expect(calls.acquired).toHaveLength(1);
+    expect(calls.cleaned).toEqual([
+      { threadId: THREAD_ID, runId: calls.acquired[0]?.runId ?? "" },
+    ]);
+  });
+
+  test("a thread the platform has never heard of is still no history", async () => {
+    const { run, calls } = harness({
+      historyFails: threadNotFound,
+      freshContextBots: FRESH,
+    });
+
+    await run();
+
+    expect(calls.runs[0]?.input.messages).toHaveLength(1);
+  });
+
+  test("a Bot that is not named keeps the whole thread", async () => {
+    const { run, calls } = harness({
+      history: THREE_ROWS,
+      freshContextBots: new Set(["some_other_bot"]),
+    });
+
+    await run();
+
+    expect(calls.runs[0]?.input.messages).toHaveLength(4);
+    expect(calls.runs[0]?.persistedInputMessages).toHaveLength(1);
+  });
+
+  test("a resumed approval runs from its own snapshot and writes nothing twice", async () => {
+    // The firing that paused, already on the thread: its turn and the call it was waiting on.
+    const paused: HistoryRow[] = [
+      { id: "turn_1", role: "user", content: frameFiring(INSTRUCTION) },
+      {
+        id: "a1",
+        role: "assistant",
+        toolCalls: [{ id: "call_2", name: "save_draft", args: "{}" }],
+      },
+    ];
+    const { run, calls } = harness({
+      history: [...THREAD, ...paused],
+      freshContextBots: FRESH,
+    });
+
+    await run({
+      continuation: {
+        snapshot: {
+          runId: "run_that_paused",
+          threadId: THREAD_ID,
+          toolCallId: "call_2",
+          toolName: "save_draft",
+          args: {},
+          messages: [
+            { id: "turn_1", role: "user", content: frameFiring(INSTRUCTION) },
+            {
+              id: "a1",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call_2",
+                  type: "function",
+                  function: { name: "save_draft", arguments: "{}" },
+                },
+              ],
+            },
+          ] as unknown as Message[],
+          state: {},
+          context: [],
+          forwardedProps: {},
+        },
+        result: { content: "saved" },
+        messageId: "result_1",
+      },
+    });
+
+    const [request] = calls.runs;
+    expect(request?.input.messages.map((message) => message.id)).toEqual([
+      "turn_1",
+      "a1",
+      "result_1",
+    ]);
+    // Without the read of the thread, `turn_1` and `a1` would be persisted a second time here.
+    expect(
+      request?.persistedInputMessages?.map((message) => message.id),
+    ).toEqual(["result_1"]);
   });
 });
 

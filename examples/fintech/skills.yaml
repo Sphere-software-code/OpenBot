@@ -236,3 +236,326 @@ skills:
       save_bot once, at the end. It is not a way to show a draft: it puts a card in front of the
       person and nothing is created unless they press the button.
     tools: []
+
+  # Research before building. Writes a brand brief and the logo into the Bot's workspace, where
+  # `build-a-react-site` reads them. Browsing is whichever route this Bot holds: its own computer's
+  # browser, or the Browser Use session tools when an administrator has made those the approved
+  # route for the Bot.
+  - slug: research-a-brand
+    title: Research a brand
+    summary: Look a company up, find its logo, colours, fonts and real facts, and save a brand brief to build from.
+    instructions: |-
+      You are researching a company or product so that a website can be built for it from facts
+      rather than from guesses. Everything you find goes into a brief in your workspace, with the
+      URL each fact came from, because the build that follows must be able to point at its sources
+      and must not invent a product, a number, a customer or a quote.
+
+      Work in this order.
+
+      1. Pin down the subject. Take the name from the request. If the request names a domain, use
+         it. If it names only a company and the name is ambiguous, say which one you are taking and
+         why rather than researching the wrong one. Make a slug: lower-case, hyphens, no spaces.
+         Everything is saved under `brands/<slug>/`.
+
+      2. Find the official website. Open a web search for the name (a search engine results page,
+         such as `https://duckduckgo.com/html/?q=<name>`), read the results, and pick the official
+         site, not a directory, a review site or a social profile. Record the domain. Open the
+         homepage and read it in full, then the pages that carry facts: about, products or
+         services, pricing, customers or case studies, contact, careers. Read no more than eight
+         pages. Open each one with your computer's browser. If your browser navigation is disabled
+         by the administrator and you hold the Browser Use session tools instead, use those for the
+         same reads; that is the approved route for this Bot, not a workaround. If you can browse by
+         neither route, stop and say so; do not research from memory.
+
+      3. Get the logo. Try these in order and stop at the first that yields a real image file:
+         - On the homepage HTML, look for `<img>` tags whose src, alt or class mentions `logo`, for
+           an SVG inline in the header, and for `<link rel="icon">`, `apple-touch-icon` and
+           `og:image`. Fetch the HTML with the shell (`curl -sL <url> -o brands/<slug>/home.html`)
+           and grep it; the browser's readable text does not show tag attributes.
+         - Download each candidate with curl into `brands/<slug>/logo-candidates/`, then run
+           `file` on it. Keep only files that are PNG, SVG, JPEG or WebP. Prefer SVG, then the
+           largest PNG, then the rest; prefer a logo with a transparent background over a favicon.
+         - If the site gave nothing usable, try `https://logo.clearbit.com/<domain>` and
+           `https://www.google.com/s2/favicons?domain=<domain>&sz=256`. Mark these as
+           lower-quality in the brief.
+         Copy the winner to `brands/<slug>/logo.<ext>`. If every route fails, say so in the brief
+         under `logo: none found`, and note that the site will need a typographic wordmark instead.
+         Never draw, generate or describe a logo as if you had found one.
+
+      4. Get the look. From the homepage HTML and its linked stylesheets (`curl` them too), pull:
+         the Google Fonts or `@font-face` families it loads; the hex or rgb colours used most,
+         ignoring pure black, white and greys; whether the site is light or dark; the border radius
+         and shadow style you can see. From the page itself note the tone of the copy (formal,
+         playful, technical), the tagline, and how the hero is laid out. Say what you measured, not
+         what you assume a company in this industry would look like.
+
+      5. Get the facts. Write down, each with its source URL: what the company does in one sentence
+         in its own words; the products or services it actually names; who it says its customers
+         are; any numbers it publishes about itself; named customers, partners or press it shows;
+         where it is based and how to contact it; social links; founding year if stated. If a
+         section of the site does not exist, write `not stated` for that item rather than filling
+         it in.
+
+      6. Write `brands/<slug>/brief.md` with these headings, in this order: Subject, Website, Logo,
+         Colours, Fonts, Tone, Facts, Products, Customers and proof, Contact, Sources, Gaps. Under
+         Gaps, list what you could not find. Under Sources, list every URL you read.
+
+      7. Report back with: the domain you settled on, whether you found a logo and from where, the
+         two or three main colours, the font families, three facts you are confident of, and the
+         gaps. Say that the brief is at `brands/<slug>/brief.md` in your workspace and that
+         `/build-a-react-site` can be run from it.
+
+      Do not sign in anywhere, do not accept cookie banners that require an account, and do not
+      read behind a login. If a page refuses you or the gateway refuses a step, say which step and
+      carry on with what you have.
+    tools:
+      - browser-use/run_session
+      - browser-use/get_session
+      - browser-use/get_session_messages
+      - browser-use/stop_session
+      - parallel/web_search
+      - parallel/web_fetch
+
+  # Builds the site from the brief. Vite + React + TypeScript, Tailwind v4, lucide-react icons,
+  # sonner toasts, on the Bot's own computer, which has node, npm and bun and a headless Chromium
+  # under /app/node_modules/playwright for checking the result.
+  - slug: build-a-react-site
+    title: Build a React site
+    summary: Build a polished React website for a company from a researched brand brief, with real colours, fonts and logo, checked in a browser, with a live preview link.
+    instructions: |-
+      You are building a React website for a company, and the standard is that a visitor should
+      believe the people who made it studied the company first. That comes from two things:
+      every word on the page traces to a fact in the brand brief, and the visual choices (colour,
+      type, logo, tone) come from what the company's own site actually does. A generic template
+      with the name swapped in fails that standard, however clean it looks.
+
+      Two ways to build, and which one is yours is decided by what you hold. If you hold the
+      site-builder tools (`start_build`, `get_build_status`, `request_changes`, `approve_site`),
+      you do not write the code: follow step 1, then hand the build over as step 2a says and
+      review it the way you review every site-builder round. If you hold no site-builder tools,
+      the computer is yours and you build the site yourself, steps 2 to 6.
+
+      1. Start from the brief. Look for `brands/<slug>/brief.md` in your workspace for the company
+         named in the request. If it is there, read it in full, and read `brands/<slug>/logo.*` if
+         it exists. If there is no brief, do the research first exactly as `/research-a-brand`
+         describes (official site, logo, colours, fonts, facts with sources, gaps) and write the
+         brief before writing any code. Do not build from a one-line description when the company
+         has a website you can read.
+
+      2a. Handing over (site-builder tools held). Follow `/run-site-builds` instead, from here
+         on: it says how to start, follow and report a site-builder build. Given the company's
+         `website_url`, the builder researches the site itself, so do not browse for step 1.
+         Nothing below this step is for you.
+
+      2. Agree the shape before building, in one message. Say which pages or sections you intend
+         (typically: header with logo and nav, hero, proof strip, three to six feature or service
+         sections drawn from the real product list, how it works or about, a testimonial or
+         customer section only if the brief has real ones, a contact or call-to-action section,
+         footer with the real links). Name the primary and accent colours and the fonts you took
+         from the brief. Ask at most one question, and only if the brief leaves something that
+         would change the build. If the person has already said "just build it", skip the question
+         and build.
+
+      3. Scaffold in `sites/<slug>/` with the shell, without interactive prompts. Write the files
+         yourself rather than running a scaffolder that asks questions:
+         - `package.json` with scripts `dev`, `build` (`tsc -b && vite build`) and `preview`;
+           dependencies `react`, `react-dom`, `lucide-react`, `sonner`; devDependencies `vite`,
+           `@vitejs/plugin-react`, `typescript`, `@types/react`, `@types/react-dom`,
+           `tailwindcss`, `@tailwindcss/vite`. Use the current versions `npm view <pkg> version`
+           reports.
+         - `vite.config.ts` registering `@vitejs/plugin-react` and `@tailwindcss/vite`, with
+           `base: "/<slug>/"`, because the site is published under that path on the preview
+           host; without it every asset 404s there.
+         - `tsconfig.json` (strict, `jsx: react-jsx`, `moduleResolution: bundler`) and
+           `tsconfig.node.json` for the config file.
+         - `index.html` with the real `<title>`, a meta description taken from the brief, the
+           favicon pointing at the logo, and the Google Fonts link for the families the brief found.
+         - `src/index.css` beginning `@import "tailwindcss";` followed by an `@theme` block that
+           defines `--color-brand-*` and `--color-accent-*` scales from the brief's colours and
+           `--font-sans` / `--font-display` from its fonts. Use these tokens everywhere; no
+           hard-coded hex values in components.
+         - `src/main.tsx` mounting `<App />` and sonner's `<Toaster />` once, positioned
+           bottom-right, with `richColors`.
+         - `src/App.tsx` composing one component per section from `src/components/`.
+         - `public/brand/` holding the logo copied from the brief's folder.
+         Then `npm install`.
+
+      4. Write the sections. Rules that make it read as researched:
+         - Copy comes from the brief. Product names, the one-sentence description, customer types,
+           location and contact details are the company's own. Where the brief says `not stated`,
+           leave that element out; never fill a gap with a plausible number, a made-up customer
+           logo, a fabricated quote or "trusted by 10,000+ teams".
+         - The logo is the real file. If the brief has none, make a wordmark component that sets
+           the company name in the display font and the brand colour, and say so in the hand-over.
+         - Icons are `lucide-react`, chosen to match each feature's meaning, not decorative filler.
+           One icon per feature card, consistent size and stroke.
+         - Toasts are `sonner`. Use them for the contact form's submit (success and validation
+           error), for copy-to-clipboard on an email or phone, and nowhere else. The contact form
+           submits nowhere by default; say so in a code comment and in the hand-over, and leave a
+           single `onSubmit` function to wire later.
+         - Layout: a max-width container, consistent vertical rhythm (one spacing scale, used
+           everywhere), a sticky header that collapses to a menu button under `md`, sections that
+           alternate background between the page colour and a brand tint, and a footer with the
+           real links from the brief. Responsive at 375, 768 and 1440 wide; nothing scrolls
+           sideways.
+         - Type: the display font for headings, the body font for text, at most two weights of
+           each, line length capped around 65 characters for paragraphs.
+         - Accessibility: every image has alt text that says what it is, every interactive element
+           is reachable by keyboard, focus is visible, colour contrast of text on brand backgrounds
+           is at least 4.5:1 (lighten or darken the token until it is).
+         - Keep it to one page unless the brief has enough real content for more. A thin second
+           page is worse than a strong single page.
+
+      5. Build and look at it. Run `npm run build` and fix every TypeScript and build error until
+         it passes; do not hand over a project that does not build. Then start the preview in the
+         background (`npm run preview -- --port 4173 >/dev/null 2>&1 &`), wait a few seconds, and
+         open `http://localhost:4173/<slug>/` and take screenshots at desktop and phone widths
+         with the headless browser your computer
+         already has:
+         `NODE_PATH=/app/node_modules node -e '...'` using `require("playwright").chromium`
+         launched with `--no-sandbox`, saving `sites/<slug>/shots/desktop.png` (1440x900, full
+         page) and `sites/<slug>/shots/mobile.png` (390x844, full page), and also print
+         `document.documentElement.scrollWidth` against `innerWidth` on the mobile shot to catch
+         sideways scroll. Also capture console errors from the page and fix any. Look at the
+         screenshots with your file tools or the browser, and fix what is wrong: overlapping text,
+         a logo that is tiny or stretched, a hero with no image or illustration, unreadable contrast,
+         a section that is empty because the brief had nothing for it (remove it). Rebuild and
+         re-shoot after fixes. Stop the preview when done.
+
+      6. Hand over. Write `sites/<slug>/README.md` with how to run it (`npm install`,
+         `npm run dev`), what is wired and what is not (the contact form), and where the logo and
+         colour tokens live. The built `sites/<slug>/dist` is picked up from your workspace every
+         minute and published at `https://preview.sphere-software.com/<slug>/`, so wait about a
+         minute, then open that URL in your browser so the person can see it, and give them the
+         link. If the page is not there after three minutes, say so rather than guessing why.
+         Then report: the link, the sections you built and the
+         brief fact each rests on, the colours and fonts and where they came from, whether the logo
+         is real or a wordmark, anything in the brief you deliberately left out and why, and that
+         the screenshots are in `sites/<slug>/shots/`. Keep the whole report under 250 words.
+         Changes the person asks for afterwards are edits to the same project, rebuilt with
+         `npm run build`; the preview updates on its own within a minute.
+
+      If `npm install` cannot reach the registry, if the shell is refused, or if a build error
+      survives three honest attempts, stop, say exactly where it stopped and what the error was,
+      and leave the project in place for a person to continue. Do not report a site as built unless
+      `npm run build` passed and you have looked at the screenshots.
+    tools:
+      - browser-use/run_session
+      - browser-use/get_session
+      - browser-use/get_session_messages
+      - browser-use/stop_session
+
+  # Driving the site-builder MCP server, for the coworker whose whole job that is (Site PM). The
+  # builder researches the company's own site, builds, and has an independent reviewer check and fix
+  # every round; what is left to the Bot is starting the right build, coming back once when it
+  # should be done, and reporting what the reviewer found. A lead demo's link reaches an email only
+  # through Outreach's draft and a person approving it in the CRM, never through this Bot.
+  #
+  # `schedule_follow_up` is not listed: it is the deployment's own tool, offered on every run, and
+  # `tools:` here is intersected with a Bot's MCP grants, so naming it would name nothing.
+  - slug: run-site-builds
+    title: Run site builds
+    summary: Build demo sites for outreach leads, or a site for a company, follow the builds, and report what the reviewer found.
+    instructions: |-
+      You run website builds with the site-builder tools. You never write code and you never
+      browse to research: the builder reads the company's own site, builds, and has an
+      independent reviewer check every round and fix what it finds. Your job is to start the
+      right build, come back once when it should be done, and tell the person what the reviewer
+      found. Nothing is ever published, and you never send an email.
+
+      Demo sites for outreach leads ("build demos for the top 5"):
+
+      1. Call `list_demo_candidates` with the number asked for. Show the candidates in ONE
+         message with `showTable`: business, city, website, email type, and why it was picked.
+         Ask once whether to build all of them or which ones, and start nothing before a yes.
+      2. Call `start_demo` for each lead agreed to, with `lead_id` and any notes the person
+         gave. Builds queue and are never refused as busy, so start them all at once. Calling
+         it again for a lead returns the same project. A refusal (not in the feed, no email,
+         already has a draft) is a fact to report, not to work around.
+      3. Say roughly when they will be ready, from `eta_minutes`.
+      4. Call `schedule_follow_up` ONCE, at the largest `eta_minutes` plus 2. Never poll
+         `get_build_status` in between and never schedule one follow-up per build.
+      5. When it wakes you, call `list_projects` with `filter: "today"` (or `get_build_status`
+         for a single build) once, and send its `report`. A demo still building shows as still
+         building. Schedule nothing more: it finishes by itself, and its link reaches the lead
+         by itself.
+
+      The daily demo run (a routine, or "run today's demos"): call `start_next_demos` with
+      `count: 5` and nothing else. It picks the next leads in Outreach's own queue, the ones
+      whose emails go out at 18:00 IST, passes over the ones a demo would be wasted on (a
+      chain's location page, an email from another company), and stops at the daily limit.
+      Do not ask first: the person set this run up to happen without them. Say in one or two
+      lines how many started and which leads were passed over and why. Give no time and schedule
+      nothing. If nothing was started, say why in one line.
+
+      The day's report is its own routine, and it is the only other message of the day: call
+      `list_projects` with `filter: "today"` once and send its `report` as your whole message, word
+      for word. To set the two routines up when asked: in this channel, Asia/Kolkata, every day at
+      10:00 with the instruction "Call start_next_demos with the default count. Say in one or two
+      lines how many demos started and name any lead passed over, with the reason. Give no time
+      and schedule nothing." and every day at 17:00 with the instruction "Call list_projects with
+      filter today once, then send its report as your whole message, word for word. Schedule
+      nothing."
+
+      Nobody approves a lead demo. Its link goes onto the lead by itself, and the person checks
+      the site when they approve its email in the CRM. Never ask anyone to approve one or tell
+      them one needs a person. A round that hits a time limit and goes round again is autopilot's
+      ordinary work, not an error, and `spent_usd` is not final while `spent_note` is present.
+      Report neither.
+
+      A site for a company: call `start_build` with `project` (a slug), the
+      `acceptance_checklist` the person's request implies, and `website_url` whenever they name
+      the company's site; the builder researches it, so the `brief` is two or three lines on
+      what they want. Write a full brief only when there is no site to research, and only from
+      what the person told you. Then one follow-up at `eta_minutes` plus 2, as above.
+
+      When asked how a build is going, call `get_build_status` once and give its status, queue
+      position or ETA, and the latest activity.
+
+      Reporting a finished build. Report from `review`, not from your own impression:
+      - the score and the verdict, in one line;
+      - the checklist with `showChecklist`, one item per entry, done when it passed, with the
+        reviewer's evidence as the note;
+      - for demos, a `showTable` of business, email, score, preview, demo link and when the
+        link expires;
+      - the `preview_url`, as a link.
+      Say plainly anything the reviewer listed under invented claims or wrong brand media. Never
+      call a site published or live: it is a private preview.
+
+      For a lead demo, what the reviewer or the builder flagged goes in the day's report under
+      "Look at when checking the email", never as a decision anyone owes. For any other site that
+      is `needs_human`, say what the reviewer flagged (`must_fix` and the failed checklist items)
+      and stop. Do not loop `request_changes` to make it pass.
+
+      Call `request_changes` only for what the PERSON asks; autopilot has already worked through
+      the reviewer's must-fix list. At most 10 items, each saying where (page and section), what
+      is there now, and what it should be. Then one follow-up, as above.
+
+      Call `approve_site` only when the person says the site is good. Approval means ready for a
+      final human check, not published. For a lead demo the link is already on the lead, and the
+      person approving the email in the CRM is the gate. Call `cancel_build` only when asked.
+
+      Links. `share_site` makes a link for a client, for at most 3 days, and asks the owner first;
+      `list_shares` and `revoke_share` manage those. Call `refresh_demo_link` when a lead demo's
+      link has under about 36 hours left and its email has not gone out; the old link keeps
+      working until it expires, but only the new one is offered to Outreach. Put links in this
+      chat and nowhere else.
+
+      Never invent a business fact, number, customer or quote, in a brief or a report; say what
+      you do not know. Never say an email was sent: Outreach drafts it and a person sends it. If a
+      tool refuses, say which step and what it said. A status check that fails says nothing about
+      the build: try once more, and if it still fails, write status unavailable in that row.
+    tools:
+      - site-builder/list_demo_candidates
+      - site-builder/start_demo
+      - site-builder/start_next_demos
+      - site-builder/start_build
+      - site-builder/get_build_status
+      - site-builder/request_changes
+      - site-builder/approve_site
+      - site-builder/cancel_build
+      - site-builder/list_projects
+      - site-builder/share_site
+      - site-builder/revoke_share
+      - site-builder/list_shares
+      - site-builder/refresh_demo_link

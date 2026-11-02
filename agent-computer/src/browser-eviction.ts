@@ -17,6 +17,9 @@
  * starts where it left off, which is already what `stop` means here.
  */
 
+import type { BrowserRuntime } from "./browser-runtime";
+import { numberFromEnv } from "./env";
+
 /** Enough of a live entry for either decision. Keeps this file independent of what else is on one. */
 export type Evictable = { usedAt: number };
 
@@ -57,4 +60,28 @@ export function chooseIdle(
   return [...running]
     .filter(([, entry]) => entry.usedAt <= cutoff)
     .map(([botId]) => botId);
+}
+
+/**
+ * How long a browser may sit untouched before the sweep closes it, where zero means never.
+ *
+ * Thirty minutes for a browser this process starts, for the reason above: it holds a few hundred MB
+ * here, and the profile on disk brings the Bot back where it left off.
+ *
+ * Never, by default, for a kernel browser, because closing one frees nothing and costs a great
+ * deal. Chromium and its tabs keep running in kernel's container, so all a close drops is the CDP
+ * connection. Dropping it interrupts the Bot's run, and its next action is refused until it takes a
+ * fresh snapshot. If a person held control at that moment, the Bot refuses every action until
+ * somebody takes control and hands it back. While nothing is connected, a page that opens a
+ * JavaScript dialog blocks every later connect, where a connected Playwright would have dismissed
+ * it. And reconnecting to a kernel the host has partly swapped out takes several seconds.
+ *
+ * `COMPUTER_BROWSER_IDLE_MS` still decides when an operator has set it, on either backend.
+ */
+export function idleTimeoutMsFor(backend: BrowserRuntime["backend"]): number {
+  return numberFromEnv(
+    "COMPUTER_BROWSER_IDLE_MS",
+    backend === "kernel" ? 0 : 30 * 60_000,
+    { zeroSwitchesItOff: true },
+  );
 }

@@ -53,6 +53,7 @@ import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import {
   createWakeUpRunner,
   createWakeUpStore,
+  followUpChannelForRun,
   wakeUpTools,
 } from "./agents/wake-up";
 import { createApp } from "./app";
@@ -634,7 +635,10 @@ const approvalService = createApprovalService(
       signal: new AbortController().signal,
     });
   },
-  { review: (prompt, signal) => chooseSkills(prompt, signal) },
+  {
+    review: (prompt, signal) => chooseSkills(prompt, signal),
+    contentTools: config.approvalContentTools,
+  },
 );
 // Housekeeping on a schedule: audit rows when asked for, screenshots always, one timer. See audit-retention.ts.
 const retentionSweeps = startRetentionSweeps(
@@ -1128,15 +1132,16 @@ const teamBots = createTeamBots({
     ),
 });
 
+/*
+ * No follow-up tools here any more. A follow-up has to wake in the conversation it was scheduled
+ * from, and this loader is asked per Bot when the agent is built, before there is a run or a thread
+ * to say which conversation that is. They are offered per run instead, beside the coordination tools
+ * in `coordinationForActor`, which every built-in and remote run is given. Both at once would be the
+ * same name twice, which a remote run refuses outright (`HeadlessToolsMiddleware`).
+ */
 const loadToolsForActor =
   (actorId: string, initiator: AuditInitiator = PERSON_INITIATOR) =>
   async (botId: string) => [
-    ...wakeUpTools({
-      store: wakeUpStore,
-      ownerUserId: actorId,
-      agentId: botId,
-      initiator,
-    }),
     ...memoryTools({
       store: personalMemoryStore,
       ingestion: memoryIngestion,
@@ -1581,7 +1586,7 @@ const coordinationForActor =
           initiator: assertion?.initiator ?? initiator,
         };
     const tools = await coordination.toolsForRun(run);
-    return tools.map((tool) => ({
+    const coordinated = tools.map((tool) => ({
       ...tool,
       execute: async (args: unknown) => {
         if (!args || typeof args !== "object" || Array.isArray(args))
@@ -1618,6 +1623,25 @@ const coordinationForActor =
         return result.text;
       },
     }));
+    /*
+     * A Bot's follow-ups, offered here because this is the first place that knows the run's thread.
+     *
+     * Not through `coordination.toolsForRun`, and not gated by it: a run that may not coordinate
+     * (a group peer turn, a thread with no source) may still come back to its own work later. Only a
+     * proactive run is given none, by `restrictCoordinationForRun`, which is what restricting the
+     * loader they used to come from did too. The channel is looked up when one is scheduled, not
+     * here, so a run that never schedules one costs nothing. See `followUpChannelForRun`.
+     */
+    return [
+      ...coordinated,
+      ...wakeUpTools({
+        store: wakeUpStore,
+        ownerUserId: actorId,
+        agentId: botId,
+        initiator: run.initiator ?? initiator,
+        channelId: () => followUpChannelForRun(run, channelSourceForRun),
+      }),
+    ];
   };
 
 /**
@@ -1702,6 +1726,8 @@ const routineRunner = createRoutineRunner({
     runner: routineAgentRunner,
     components: { store: componentStore, auditStore: bootAuditStore },
     buildAgentFor,
+    // This runner only, which is scheduled firings and Run now. Every other runner keeps the thread.
+    freshContextBots: new Set(config.routineFreshContextBots),
     toolsForTurn: async ({ ownerUserId, agentId, initiator }) => {
       if (!computerGateway) return [];
       const actor = await actorFor(ownerUserId);
@@ -2347,9 +2373,15 @@ const proactiveEngine = createProactiveEngine({
       loadToolsForActor(ownerUserId)(agentId),
       proactiveReadOnlyRefs(),
     ]);
-    return tools
-      .filter((tool) => !allowed.has(tool.ref) && !allowed.has(tool.name))
-      .map((tool) => tool.name);
+    return [
+      ...tools
+        .filter((tool) => !allowed.has(tool.ref) && !allowed.has(tool.name))
+        .map((tool) => tool.name),
+      // Offered per run now rather than by the loader above, and still not a read: refused as before.
+      ...wakeUpTools({ store: wakeUpStore, ownerUserId, agentId }).map(
+        (tool) => tool.name,
+      ),
+    ];
   },
   mintThreadId: () => threadIdentity.mint(),
 });
@@ -2368,7 +2400,8 @@ const proactiveSweep = repeatAfterEach(async () => {
 }, 60_000);
 /*
  * Follow-ups a Bot scheduled for itself: one headless turn each, through the same turn runner as a
- * routine, into the person's conversation with that Bot. See agents/wake-up.ts.
+ * routine, into the channel it was scheduled from or else the person's conversation with that Bot.
+ * See agents/wake-up.ts.
  */
 const wakeUpQueue = createWorkQueue(database);
 const wakeUpRunner = createWakeUpRunner({
@@ -2976,6 +3009,8 @@ const app = createApp(
       ownerUserId: input.actorId,
       agentId: input.botId,
       ...(input.initiator ? { initiator: input.initiator } : {}),
+      // The signed run's own thread, as on the per-run path: a channel run wakes in its channel.
+      channelId: () => followUpChannelForRun(input.run, channelSourceForRun),
     }).find((candidate) => candidate.name === input.name);
     if (followUp) {
       const text = await followUp.execute(input.args);

@@ -13,8 +13,9 @@ import {
   stop,
 } from "./docker";
 import { registerEntry } from "./identity";
-import { namesFor } from "./names";
+import { NAMESPACE, namesFor } from "./names";
 import { computerMemoryBytes } from "./computer-memory-bytes";
+import { kernelNetworkTemplate } from "./kernel-network";
 import { listenPort } from "./listen-port";
 
 /**
@@ -70,6 +71,15 @@ if (!resolvedMemory.ok) {
   process.exit(1);
 }
 const memoryBytes = resolvedMemory.bytes;
+const resolvedKernelNetwork = kernelNetworkTemplate(
+  process.env.COMPUTER_KERNEL_NETWORK,
+  NAMESPACE,
+);
+if (!resolvedKernelNetwork.ok) {
+  console.error(resolvedKernelNetwork.reason);
+  process.exit(1);
+}
+const kernelNetwork = resolvedKernelNetwork.template;
 const spireSocketVolume =
   process.env.SPIRE_AGENT_SOCKET_VOLUME?.trim() || undefined;
 
@@ -106,6 +116,7 @@ app.post("/computers/:botId/ensure", async (context) => {
       image,
       environment: environmentFor(parsed.names.botId),
       ...(network ? { network } : {}),
+      ...(kernelNetwork ? { kernelNetwork } : {}),
       ...(runtime ? { runtime } : {}),
       ...(memoryBytes ? { memoryBytes } : {}),
       ...(spireSocketVolume ? { spireSocketVolume } : {}),
@@ -176,5 +187,5 @@ app.get("/computers", async (context) => {
 serve({ port, fetch: app.fetch, idleTimeout: 120 });
 
 console.info(
-  `Supervisor listening on http://localhost:${port} (image ${image}${runtime ? `, runtime ${runtime}` : ""})`,
+  `Supervisor listening on http://localhost:${port} (image ${image}${runtime ? `, runtime ${runtime}` : ""}${kernelNetwork ? `, kernel networks ${kernelNetwork}` : ""})`,
 );

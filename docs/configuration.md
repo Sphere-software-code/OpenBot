@@ -626,6 +626,8 @@ is still the record.
 | `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS` | Local-only private-host browsing when `true`. A deployment running with `NODE_ENV=production` refuses to start while it is set. Cloud metadata addresses are refused either way. |
 | `AGENT_ENDPOINT_ALLOWED_HOSTS`       | Private addresses an agent may be registered at, comma separated; unset (none) by default. Host, optionally with a port. Exact match; no wildcards. Never-allowed addresses cannot be named. |
 | `AGENT_COMPUTER_POLICY`              | JSON action policy: `{"mode":"enforce","deny":[...],"allow":[...]}`.                      |
+| `APPROVAL_CONTENT_TOOLS`             | Tools whose arguments are content for a person to read (a script, a draft), as comma-separated tool-ref globs such as `social-video/*`; unset (none) by default. The built-in password, security-settings and payment hand-offs then read only the tool's name, server and target, not its arguments. |
+| `ROUTINE_FRESH_CONTEXT_BOTS`         | Bots whose routine firings start from the stored instruction alone, as comma-separated Bot ids; unset (none) by default. A firing is normally handed its channel's whole thread. The thread is still written to and a person still reads all of it, and follow-ups, approvals and whatever a person says keep the whole thread. |
 | `COMPUTER_RUNTIME`                   | Set to `runsc` to run supervised computers under gVisor.                                  |
 | `COMPUTER_SANDBOX`                   | Set to `on` to enable Chromium's own sandbox where the host permits user namespaces. Which way it went is printed at start-up. |
 

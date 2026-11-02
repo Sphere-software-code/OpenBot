@@ -309,6 +309,14 @@ export function createTurnRunner(options: {
   heartbeatMs?: number;
   /** See {@link DEFAULT_ABORT_GRACE_MS}. */
   abortGraceMs?: number;
+  /**
+   * Bots whose turns through THIS runner start from their own message, with nothing from the thread.
+   *
+   * On the runner rather than on each call, so it reaches only what that runner carries. The routine
+   * runner is the one that takes it: follow-ups, approvals and inbound messages have runners of their
+   * own and need the conversation they are continuing. See `routineFreshContextBots` in `config.ts`.
+   */
+  freshContextBots?: ReadonlySet<string>;
 }): TurnRunner {
   const {
     intelligence,
@@ -321,6 +329,7 @@ export function createTurnRunner(options: {
     lockTtlSeconds = DEFAULT_LOCK_TTL_SECONDS,
     heartbeatMs = DEFAULT_HEARTBEAT_MS,
     abortGraceMs = DEFAULT_ABORT_GRACE_MS,
+    freshContextBots,
   } = options;
 
   return async ({
@@ -408,7 +417,26 @@ export function createTurnRunner(options: {
       { messages: [] as ThreadHistoryMessage[] },
     );
 
-    const seeded = sanitizeSeededHistory(history.messages.map(toAgentMessage));
+    /*
+     * A Bot named in `freshContextBots` gets none of it, and the read above stays all the same:
+     * `historicIds` below is what stops a resumed approval writing its whole snapshot to the thread a
+     * second time. Nothing here touches the thread, so the person still reads every row of it and
+     * this turn joins the end. Logged because the transcript looks the same either way, so this line
+     * is the only evidence a firing took this path.
+     */
+    const fresh = freshContextBots?.has(agentId) ?? false;
+    if (fresh)
+      console.info(
+        JSON.stringify({
+          type: "routine-fresh-context",
+          routineId,
+          agentId,
+          threadRowsLeftOut: history.messages.length,
+        }),
+      );
+    const seeded = fresh
+      ? []
+      : sanitizeSeededHistory(history.messages.map(toAgentMessage));
     /*
      * This turn's own message — and the ONLY message that is framed. See {@link frameFiring} for the
      * firing it did nothing on. The seeded history above is untouched, which is what keeps a previous

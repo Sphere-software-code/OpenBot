@@ -115,6 +115,10 @@ stop_port() {
   green "  $name: stopped ($who)"
 }
 
+# Stopped on purpose, so `scripts/watchdog.sh` leaves it stopped until the next `start.sh`.
+mkdir -p "$ROOT/.logs"
+: > "$ROOT/.logs/watchdog.hold"
+
 echo
 echo "OpenBot"
 echo "======="

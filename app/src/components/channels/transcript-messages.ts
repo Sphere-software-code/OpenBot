@@ -37,9 +37,24 @@ export function seedMessage(text: string, id: string): Message {
  * is in the thread and arrives through the normal replay.
  */
 const firstMessages = new Map<string, string>();
+/*
+ * The `/` skills the first message was sent with, kept beside the text rather than inside it: the
+ * instruction goes in front of the run as a system turn, never into the person's message. Taken
+ * separately so a screen can seed the transcript first and send later.
+ */
+const firstMessageSkills = new Map<string, string[]>();
 
-export function stashFirstMessage(channelId: string, text: string): void {
+export function stashFirstMessage(
+  channelId: string,
+  text: string,
+  skillInstructions: string[] = [],
+): void {
   firstMessages.set(channelId, text);
+  if (skillInstructions.length > 0) {
+    firstMessageSkills.set(channelId, skillInstructions);
+  } else {
+    firstMessageSkills.delete(channelId);
+  }
 }
 
 /** Read the pending first message and forget it. Null for a channel opened any other way. */
@@ -47,4 +62,11 @@ export function takeFirstMessage(channelId: string): string | null {
   const text = firstMessages.get(channelId) ?? null;
   firstMessages.delete(channelId);
   return text;
+}
+
+/** The skill instructions stashed with the first message, once; empty when there were none. */
+export function takeFirstMessageSkills(channelId: string): string[] {
+  const instructions = firstMessageSkills.get(channelId) ?? [];
+  firstMessageSkills.delete(channelId);
+  return instructions;
 }

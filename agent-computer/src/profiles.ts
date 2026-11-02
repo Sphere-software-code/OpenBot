@@ -37,10 +37,15 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type BrowserContext, chromium, type Page } from "playwright";
 import { profileDirectoryFor } from "./bot-id";
-import { chooseEvictions, chooseIdle } from "./browser-eviction";
+import {
+  chooseEvictions,
+  chooseIdle,
+  idleTimeoutMsFor,
+} from "./browser-eviction";
 import { browserRuntimeFromEnv } from "./browser-runtime";
 import { egressFor, egressLabel, egressPolicyFor, upstreamFor } from "./egress";
 import { numberFromEnv, settleWithin } from "./env";
+import { preflightKernel } from "./kernel-preflight";
 import { chooseLivePage } from "./live-page";
 import { botIdsIn } from "./profile-listing";
 import {
@@ -270,6 +275,46 @@ function kernelEgressProblem(botId: string): string | null {
 }
 
 /**
+ * How long Playwright may take to attach to a kernel browser.
+ *
+ * Playwright's own default as well, written down because a connect that waits on a page that will
+ * not answer waits exactly this long, and so does the request that asked for the page.
+ */
+const KERNEL_CONNECT_TIMEOUT_MS = 30_000;
+
+/**
+ * A connect slower than this is logged even though it worked. A kernel the host has partly swapped
+ * out takes several seconds to answer again, and a trail of slow connects is what shows it.
+ */
+const SLOW_KERNEL_CONNECT_MS = 5_000;
+
+/**
+ * How long each best-effort step after a kernel connect may take before the launch carries on
+ * without it: parking the New Tab page, and bringing the live tab forward.
+ */
+const KERNEL_TIDY_BUDGET_MS = 5_000;
+
+/**
+ * The address a tab shows in its own address bar.
+ *
+ * Not `page.url()`, which is the address the frame committed. kernel's Chromium is managed to open
+ * https://start.duckduckgo.com/ as its New Tab page, so Playwright reads that address for a tab the
+ * browser itself still calls chrome://newtab.
+ */
+async function tabAddress(
+  context: BrowserContext,
+  page: Page,
+): Promise<string> {
+  const session = await context.newCDPSession(page);
+  try {
+    const { targetInfo } = await session.send("Target.getTargetInfo");
+    return targetInfo.url;
+  } finally {
+    await session.detach().catch(() => undefined);
+  }
+}
+
+/**
  * Attach to this Bot's kernel browser.
  *
  * Its persistent context is the one kernel already has, on kernel's profile volume. Pages there carry
@@ -280,16 +325,69 @@ async function connectKernel(botId: string): Promise<BrowserContext> {
   const problem = kernelEgressProblem(botId);
   if (problem) throw new Error(problem);
   const url = (BROWSER_RUNTIME.cdpUrl ?? "").replaceAll("{bot}", botId);
-  const browser = await chromium.connectOverCDP(url);
+  // A page that cannot answer would hold the connect below until it timed out. See the module.
+  await preflightKernel(url, botId);
+  const connectStartedAt = Date.now();
+  const browser = await chromium
+    .connectOverCDP(url, { timeout: KERNEL_CONNECT_TIMEOUT_MS })
+    .catch((error: unknown) => {
+      console.info(
+        JSON.stringify({
+          type: "computer-kernel-connect",
+          botId,
+          ok: false,
+          ms: Date.now() - connectStartedAt,
+          // The first line only. The rest is Playwright's call log, which repeats the address.
+          error: (error instanceof Error ? error.message : String(error))
+            .split("\n")[0]
+            ?.slice(0, 300),
+        }),
+      );
+      throw error;
+    });
+  const connectMs = Date.now() - connectStartedAt;
+  if (connectMs > SLOW_KERNEL_CONNECT_MS) {
+    console.info(
+      JSON.stringify({
+        type: "computer-kernel-connect",
+        botId,
+        ok: true,
+        ms: connectMs,
+      }),
+    );
+  }
   const context = browser.contexts()[0];
   if (!context) {
     await browser.close();
     throw new Error(`The kernel browser at ${url} has no default context.`);
   }
-  const pin = (page: Page) =>
-    page.setViewportSize(VIEWPORT).catch(() => undefined);
+  /*
+   * Every page also takes its own file choosers. With nothing listening, a click on a file input
+   * makes kernel's headed Chromium open a native file dialog on kernel's display, where nobody sees
+   * it or answers it, and that tab's file inputs do nothing until it closes. With a listener,
+   * Playwright takes the chooser instead. There is no upload tool, so the input just gets nothing.
+   */
+  const pin = (page: Page) => {
+    page.on("filechooser", () => undefined);
+    return page.setViewportSize(VIEWPORT).catch(() => undefined);
+  };
   await Promise.all(context.pages().map(pin));
   context.on("page", (page) => void pin(page));
+  /*
+   * A live page left on the New Tab page is parked on about:blank. kernel's New Tab page is a live
+   * web page, and a browser idling on it costs about 1.3% of a core more than one on a blank page.
+   * Best effort: the Bot's first navigation leaves it either way.
+   */
+  const current = chooseLivePage(context.pages());
+  if (current) {
+    await settleWithin(
+      tabAddress(context, current).then(async (address) => {
+        if (address.startsWith("chrome://newtab"))
+          await current.goto("about:blank", { timeout: KERNEL_TIDY_BUDGET_MS });
+      }),
+      KERNEL_TIDY_BUDGET_MS,
+    );
+  }
   return context;
 }
 
@@ -320,10 +418,11 @@ const MAX_LIVE_BROWSERS = numberFromEnv("COMPUTER_MAX_BROWSERS", 8);
  * Zero is the documented way to say "keep them resident", which is why it is read as a value here
  * rather than as a value that is not set. Read like the cap, an operator who wrote it got the
  * default back and the sweep they had switched off carried on closing their browsers.
+ *
+ * Zero is also the default for a kernel browser, whose memory is not this process's to free and
+ * whose connection is worth keeping. `idleTimeoutMsFor` says why.
  */
-const IDLE_TIMEOUT_MS = numberFromEnv("COMPUTER_BROWSER_IDLE_MS", 30 * 60_000, {
-  zeroSwitchesItOff: true,
-});
+const IDLE_TIMEOUT_MS = idleTimeoutMsFor(BROWSER_RUNTIME.backend);
 
 /** How often the idle sweep looks. Cheap: it walks a map of at most `MAX_LIVE_BROWSERS`. */
 const IDLE_SWEEP_MS = 60_000;
@@ -625,6 +724,10 @@ export function createProfiles(root: string, onClosed: BrowserClosed) {
               url: next.url(),
             }),
           );
+          // A background tab of a headed browser paints nothing, so a screenshot of one waits for
+          // a frame that never comes. Kernel's tabs outlive this process, so the live one can be
+          // any of them, and bringing it forward is what lets it be seen and photographed.
+          if (KERNEL) void next.bringToFront().catch(() => undefined);
         };
         // Without this the Bot stays pinned to the page it launched with, so a sign-in the site opens
         // in a new window is neither shown to the person taking the wheel nor reachable by input.
@@ -639,6 +742,12 @@ export function createProfiles(root: string, onClosed: BrowserClosed) {
         // After the new one is in the map, so the cap counts what is really running and the Bot that
         // just asked is the most recently used and therefore never the one closed.
         await enforceCap();
+        // Asked here as well as on every later call, so the first caller is handed the page every
+        // later one will be. A kernel browser can have several tabs open already, and opening them
+        // announced nothing to this context.
+        record.retarget();
+        if (KERNEL)
+          await settleWithin(record.page.bringToFront(), KERNEL_TIDY_BUDGET_MS);
         // Not `page`: a window opened while the browser was starting is already the live one.
         return record.page;
       })();

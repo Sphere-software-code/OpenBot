@@ -1,12 +1,27 @@
 
+# Memory caps sized for srv1851097, which also runs the lead database: ~4.5 GB across these plus
+# the kernel browser, leaving the rest of its free RAM for the host processes. A capped container
+# that hits its limit is killed on its own, so each one also restarts.
 services:
   migrate:
     build: !reset null
+  postgres:
+    mem_limit: 512m
+    restart: unless-stopped
   agent-computer:
     build: !reset null
+    mem_limit: 256m
+    restart: unless-stopped
   supervisor:
     build: !reset null
+    mem_limit: 384m
+    restart: unless-stopped
+    environment:
+      # Per-Bot computer cap, in bytes (768 MiB). Each new Bot adds one more of these.
+      COMPUTER_MEMORY_BYTES: ${COMPUTER_MEMORY_BYTES:-805306368}
   agent-bot:
     build: !reset null
   agent-langgraph:
     build: !reset null
+    mem_limit: 384m
+    restart: unless-stopped

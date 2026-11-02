@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { stoppedReason } from "../src/lib/copilot/stopped-turn";
+import { AgentThreadLockedError } from "@copilotkit/react-core/v2";
+import {
+  BUSY_CONVERSATION,
+  stoppedReason,
+} from "../src/lib/copilot/stopped-turn";
 
 /**
  * What a person is told when a turn ends and no answer came.
  *
- * The cases are the three things that actually arrive: the sentence the deployment's stall watchdog
- * wrote into the run, an error thrown in the browser, and nothing at all.
+ * The cases are the things that actually arrive: the sentence the deployment's stall watchdog wrote
+ * into the run, an error thrown in the browser, the client's refusal of a conversation another turn
+ * still holds, and nothing at all.
  */
 
 describe("the reason a turn ended", () => {
@@ -21,6 +26,13 @@ describe("the reason a turn ended", () => {
     expect(
       stoppedReason(new Error("The endpoint refused the connection")),
     ).toBe("The endpoint refused the connection");
+  });
+
+  test("a message refused because the conversation was busy says what happened and what to do", () => {
+    // The client's own error, whose words are "Thread <id> is locked".
+    const refused = new AgentThreadLockedError("55569917-dab5-8968");
+    expect(refused.message).toContain("is locked");
+    expect(stoppedReason(refused)).toBe(BUSY_CONVERSATION);
   });
 
   test("says so plainly when nothing was reported, rather than inventing a cause", () => {

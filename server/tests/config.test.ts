@@ -1083,6 +1083,40 @@ describe("AGENT_ENDPOINT_ALLOWED_HOSTS", () => {
   });
 });
 
+describe("APPROVAL_CONTENT_TOOLS", () => {
+  const base = () => ({ ...baseEnvironment });
+
+  test("unset means none, so every argument is read", () => {
+    expect(loadConfig(base()).approvalContentTools).toEqual([]);
+  });
+
+  test("a comma-separated list of tool-ref globs is trimmed", () => {
+    expect(
+      loadConfig({
+        ...base(),
+        APPROVAL_CONTENT_TOOLS: " social-video/* , leads/save_draft ,",
+      }).approvalContentTools,
+    ).toEqual(["social-video/*", "leads/save_draft"]);
+  });
+});
+
+describe("ROUTINE_FRESH_CONTEXT_BOTS", () => {
+  const base = () => ({ ...baseEnvironment });
+
+  test("unset means none, so every firing keeps its history", () => {
+    expect(loadConfig(base()).routineFreshContextBots).toEqual([]);
+  });
+
+  test("a comma-separated list of Bot ids is trimmed", () => {
+    expect(
+      loadConfig({
+        ...base(),
+        ROUTINE_FRESH_CONTEXT_BOTS: " outreach , agent_55cdbb1a ,",
+      }).routineFreshContextBots,
+    ).toEqual(["outreach", "agent_55cdbb1a"]);
+  });
+});
+
 /**
  * A cap is a safety number, so a value that is not one has to stop the deployment rather than be
  * quietly replaced by the default. Somebody who typed `two` would otherwise believe they had set a

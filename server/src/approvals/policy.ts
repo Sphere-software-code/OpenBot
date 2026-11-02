@@ -129,15 +129,25 @@ function flatten(value: unknown, depth = 0): string {
 const NOT_ACCOUNT_ACTIONS =
   /^(computer_(write_file|read_file|list_files|run_command)|host\/)/;
 
+/**
+ * `contentTools` are the tools a deployment has named as taking content for a person to read (a
+ * video script, an email draft) rather than an action on an account: a script that says "billing
+ * system" is not a payment. Only their arguments are spared. The tool's own name, server and target
+ * are still read, so a content server that offers `purchase_music` is handed off like anything else.
+ */
 export function safetyRequirement(
   candidate: ApprovalCandidate,
+  contentTools: readonly string[] = [],
 ): { id: string; reason: string } | undefined {
   if (candidate.effect === "read") return undefined;
   if (NOT_ACCOUNT_ACTIONS.test(candidate.toolRef)) return undefined;
+  const content = contentTools.some((pattern) =>
+    globMatches(pattern, candidate.toolRef),
+  );
   const words = [
     candidate.toolRef,
     candidate.scope,
-    flatten(candidate.args),
+    content ? "" : flatten(candidate.args),
     flatten(candidate.target),
   ].join(" ");
   const hit = SAFETY_REQUIREMENTS.find((entry) => entry.pattern.test(words));
@@ -285,9 +295,11 @@ export async function decideAction(input: {
   autoReview: boolean;
   askBeforeChanges: boolean;
   model?: ReviewModel;
+  /** Tool-ref globs whose arguments the keyword floor does not read. See `safetyRequirement`. */
+  contentTools?: readonly string[];
 }): Promise<ApprovalPolicyOutcome> {
   const { candidate } = input;
-  const safety = safetyRequirement(candidate);
+  const safety = safetyRequirement(candidate, input.contentTools);
   if (safety)
     return {
       behaviour: "hand_off",

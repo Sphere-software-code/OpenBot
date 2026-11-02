@@ -47,7 +47,9 @@ ENV COMPUTER_BROWSER_BACKEND=${COMPUTER_BROWSER_BACKEND}
 ENV PORT=4100
 EXPOSE 4100
 # Readiness is exposed through Docker health so the supervisor need not know the network route.
-HEALTHCHECK --interval=2s --timeout=3s --start-period=2s --retries=30 \
+# Every second until it first answers, then every 30 s: each probe is an exec, and readiness is the
+# only question asked of it. COMPUTER_HEALTHCHECK in supervisor/src/docker.ts states the same.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --start-interval=1s --retries=3 \
   CMD bun -e "const r = await fetch('http://localhost:4100/health'); process.exit(r.ok ? 0 : 1)"
 
 CMD ["bun", "src/index.ts"]

@@ -200,6 +200,27 @@ export type DeploymentConfig = {
    */
   agentEndpointAllowedHosts: ReadonlySet<string>;
   /**
+   * Tools whose arguments are content for a person to read, as tool-ref globs (`social-video/*`).
+   *
+   * The built-in credential, security-settings and payment hand-offs match words anywhere in an
+   * action, and a generated script or email draft about invoices is full of them. Those hand-offs
+   * cannot be allowed, only done by the person, so a content tool that mentions money could never
+   * run. Named here, its arguments are not read by those checks; its name, server and target still
+   * are. Empty by default, which keeps every argument read.
+   */
+  approvalContentTools: readonly string[];
+  /**
+   * Bots whose routine firings start from the stored instruction alone, as comma-separated Bot ids.
+   *
+   * A firing is normally handed its channel's whole thread. That is right for a routine that builds
+   * on what it said before and wrong for one whose tools are the record: Outreach's list showed five
+   * leads with no draft and it wrote none, saying it had saved them on earlier runs. Named here, a
+   * firing sees none of that. The thread is still written to and the person still reads all of it;
+   * follow-ups, approvals and whatever a person says keep the whole thread. Empty by default, which
+   * keeps every firing's history.
+   */
+  routineFreshContextBots: readonly string[];
+  /**
    * What this deployment calls itself, when more than one shares an Intelligence project.
    *
    * Absent, the tenant package's id stands in, which separates deployments running different
@@ -1315,6 +1336,11 @@ export function loadConfig(
     ...(managedAgent ? { managedAgent } : {}),
     ...(githubApp ? { githubApp } : {}),
     agentEndpointAllowedHosts: agentEndpointAllowedHosts(environment),
+    approvalContentTools: commaSeparated(environment, "APPROVAL_CONTENT_TOOLS"),
+    routineFreshContextBots: commaSeparated(
+      environment,
+      "ROUTINE_FRESH_CONTEXT_BOTS",
+    ),
     deploymentId: optional(environment, "DEPLOYMENT_ID"),
     composioApiKey: optional(environment, "COMPOSIO_API_KEY"),
     publicUrl,

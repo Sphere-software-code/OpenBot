@@ -22,6 +22,7 @@ import {
   useState,
 } from "react";
 import { Streamdown } from "streamdown";
+import { PendingApprovals } from "@/components/approvals/inline-approval";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import {
   Dialog,
@@ -1336,8 +1337,18 @@ const TranscriptToolCall = memo(function TranscriptToolCall({
          *
          * What was called, shimmering until its result arrives, and then the server's own words
          * drawn the way a Bot's prose is drawn.
+         *
+         * A held call's decision is drawn here too: unlike the computer tools, a server tool has no
+         * renderer of its own to draw its approval card in.
          */}
-        {drawn ?? <ServerToolLine name={name} result={result} />}
+        {drawn ?? (
+          <>
+            <ServerToolLine name={name} result={result} />
+            {result === undefined ? (
+              <PendingApprovals toolCallIds={[toolCallId]} />
+            ) : null}
+          </>
+        )}
       </ToolRenderBoundary>
     </Arriving>
   );

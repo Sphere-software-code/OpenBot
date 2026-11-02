@@ -17,6 +17,7 @@ import { VoiceCallWidget } from "@/components/channels/voice-call-widget";
 import {
   seedMessage,
   takeFirstMessage,
+  takeFirstMessageSkills,
   transcriptMessages,
 } from "@/components/channels/transcript-messages";
 import { agentListQueryOptions } from "@/lib/agents/queries";
@@ -36,7 +37,10 @@ import { afterMs, joinWithin } from "@/lib/copilot/join-thread";
 import { repairUnansweredToolCalls } from "@/lib/copilot/repair-history";
 import { stoppedReason } from "@/lib/copilot/stopped-turn";
 import { readThreadMessages } from "@/lib/copilot/thread-messages";
-import { useSkillCommands } from "@/lib/plugins/skill-commands";
+import {
+  skillInstructionsFor,
+  useSkillCommands,
+} from "@/lib/plugins/skill-commands";
 import {
   askChannelAgent,
   messageText,
@@ -269,14 +273,28 @@ export function ChannelChat({
    * First-message seed from the compose screen. It is taken once per mount and retained until the
    * agent has its own messages because joining a fresh thread can temporarily empty the agent.
    */
-  const [seed] = useState<Message | null>(() => {
+  //
+  // The `/` skills picked on the compose screen come out of the stash in the same initializer as
+  // the text, as one value. The stash forgets on take, and an initializer can run twice on one
+  // mount (StrictMode does so in development), so taking them in two initializers could keep the
+  // text from one call and the empty skills from the other.
+  const [seeded] = useState<{
+    message: Message;
+    skillInstructions: string[];
+  } | null>(() => {
     const pending = takeFirstMessage(channel.id);
-    return pending ? seedMessage(pending, newId()) : null;
+    const skillInstructions = takeFirstMessageSkills(channel.id);
+    return pending
+      ? { message: seedMessage(pending, newId()), skillInstructions }
+      : null;
   });
+  const seed = seeded?.message ?? null;
 
   /** Cleared by the send-on-mount effect without restarting it. */
   const seedRef = useRef(seed);
   seedRef.current = seed;
+  const seedSkillsRef = useRef(seeded?.skillInstructions ?? []);
+  seedSkillsRef.current = seeded?.skillInstructions ?? [];
 
   /** Promise gate for ordering the first message after the thread join when possible. */
   const openJoinGate = useRef<() => void>(() => {});
@@ -894,7 +912,10 @@ export function ChannelChat({
     // the seed has no box to go back into — it was typed on a screen that has already navigated
     // away. The transcript keeps the seeded message and the notice under it says what happened.
     void sayRef
-      .current(typeof pending.content === "string" ? pending.content : "")
+      .current(
+        typeof pending.content === "string" ? pending.content : "",
+        seedSkillsRef.current,
+      )
       .catch(() => undefined);
 
     // Keep `seed` in state; transcriptMessages gives it up once the agent holds a user turn.
@@ -1007,14 +1028,10 @@ export function ChannelChat({
               // typed. Resolved against the same list the menu was built from, so a chip left over from
               // a skill that has since been revoked resolves to nothing rather than to a stale
               // instruction — the menu is refetched, and this reads from it.
-              const skillInstructions = draft.commandIds
-                .map(
-                  (id) =>
-                    skillCommands.find((command) => command.id === id)?.prompt,
-                )
-                .filter((instruction): instruction is string =>
-                  Boolean(instruction),
-                );
+              const skillInstructions = skillInstructionsFor(
+                draft,
+                skillCommands,
+              );
 
               await say(draft.text, skillInstructions, draft.attachments);
             }}

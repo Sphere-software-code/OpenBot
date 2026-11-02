@@ -295,6 +295,8 @@ describe("registered Copilot agents", () => {
       // it. That Bot needs it most: nothing it says was read anywhere.
       prompt: `Be helpful.\n\n${PROVENANCE_GUIDANCE}\n\n${UNTRUSTED_GUIDANCE}`,
       apiKey: "openai-secret",
+      // A `/` skill is a system row from the browser; off, the runtime drops it unread.
+      forwardSystemMessages: true,
     });
   });
 

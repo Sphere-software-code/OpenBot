@@ -12,7 +12,9 @@
  * approvals, and the pause guard at the top of every headless turn.
  *
  * Identities come from the run that scheduled it, never from model arguments: the person and the
- * Bot are bound when the tools are built.
+ * Bot are bound when the tools are built, and so is where it wakes. A follow-up scheduled in a
+ * channel wakes in that channel; one scheduled anywhere else wakes in the person's own conversation
+ * with the Bot.
  */
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, isNull, sql } from "drizzle-orm";
@@ -294,12 +296,73 @@ export function createWakeUpStore(
   };
 }
 
+/**
+ * The channel a follow-up scheduled from this run should wake in, or null for the direct one.
+ *
+ * ONLY A CHANNEL'S OWN THREAD, AND ONLY ONE THIS BOT IS IN. `channelOf` is the lookup a channel's
+ * coordination callbacks are authorised by: the run's thread mapped to a live channel the person is
+ * a member of. For a delegated run it also answers with a channel the Bot need not be in, and a
+ * follow-up woken there would put a Bot into a conversation nobody added it to, so that answer is
+ * not taken.
+ *
+ * A Bot's thread in a group conversation is not a channel's thread and finds nothing here, on
+ * purpose. The wake runner runs in the channel's own thread and records through the channel store,
+ * which is the wrong conversation for a group Bot's turn, so those keep waking in the direct one.
+ */
+export async function followUpChannelForRun<
+  Run extends { botId: string; threadId?: string },
+>(
+  run: Run,
+  channelOf: (run: Run) => Promise<{ channelId: string; botId: string } | null>,
+): Promise<string | null> {
+  if (!run.threadId) return null;
+  const source = await channelOf(run);
+  return source?.botId === run.botId ? source.channelId : null;
+}
+
+/**
+ * Where to wake, read when a follow-up is scheduled and not before.
+ *
+ * A lookup that fails costs the follow-up its channel, not the follow-up: it wakes in the person's
+ * own conversation with this Bot, which is where every follow-up went before channels were
+ * recorded, and still somewhere they will see it.
+ */
+async function wakeUpChannel(
+  channel: string | (() => Promise<string | null | undefined>) | undefined,
+): Promise<string | undefined> {
+  if (typeof channel !== "function") return channel || undefined;
+  try {
+    return (await channel()) || undefined;
+  } catch (error) {
+    console.warn(
+      JSON.stringify({
+        type: "follow-up-channel-lookup-failed",
+        error: error instanceof Error ? error.name : "UnknownError",
+      }),
+    );
+    return undefined;
+  }
+}
+
 /** The Bot's own tools for this, bound to the person and the Bot of the run that is offered them. */
 export function wakeUpTools(options: {
   store: WakeUpStore;
   ownerUserId: string;
   agentId: string;
   initiator?: AuditInitiator;
+  /**
+   * Which channel a follow-up wakes in: the one the run that scheduled it is in.
+   *
+   * Without it, a Bot asked to build something in a team channel checked on the build in the
+   * person's direct chat with it, where nobody who asked was looking, and three builds went
+   * unreviewed that way. Bound here with the person and the Bot, from the run, never from model
+   * arguments, for the reason they are.
+   *
+   * A function as well as a string, because finding it is a query and most runs never schedule
+   * anything: asked only when one is, so the others never pay for it. Absent, or nothing found,
+   * means the person's own conversation with this Bot.
+   */
+  channelId?: string | (() => Promise<string | null | undefined>);
   now?: () => Date;
 }): GrantedTool[] {
   const { store, ownerUserId, agentId, initiator } = options;
@@ -339,12 +402,14 @@ export function wakeUpTools(options: {
           value.at !== undefined
             ? new Date(value.at)
             : new Date(now().getTime() + (value.in_minutes ?? 0) * 60_000);
+        const channelId = await wakeUpChannel(options.channelId);
         const record = await store.schedule({
           ownerUserId,
           agentId,
           reason: value.reason,
           dueAt,
           ...(value.instruction ? { instruction: value.instruction } : {}),
+          ...(channelId ? { channelId } : {}),
           ...(initiator ? { initiator } : {}),
         });
         return { scheduled: record.id, dueAt: record.dueAt };
@@ -465,9 +530,18 @@ export function createWakeUpRunner(options: {
             continue;
           }
           const actor = await actorFor(payload.ownerUserId);
+          const scheduledFrom = payload.channelId
+            ? await channels.get(actor, payload.channelId)
+            : null;
+          /*
+           * The channel it was scheduled from, while this Bot is still in it. One the person has
+           * left or deleted reads as null, and one the Bot was taken out of since is passed over:
+           * both wake in the direct conversation instead, which the person still reads and which
+           * never puts the Bot back into a conversation it was removed from.
+           */
           const channel =
-            (payload.channelId
-              ? await channels.get(actor, payload.channelId)
+            (scheduledFrom?.agentIds.includes(payload.agentId)
+              ? scheduledFrom
               : null) ?? (await channels.direct(actor, payload.agentId));
           const initiator: AuditInitiator = {
             kind: "routine",

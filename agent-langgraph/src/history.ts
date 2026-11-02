@@ -85,6 +85,25 @@ export function toLangChainMessages(
     const id = (message as { toolCallId?: string }).toolCallId;
     if (id) resultsByCall.set(id, String(message.content ?? ""));
   }
+  /*
+   * The one screenshot the model gets to see as a picture: the latest answered one. Every earlier
+   * one is described in words instead, so a long review session costs a few hundred tokens per
+   * screenshot rather than a million. See `shapeToolResult`.
+   */
+  let latestScreenshot: string | undefined;
+  for (const message of input.messages) {
+    if (message.role !== "assistant") continue;
+    for (const call of message.toolCalls ?? []) {
+      if (
+        call.id &&
+        answered.has(call.id) &&
+        callDetails(call).name === "computer_screenshot" &&
+        screenshotOf(resultsByCall.get(call.id) ?? "")
+      ) {
+        latestScreenshot = call.id;
+      }
+    }
+  }
 
   for (const message of input.messages) {
     // Placed with the call they answer, below, rather than wherever they arrived.
@@ -124,15 +143,32 @@ export function toLangChainMessages(
        */
       for (const call of message.toolCalls ?? []) {
         if (!call.id) continue;
+        const raw = resultsByCall.get(call.id) ?? "";
         messages.push(
           new ToolMessage({
             tool_call_id: call.id,
             content: answered.has(call.id)
-              ? (resultsByCall.get(call.id) ?? "")
+              ? shapeToolResult(raw, call.id === latestScreenshot)
               : NO_ANSWER_CAME,
             name: callDetails(call).name,
           }),
         );
+        const shot = call.id === latestScreenshot ? screenshotOf(raw) : null;
+        if (shot && showable(shot)) {
+          // A user-role turn straight after the tool result; the providers that take one user
+          // turn at a time merge the two, and all three read an image_url part.
+          messages.push(
+            new HumanMessage({
+              content: [
+                { type: "text", text: "The screenshot that call returned:" },
+                {
+                  type: "image_url",
+                  image_url: { url: `data:image/png;base64,${shot.base64}` },
+                },
+              ],
+            }),
+          );
+        }
       }
     }
   }
@@ -222,4 +258,106 @@ function callDetails(call: {
           ? "{}"
           : JSON.stringify(args),
   };
+}
+
+/**
+ * WHY TOOL RESULTS ARE SHAPED BEFORE THE MODEL SEES THEM.
+ *
+ * A tool result travels as text. `computer_screenshot` answers with a PNG as base64, which is the
+ * right shape for the transcript to draw and the wrong shape for a model to read: base64 tokenises
+ * at close to a token per character, so one full-size screenshot is around a million tokens, and
+ * every later turn sends it again. Found live: a Site PM review thread died with "prompt is too
+ * long: 1156376 tokens" after a single screenshot, and stayed dead, because the thread keeps the
+ * result. The picture still reaches the model, once, as an image part on the latest screenshot,
+ * where it costs a few hundred to a few thousand tokens. Anything else that is plainly a base64
+ * blob, and any result past a generous length, is cut with a note that says so.
+ */
+const MAX_TOOL_RESULT_CHARS = 120_000;
+const BASE64_BLOB = /^[A-Za-z0-9+/\s]{4096,}={0,2}$/;
+/** Anthropic refuses an image past 5 MB or 8000 px on a side; the others are no stricter. */
+const MAX_IMAGE_BASE64_CHARS = 5 * 1024 * 1024 * (4 / 3);
+const MAX_IMAGE_SIDE = 8000;
+
+type Screenshot = { base64: string; width: number; height: number };
+
+function screenshotOf(raw: string): Screenshot | null {
+  if (!raw.includes('"base64"')) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      typeof parsed.base64 === "string" &&
+      parsed.base64.length >= 64 &&
+      typeof parsed.width === "number" &&
+      typeof parsed.height === "number"
+    ) {
+      return {
+        base64: parsed.base64,
+        width: parsed.width,
+        height: parsed.height,
+      };
+    }
+  } catch {
+    // Not JSON: not a screenshot.
+  }
+  return null;
+}
+
+function showable(shot: Screenshot): boolean {
+  return (
+    shot.base64.length <= MAX_IMAGE_BASE64_CHARS &&
+    shot.width <= MAX_IMAGE_SIDE &&
+    shot.height <= MAX_IMAGE_SIDE
+  );
+}
+
+function kilobytes(base64: string): number {
+  return Math.round((base64.length * 3) / 4 / 1024);
+}
+
+export function shapeToolResult(raw: string, latestScreenshot = false): string {
+  const shot = screenshotOf(raw);
+  let text = raw;
+  if (shot) {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const where = latestScreenshot
+      ? showable(shot)
+        ? "shown to you as an image right after this result"
+        : "too large to show you; use computer_read or computer_snapshot instead"
+      : "an earlier screenshot, no longer shown; take a new one if you need to look again";
+    parsed.base64 = `[PNG ${shot.width}x${shot.height}, ${kilobytes(shot.base64)} KB; ${where}]`;
+    text = JSON.stringify(parsed);
+  } else if (raw.includes('"') || raw.includes("{")) {
+    // Any other base64 blob riding inside a JSON result, whatever the field is called.
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      let changed = false;
+      const strip = (value: unknown): unknown => {
+        if (typeof value === "string") {
+          if (value.length >= 4096 && BASE64_BLOB.test(value)) {
+            changed = true;
+            return `[binary data omitted, ${kilobytes(value)} KB]`;
+          }
+          return value;
+        }
+        if (Array.isArray(value)) return value.map(strip);
+        if (value && typeof value === "object") {
+          return Object.fromEntries(
+            Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+              k,
+              strip(v),
+            ]),
+          );
+        }
+        return value;
+      };
+      const stripped = strip(parsed);
+      if (changed) text = JSON.stringify(stripped);
+    } catch {
+      // Not JSON: left as it is, subject to the length cap below.
+    }
+  }
+  if (text.length > MAX_TOOL_RESULT_CHARS) {
+    text = `${text.slice(0, MAX_TOOL_RESULT_CHARS)}\n\n[result cut at ${MAX_TOOL_RESULT_CHARS} characters; ${text.length - MAX_TOOL_RESULT_CHARS} more were not shown]`;
+  }
+  return text;
 }

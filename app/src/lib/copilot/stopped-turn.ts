@@ -16,13 +16,28 @@ import { useEffect, useState } from "react";
  */
 
 /**
+ * What a message refused because its conversation was busy is told, instead of the client's words.
+ *
+ * The platform runs one turn per conversation and refuses another while the first holds it, which
+ * the client reports as "Thread <id> is locked". True, and of no use to the person reading it, who
+ * takes it to mean the conversation is broken. It lasts only as long as the other turn: the Bot's
+ * last reply still finishing after its text appeared, or a routine posting into this conversation.
+ */
+export const BUSY_CONVERSATION =
+  "This conversation was still busy with another turn (the last reply finishing, or a routine running here), so your message didn't go through. Send it again in a moment.";
+
+/**
  * The sentence to show, in the words of whatever ended the turn.
  *
  * Falls back only when there is genuinely nothing to pass on. Saying "the Bot stopped without saying
  * why" is honest about that; inventing a cause would not be, and this is the one moment a person has
- * no other way to find out what went wrong.
+ * no other way to find out what went wrong. The one rewording is a busy conversation, matched on the
+ * error's name, which the client sets on every instance, rather than with `instanceof`, which a second
+ * copy of the client bundled elsewhere would fail.
  */
 export function stoppedReason(reported: unknown): string {
+  if (reported instanceof Error && reported.name === "AgentThreadLockedError")
+    return BUSY_CONVERSATION;
   const said =
     reported instanceof Error
       ? reported.message

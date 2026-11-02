@@ -30,7 +30,10 @@ import {
   agentQueryOptions,
 } from "@/lib/agents/queries";
 import { useStartChannel } from "@/lib/channels/start";
-import { useSkillCommands } from "@/lib/plugins/skill-commands";
+import {
+  skillInstructionsFor,
+  useSkillCommands,
+} from "@/lib/plugins/skill-commands";
 import { newId } from "../../../../lib/new-id";
 
 /**
@@ -230,10 +233,15 @@ function RouteComponent() {
           setError(null);
           setSent(seedMessage(draft.text, newId()));
 
+          // The `/` skills this message was sent with, resolved exactly as `channel-chat` does for
+          // every later turn. Left out, the first message of a new channel offered the skill in the
+          // menu and then sent the text without it.
+          const skillInstructions = skillInstructionsFor(draft, skillCommands);
+
           try {
             // Recorded, then started: a coworker picked here is as much a choice as an `@` on the
             // home screen, and the trail has to say so for both.
-            await startChosen(recipient.id, draft.text);
+            await startChosen(recipient.id, draft.text, skillInstructions);
           } catch (caught) {
             // Preserve the unsent draft when channel creation fails.
             setSent(null);

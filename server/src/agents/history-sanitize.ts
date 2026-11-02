@@ -94,13 +94,14 @@ export function sanitizeSeededHistory(
    * as answered here while the API still threw on every retry.
    *
    * ONLY A USER ROW IS A BOUNDARY, though the API also stops at a system row. That is because it
-   * checks the converted messages, and `BuiltInAgent` drops every `system` and `developer` row on
-   * the way there unless `forwardSystemMessages` or `forwardDeveloperMessages` is set, which this
-   * deployment never does (`builtInAgentConfiguration` in `copilot.ts`). A skill's instructions
-   * arrive as a system row the browser inserts ahead of the person's message, so a call answered
-   * after one of those is answered as far as the model call is concerned, and treating the row as
-   * a boundary would drop a call the request would have carried fine. If either forwarding flag is
-   * ever turned on, that role becomes a boundary here too.
+   * checks the converted messages, and by the time the built-in runtime converts them no system row
+   * sits between a call and its answer: `forwardSystemMessages` is on (`builtInAgentConfiguration`
+   * in `copilot.ts`, so a skill's instructions reach the model at all), and `hoistSystemRows` below
+   * moves every forwarded row ahead of the whole conversation first. A skill's instructions arrive
+   * as a system row the browser inserts ahead of the person's message, so a call answered after one
+   * of those is answered as far as the model call is concerned, and treating the row as a boundary
+   * would drop a call the request would have carried fine. If forwarded rows ever stop being
+   * hoisted, that role becomes a boundary here too.
    */
   const boundaryAfter: number[] = new Array(history.length).fill(
     history.length,
@@ -177,4 +178,40 @@ export function sanitizeSeededHistory(
     if (toolCallId === undefined) return true;
     return surviving.has(toolCallId) && answerAt.get(toolCallId) === index;
   });
+}
+
+/**
+ * Ids of the system rows the built-in prompt already carries. The run pipeline puts both at the head
+ * of every run's messages for the remote frameworks, which have no prompt field to receive them; the
+ * built-in runtime used to drop every system row on conversion, which hid the duplicate. Forwarding
+ * system rows would send each twice, so these two are left to the prompt.
+ */
+const IN_THE_PROMPT = ["standing-role:", "granted-tools:"];
+
+/**
+ * Every forwarded system row ahead of the conversation, in the order it arrived.
+ *
+ * WHY HOIST. A skill picked in the browser arrives as a system row inserted just before the person's
+ * message, deep in the thread. OpenAI takes a system turn anywhere; Anthropic's Messages API and
+ * Gemini take one system prompt, first, and the AI SDK refuses a system row that follows a user or
+ * assistant turn before any request is made. Hoisted, the rows sit where every provider accepts
+ * them, and the model reads the skill as standing instructions for the run, which is what it is.
+ * This is the same shape `agent-langgraph/src/history.ts` gives those providers.
+ *
+ * Called after `sanitizeSeededHistory`, never before: that filter reasons about where a call's
+ * answer may land, and a system row that has moved to the front is no longer between anything.
+ */
+export function hoistSystemRows(history: Message[]): Message[] {
+  const hoisted: Message[] = [];
+  const rest: Message[] = [];
+  for (const message of history) {
+    const { role, id } = message as { role?: string; id?: string };
+    if (role !== "system" && role !== "developer") {
+      rest.push(message);
+      continue;
+    }
+    if (IN_THE_PROMPT.some((prefix) => id?.startsWith(prefix))) continue;
+    hoisted.push(message);
+  }
+  return [...hoisted, ...rest];
 }

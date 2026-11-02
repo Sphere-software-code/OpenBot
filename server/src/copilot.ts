@@ -15,7 +15,10 @@ import {
   type ActorAgentResolver,
   CoworkerUnavailableError,
 } from "./agents/agent-resolver";
-import { sanitizeSeededHistory } from "./agents/history-sanitize";
+import {
+  hoistSystemRows,
+  sanitizeSeededHistory,
+} from "./agents/history-sanitize";
 import {
   PLAN_RUN_COMPLETED,
   PlanModel,
@@ -434,6 +437,16 @@ export function builtInAgentConfiguration(
       ...(learnedSkills?.catalog ? [learnedSkills.catalog] : []),
     ].join("\n\n"),
     ...(planModel ? {} : { apiKey: apiKey ?? undefined }),
+    /*
+     * A skill picked in the browser arrives as a system row ahead of the person's message, and
+     * the runtime's default drops every system row on conversion. With that default, every `/`
+     * skill on a built-in Bot was silently a no-op: the menu offered it, the transcript showed it
+     * invoked, and the model never saw a word of it. The rows this deployment itself puts at the
+     * head of a run (the standing role and the holdings) are already in `prompt` above, so
+     * `hoistSystemRows` leaves those out and moves the rest ahead of the conversation, where every
+     * provider accepts them.
+     */
+    forwardSystemMessages: true,
     /*
      * A run stops after one step unless told otherwise, which for a Bot with tools means it calls
      * one and never speaks: the tool executes, the result arrives, and the run ends before the model
@@ -1639,7 +1652,27 @@ class BuiltInAgentWithSaneHistory extends BuiltInAgent {
     const answeredByResume = new Set(
       (input.resume ?? []).map((entry) => entry.interruptId),
     );
-    const history = sanitizeSeededHistory(input.messages, answeredByResume);
+    const history = hoistSystemRows(
+      sanitizeSeededHistory(input.messages, answeredByResume),
+    );
+    /*
+     * One line per run that carries forwarded rows, so a skill that seems to have no effect can
+     * be told apart from one that never arrived: the browser attaches it, this is where it is
+     * read. The head of each row, not the whole, because an instruction is pages long.
+     */
+    const forwarded = history.filter((message) => message.role === "system");
+    if (forwarded.length > 0) {
+      console.log(
+        JSON.stringify({
+          type: "skill-rows-forwarded",
+          threadId: input.threadId,
+          count: forwarded.length,
+          heads: forwarded.map((message) =>
+            String(message.content ?? "").slice(0, 80),
+          ),
+        }),
+      );
+    }
     const load = this.loadAttachment;
     /*
      * ALONGSIDE THE GUARD ABOVE, NOT INSTEAD OF IT. One drops a conversation the model provider is

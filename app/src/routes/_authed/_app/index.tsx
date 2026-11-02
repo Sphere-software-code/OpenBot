@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { AgentCard } from "@/components/agents/agent-card";
@@ -20,6 +20,7 @@ import {
   routeMessage,
 } from "@/lib/channels/route";
 import { useStartChannel } from "@/lib/channels/start";
+import { skillInstructionsForAgent } from "@/lib/plugins/skill-commands";
 import { appConfig } from "@/lib/generated/application-config";
 
 export const Route = createFileRoute("/_authed/_app/")({
@@ -34,6 +35,7 @@ function RouteComponent() {
   } = useQuery(agentListQueryOptions());
   const explore = agents?.filter(isSharedWithYou);
   const { start, startChosen, pending } = useStartChannel();
+  const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
 
   /** Default recipient when the composer draft has no mention. */
@@ -66,10 +68,21 @@ function RouteComponent() {
               // run, it falls back to the same default the composer used to always use.
               setError(null);
               try {
+                // This composer has no `/` menu, since the coworker is only known once the draft
+                // names it, so a skill arrives typed. Resolved against that coworker's own skills,
+                // the same list a channel's menu is built from.
                 if (draft.agentId) {
                   // Recorded and started as one sequence, shared with `/channel/new`: the person
                   // already decided, and the trail has to say so wherever they decided it.
-                  await startChosen(draft.agentId, draft.text);
+                  await startChosen(
+                    draft.agentId,
+                    draft.text,
+                    await skillInstructionsForAgent(
+                      queryClient,
+                      draft.agentId,
+                      draft,
+                    ),
+                  );
                   return;
                 }
                 let agentId: string | undefined;
@@ -81,7 +94,11 @@ function RouteComponent() {
                   agentId = fallback?.id;
                 }
                 if (!agentId) return;
-                await start(agentId, draft.text);
+                await start(
+                  agentId,
+                  draft.text,
+                  await skillInstructionsForAgent(queryClient, agentId, draft),
+                );
               } catch (caught) {
                 setError(
                   caught instanceof Error

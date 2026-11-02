@@ -3,12 +3,17 @@ import type { RunAgentInput } from "@ag-ui/core";
 import { ChatAnthropic } from "@langchain/anthropic";
 import {
   AIMessage,
+  HumanMessage,
   SystemMessage,
   ToolMessage,
 } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
-import { NO_ANSWER_CAME, toLangChainMessages } from "../src/history";
+import {
+  NO_ANSWER_CAME,
+  shapeToolResult,
+  toLangChainMessages,
+} from "../src/history";
 
 /**
  * A tool call nobody answered does not end the conversation.
@@ -373,5 +378,141 @@ describe("a provider that takes one system prompt", () => {
         .slice(-3),
     ).toEqual(["Revenue rose 4%.", "system", "Again, shorter."]);
     expect(messages.filter((m) => m instanceof SystemMessage)).toHaveLength(4);
+  });
+});
+
+describe("screenshots and other large tool results", () => {
+  const png = (chars: number) => "A".repeat(chars);
+  const shotCall = (id: string) => ({
+    id,
+    type: "function" as const,
+    function: { name: "computer_screenshot", arguments: "{}" },
+  });
+  const shotResult = (chars: number) =>
+    JSON.stringify({
+      ok: true,
+      base64: png(chars),
+      width: 1440,
+      height: 900,
+      capturedAt: "2026-10-29T12:00:00Z",
+    });
+
+  test("the latest screenshot reaches the model as an image, not as a million characters of text", () => {
+    const input = {
+      threadId: "t",
+      runId: "r",
+      messages: [
+        { id: "u1", role: "user", content: "Review the page." },
+        {
+          id: "a1",
+          role: "assistant",
+          content: "",
+          toolCalls: [shotCall("c1")],
+        },
+        {
+          id: "t1",
+          role: "tool",
+          toolCallId: "c1",
+          content: shotResult(1_200_000),
+        },
+      ],
+      tools: [],
+      context: [],
+      state: {},
+      forwardedProps: {},
+    } as unknown as RunAgentInput;
+    const messages = toLangChainMessages(input, "anthropic");
+    const tool = messages.find((m) => m instanceof ToolMessage) as ToolMessage;
+    expect(String(tool.content).length).toBeLessThan(400);
+    expect(String(tool.content)).toContain("1440x900");
+    expect(String(tool.content)).toContain("shown to you as an image");
+    const after = messages[messages.indexOf(tool) + 1] as HumanMessage;
+    expect(after).toBeInstanceOf(HumanMessage);
+    const parts = after.content as {
+      type: string;
+      image_url?: { url: string };
+    }[];
+    expect(parts[1]?.type).toBe("image_url");
+    expect(parts[1]?.image_url?.url.startsWith("data:image/png;base64,")).toBe(
+      true,
+    );
+    // The total text the model reads stays small even though the thread holds the whole PNG.
+    const textChars = messages
+      .filter((m) => !(m instanceof HumanMessage && Array.isArray(m.content)))
+      .reduce((sum, m) => sum + String(m.content).length, 0);
+    expect(textChars).toBeLessThan(20_000);
+  });
+
+  test("older screenshots are described, and only the latest is shown", () => {
+    const input = {
+      threadId: "t",
+      runId: "r",
+      messages: [
+        { id: "u1", role: "user", content: "Review the page." },
+        {
+          id: "a1",
+          role: "assistant",
+          content: "",
+          toolCalls: [shotCall("c1")],
+        },
+        {
+          id: "t1",
+          role: "tool",
+          toolCallId: "c1",
+          content: shotResult(50_000),
+        },
+        {
+          id: "a2",
+          role: "assistant",
+          content: "Scrolling.",
+          toolCalls: [shotCall("c2")],
+        },
+        {
+          id: "t2",
+          role: "tool",
+          toolCallId: "c2",
+          content: shotResult(50_000),
+        },
+      ],
+      tools: [],
+      context: [],
+      state: {},
+      forwardedProps: {},
+    } as unknown as RunAgentInput;
+    const messages = toLangChainMessages(input, "openai");
+    const tools = messages.filter(
+      (m) => m instanceof ToolMessage,
+    ) as ToolMessage[];
+    expect(String(tools[0]?.content)).toContain("no longer shown");
+    expect(String(tools[1]?.content)).toContain("shown to you as an image");
+    const images = messages.filter(
+      (m) => m instanceof HumanMessage && Array.isArray(m.content),
+    );
+    expect(images).toHaveLength(1);
+  });
+
+  test("a screenshot too large for any provider is described instead of sent", () => {
+    const huge = JSON.stringify({
+      ok: true,
+      base64: png(8_000_000),
+      width: 1440,
+      height: 12_000,
+    });
+    expect(shapeToolResult(huge, true)).toContain("too large to show you");
+  });
+
+  test("a base64 blob under any other name is cut, and ordinary results are untouched", () => {
+    const blob = JSON.stringify({ ok: true, file: png(10_000) });
+    expect(shapeToolResult(blob)).toContain("[binary data omitted");
+    const plain = JSON.stringify({ ok: true, text: "Hello, this is a page." });
+    expect(shapeToolResult(plain)).toBe(plain);
+    expect(shapeToolResult("just words")).toBe("just words");
+  });
+
+  test("an oversized text result is cut with a note", () => {
+    const long = "x".repeat(200_000);
+    const shaped = shapeToolResult(long);
+    expect(shaped.length).toBeLessThan(120_200);
+    expect(shaped).toContain("[result cut at 120000 characters");
   });
 });

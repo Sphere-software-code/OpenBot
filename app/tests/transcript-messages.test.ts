@@ -4,6 +4,7 @@ import {
   seedMessage,
   stashFirstMessage,
   takeFirstMessage,
+  takeFirstMessageSkills,
   transcriptMessages,
 } from "../src/components/channels/transcript-messages";
 
@@ -76,5 +77,22 @@ describe("the first-message stash", () => {
     stashFirstMessage("channel_d", "for d");
     expect(takeFirstMessage("channel_d")).toBe("for d");
     expect(takeFirstMessage("channel_c")).toBe("for c");
+  });
+});
+
+describe("first message skills", () => {
+  test("the skills picked on the compose screen travel with the first message, once", () => {
+    stashFirstMessage("channel_s", "Acme", ["Research the brand."]);
+    expect(takeFirstMessage("channel_s")).toBe("Acme");
+    expect(takeFirstMessageSkills("channel_s")).toEqual([
+      "Research the brand.",
+    ]);
+    expect(takeFirstMessageSkills("channel_s")).toEqual([]);
+  });
+
+  test("a message stashed without skills carries none, even after an earlier stash had some", () => {
+    stashFirstMessage("channel_t", "first", ["Do a thing."]);
+    stashFirstMessage("channel_t", "second");
+    expect(takeFirstMessageSkills("channel_t")).toEqual([]);
   });
 });

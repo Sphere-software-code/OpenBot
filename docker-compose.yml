@@ -215,7 +215,7 @@ services:
       COMPUTER_RUNTIME: ${COMPUTER_RUNTIME:-}
       # Identity, when SPIRE is part of this deployment. The supervisor registers an entry per Bot
       # and mounts the agent's socket into that Bot's computer so it can fetch its own SVID.
-      SPIRE_SOCKET: /tmp/spire-server/private/api.sock
+      # SPIRE_SOCKET: /tmp/spire-server/private/api.sock
       SPIRE_TRUST_DOMAIN: openbot.local
       SPIRE_AGENT_ID: spiffe://openbot.local/spire/agent/join_token/${SPIRE_JOIN_TOKEN:-openbot-dev-token}
       SPIRE_AGENT_SOCKET_VOLUME: ${COMPOSE_PROJECT_NAME:-openbot}_spire-agent-socket

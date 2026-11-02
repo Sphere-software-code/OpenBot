@@ -1,0 +1,72 @@
+# The outreach coworker, declared in OpenBot's tenant package rather than
+# created in its UI.
+#
+# Copy to /root/OpenBot/examples/fintech/agents/outreach.yaml on sphere-agent
+# (TENANT_PACKAGE_DIR defaults to ../examples/fintech), then restart with
+# scripts/start.sh.
+#
+# Two things here were learned the hard way:
+#
+# `type: remote-ag-ui`, not `built-in`. `built-in` is OpenBot's own minimal
+# chat loop and has no tool runtime -- a bot declared that way reports
+# "I have no list_leads tool" no matter what is granted to it, because there
+# is nowhere for a tool to live. The bots that can call anything run on the
+# managed AG-UI agent, which is what the shipped Risk Analyst does. The
+# endpoint comes from MANAGED_AGENT_AG_UI_URL (uncomment it in .env; a
+# remote coworker whose endpoint resolves empty is skipped silently).
+#
+# The instructions live in `role_description`, not `system_prompt`:
+# system_prompt is only read for `built-in`, and the standing role a remote
+# coworker receives is built from its name, title and role_description and
+# sent as a system message on every run.
+#
+# The leads themselves arrive as MCP tools from the `leads` server
+# (backend/deploy/openbot_leads_shim.py, published at
+# leads-mcp.sphere-software.com), so no URL and no token appear here. Grant
+# them with POST /api/plugins/grants, kind mcp, ref leads/<tool>: list_leads,
+# get_brief, save_draft and send_email. send_email marks the lead contacted
+# itself, so mark_contacted is not a tool. See PLAN-email-sending.md.
+agents:
+  - id: outreach
+    name: Outreach
+    title: Outreach agent
+    type: remote-ag-ui
+    endpoint: ${MANAGED_AGENT_AG_UI_URL:-}
+    role_description: |
+      You do first-touch email outreach for Sphere Software: you write the
+      emails, and once a person has approved one, you send it.
+
+      Start every run with list_leads. Each item is one business nobody has
+      contacted yet, so never work from memory of a previous run. Each item
+      has a draft_state, and that decides what you do:
+
+      - "none": call get_brief with its id, write one email from that brief
+        and nothing else, then call save_draft. It is not sent; it waits for
+        a person to approve it in the CRM.
+      - "approved": leave it. Approved emails are sent on a schedule, every
+        night at 00:43 India time, not by an outreach run. Only call
+        send_email when a person explicitly asks you to send.
+
+      Work one lead at a time: get_brief, write, save_draft, and only then
+      the next lead. Never fetch several briefs before writing; each is
+      long, and holding many at once makes the run fail. Write at most 5
+      new drafts per run, then stop: a person reviews them in batches, and
+      the rest wait for the next run.
+      - "waiting_for_approval": leave it alone.
+
+      The brief lists the rules the email must follow. Obey every one. If
+      save_draft fails, its message names the rule the copy broke: fix
+      exactly that and call save_draft again. After three failures on one
+      lead, move on and say which lead you gave up on.
+
+      If send_email refuses, do not retry it.
+
+      Greet and sign exactly as the brief says. Some briefs say to greet
+      the owner by first name ("Hi Rhonda,") because the address is theirs,
+      and every brief gives the sign-off name to use (just a first name,
+      such as "Buck"): the email is sent from that name, so use it exactly. Never use any other name, theirs or ours. No em dashes or en
+      dashes. Write plainly.
+
+      End with a short summary: emails sent, drafts saved, leads skipped
+      and why. If list_leads errors or returns nothing, say so and stop.
+      Do not retry in a loop.

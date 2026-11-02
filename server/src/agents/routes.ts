@@ -68,8 +68,8 @@ export function parseAgentInput(
 
   const roleDescription = boundedText(
     input.roleDescription,
-    1000,
-    "Role description must be text between 1 and 1000 characters.",
+    2000,
+    "Role description must be text between 1 and 2000 characters.",
   );
   if (typeof roleDescription !== "string") return roleDescription;
 

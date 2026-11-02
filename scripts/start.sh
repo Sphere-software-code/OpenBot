@@ -15,6 +15,11 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 LOGS="$ROOT/.logs"
 mkdir -p "$LOGS"
+# A started stack is one `scripts/watchdog.sh` should keep up again; `stop.sh` leaves this behind.
+rm -f "$LOGS/watchdog.hold"
+# And while this runs, the watchdog leaves the stack to it rather than start a second one beside it.
+echo "$$" > "$LOGS/start.pid"
+trap 'rm -f "$LOGS/start.pid"' EXIT
 
 if [ ! -f "$ROOT/.env" ]; then
   printf '\033[31m%s\033[0m\n' ".env is missing. Copy .env.example to .env and fill in the required settings."
@@ -371,20 +376,28 @@ wait_for_openbot "$SERVER_PORT" server
 # The old pattern matched those containers, the guard false-positived, and the worker silently never
 # started. `bun worker/src/index.ts` matches nothing else in the repo. Running from `$ROOT` is safe:
 # relative imports resolve from the importing file, not from the process's cwd.
-if ! running "bun worker/src/index.ts"; then
-  WORKER_DATABASE_URL="$(setting DATABASE_URL postgres://openbot:openbot@localhost:5432/openbot)"
-  (cd "$ROOT" && \
-    DATABASE_URL="$WORKER_DATABASE_URL" \
-    SERVER_INTERNAL_URL="http://localhost:$SERVER_PORT" \
-    WORKER_SHARED_SECRET="$WORKER_SHARED_SECRET" \
-    bun worker/src/index.ts >"$LOGS/worker.log" 2>&1 &)
-  info "  worker: started (routine sweep loop)"
+#
+# A worker that is already running is restarted, not left alone. Running proves it is alive, not that
+# it holds this run's WORKER_SHARED_SECRET: one started before a real secret was put in `.env` keeps
+# the default forever, the server above (which was probed with the new secret and kept) answers every
+# dispatch with 401, and routines are offered, retried five times and reaped as "skipped" every day
+# while the worker log is the only place that says why. It has no endpoint to probe the way the server
+# is probed, and a restart costs nothing: the sweep is idempotent by offer key, and a claimed firing
+# whose lease lapses is picked up again by the new process.
+if running "bun worker/src/index.ts"; then
+  stop_matching "bun worker/src/index.ts"
   sleep 1
-  if ! running "bun worker/src/index.ts"; then
-    red "  worker: did not stay up, check $LOGS/worker.log"
-  fi
-else
-  info "  worker: already running"
+fi
+WORKER_DATABASE_URL="$(setting DATABASE_URL postgres://openbot:openbot@localhost:5432/openbot)"
+(cd "$ROOT" && \
+  DATABASE_URL="$WORKER_DATABASE_URL" \
+  SERVER_INTERNAL_URL="http://localhost:$SERVER_PORT" \
+  WORKER_SHARED_SECRET="$WORKER_SHARED_SECRET" \
+  bun worker/src/index.ts >"$LOGS/worker.log" 2>&1 &)
+info "  worker: started (routine sweep loop)"
+sleep 1
+if ! running "bun worker/src/index.ts"; then
+  red "  worker: did not stay up, check $LOGS/worker.log"
 fi
 
 info "3/4  Runtime health"
