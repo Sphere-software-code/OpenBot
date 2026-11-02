@@ -22,7 +22,9 @@ import {
   parseEgressRules,
 } from "../../../agent-computer/src/egress";
 import type { NetworkPolicyRow } from "../admin/settings-store";
-import type { ComputerProvider } from "./provider";
+import type { WebBotAuth } from "../web-bot-auth";
+import { type ComputerSeat, computerKeyText, seatText } from "./computer-key";
+import type { ComputerLocation, ComputerProvider } from "./provider";
 
 export type { EgressPolicy, EgressRule };
 export { DEFAULT_EGRESS_DESTINATIONS, egressDecision, parseEgressRules };
@@ -66,46 +68,110 @@ export type EgressPushReport = {
 };
 
 /**
- * Push each running computer the policy its Bot's owner is under.
+ * The Bots a running computer carries, each of which holds a policy of its own there.
+ *
+ * A seat on the shared computer and an isolated Bot's computer each name their Bot. A person's
+ * computer carries every Bot that person has used, and only the computer knows which, so it is asked.
+ */
+async function botsOn(
+  computer: ComputerLocation,
+  options: { token?: string; fetchImpl: typeof fetch },
+): Promise<string[]> {
+  if (computer.botId) return [computer.botId];
+  if (computer.key.kind === "bot") return [computer.key.botId];
+  const response = await options.fetchImpl(
+    `${(computer.url ?? "").replace(/\/$/, "")}/computers`,
+    {
+      headers: options.token
+        ? { "x-openbot-computer-token": options.token }
+        : {},
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (!response.ok) throw new Error(`the computer answered ${response.status}`);
+  const body = (await response.json().catch(() => null)) as {
+    computers?: { botId?: unknown }[];
+  } | null;
+  return [
+    ...new Set(
+      (body?.computers ?? []).flatMap((seat) =>
+        typeof seat.botId === "string" ? [seat.botId] : [],
+      ),
+    ),
+  ];
+}
+
+/**
+ * Push each running computer the policy each of its Bots' owners is under.
  *
  * Only running computers, read from `provider.list()`, which never wakes one. A computer that answers
  * 404 is running an agent-computer without the `/egress-policy` route and is reported, not retried
- * in a loop.
+ * in a loop. Each Bot on a computer is pushed once, however many seats it has there.
  */
 export async function pushEgressPolicies(options: {
   provider: ComputerProvider;
   token?: string;
   policyForBot: (botId: string) => Promise<EgressPolicy>;
+  webBotAuth?: WebBotAuth;
   fetchImpl?: typeof fetch;
 }): Promise<EgressPushReport> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const report: EgressPushReport = { pushed: [], failed: [] };
   const computers = await options.provider.list();
+  const done = new Set<string>();
   for (const computer of computers) {
     if (computer.status !== "running" || !computer.url) continue;
+    let bots: string[];
     try {
-      const policy = await options.policyForBot(computer.botId);
-      await pushEgressPolicy(computer.url, computer.botId, policy, {
+      bots = await botsOn(computer, {
         ...(options.token ? { token: options.token } : {}),
         fetchImpl,
       });
-      report.pushed.push(computer.botId);
     } catch (error) {
       report.failed.push({
-        botId: computer.botId,
+        botId: computerKeyText(computer.key),
         reason: error instanceof Error ? error.message : String(error),
       });
+      continue;
+    }
+    for (const botId of bots) {
+      const once = `${computer.url}|${botId}`;
+      if (done.has(once)) continue;
+      done.add(once);
+      try {
+        const policy = await options.policyForBot(botId);
+        await pushEgressPolicy(computer.url, botId, policy, {
+          ...(options.token ? { token: options.token } : {}),
+          ...(options.webBotAuth ? { webBotAuth: options.webBotAuth } : {}),
+          fetchImpl,
+        });
+        report.pushed.push(botId);
+      } catch (error) {
+        report.failed.push({
+          botId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
   return report;
 }
 
-/** Push one computer one Bot's policy. Throws with the reason when the computer does not take it. */
+/**
+ * Push one computer one Bot's policy. Throws with the reason when the computer does not take it.
+ *
+ * The deployment's Web Bot Auth key travels in the same body when it is on, so every computer that
+ * has a policy also has the key its browser signs with, and one pushed no key stops signing.
+ */
 export async function pushEgressPolicy(
   url: string,
   botId: string,
   policy: EgressPolicy,
-  options: { token?: string; fetchImpl?: typeof fetch } = {},
+  options: {
+    token?: string;
+    webBotAuth?: WebBotAuth;
+    fetchImpl?: typeof fetch;
+  } = {},
 ): Promise<void> {
   const response = await (options.fetchImpl ?? fetch)(
     `${url.replace(/\/$/, "")}/egress-policy`,
@@ -118,11 +184,46 @@ export async function pushEgressPolicy(
       },
       body: JSON.stringify({
         policy: { mode: policy.mode, rules: policy.rules },
+        ...(options.webBotAuth
+          ? {
+              webBotAuth: {
+                agent: options.webBotAuth.agent,
+                jwk: options.webBotAuth.privateJwk,
+              },
+            }
+          : {}),
       }),
       signal: AbortSignal.timeout(5_000),
     },
   );
   if (!response.ok) throw new Error(`the computer answered ${response.status}`);
+}
+
+/**
+ * Push one Bot's computer its policy now, not on the way to its next action: for a change that must reach a computer
+ * already pushed this run, which the push on wake (once per run) would not send again. A recording starting in the Bot's
+ * browser widens its policy, and one ending narrows it back (browser/bot-browser.ts). Throws with the reason when the
+ * computer does not take it; does nothing where no policy is pushed at all.
+ */
+export function policyPusher(options: {
+  /** The Bot's computer, checked as every computer address is (the gateway's `locate`). */
+  locate: (botId: string) => Promise<string>;
+  policyForBot: (
+    botId: string,
+  ) => Promise<EgressPolicy | undefined> | undefined;
+  token?: string;
+  webBotAuth?: WebBotAuth;
+  fetchImpl?: typeof fetch;
+}): (botId: string) => Promise<void> {
+  return async (botId) => {
+    const policy = await options.policyForBot(botId);
+    if (!policy) return;
+    await pushEgressPolicy(await options.locate(botId), botId, policy, {
+      ...(options.token ? { token: options.token } : {}),
+      ...(options.webBotAuth ? { webBotAuth: options.webBotAuth } : {}),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    });
+  };
 }
 
 /** Without a run to compare, how long a pushed policy is trusted before it is pushed again. */
@@ -149,13 +250,20 @@ export function withPolicyPushOnWake(
       botId: string,
     ) => Promise<EgressPolicy | undefined> | undefined;
     token?: string;
+    webBotAuth?: WebBotAuth;
     fetchImpl?: typeof fetch;
   },
 ): ComputerProvider {
+  /*
+   * Keyed by seat, not by Bot: one Bot on two people's computers is two computers, each of which
+   * starts empty, and a push to one says nothing about the other.
+   */
   const pushed = new Map<string, { run: string | undefined; at: number }>();
-  const ensure = async (botId: string, url: string) => {
-    const run = await provider.sessionOf?.(botId).catch(() => undefined);
-    const last = pushed.get(botId);
+  const ensure = async (seat: ComputerSeat, url: string) => {
+    const botId = seat.botId;
+    const id = seatText(seat);
+    const run = await provider.sessionOf?.(seat).catch(() => undefined);
+    const last = pushed.get(id);
     if (
       last &&
       (run !== undefined
@@ -170,9 +278,10 @@ export function withPolicyPushOnWake(
       if (!policy) return;
       await pushEgressPolicy(url, botId, policy, {
         ...(options.token ? { token: options.token } : {}),
+        ...(options.webBotAuth ? { webBotAuth: options.webBotAuth } : {}),
         ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       });
-      pushed.set(botId, { run, at: Date.now() });
+      pushed.set(id, { run, at: Date.now() });
     } catch (error) {
       console.warn(
         JSON.stringify({
@@ -185,9 +294,9 @@ export function withPolicyPushOnWake(
     }
   };
   return Object.assign(Object.create(provider) as ComputerProvider, {
-    locate: async (botId: string) => {
-      const url = await provider.locate(botId);
-      await ensure(botId, url);
+    locate: async (seat: ComputerSeat) => {
+      const url = await provider.locate(seat);
+      await ensure(seat, url);
       return url;
     },
   });

@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import type { VoiceSessionRecord } from "../../shared/voice-session";
+import type { VoiceSessionRecord } from "@openbot/shared/voice-session";
 import {
   loadVoiceArchive,
   saveVoiceSession,
@@ -157,4 +157,19 @@ test("earlier calls' context is cut between characters", () => {
   ]);
   expect(context.isWellFormed()).toBe(true);
   expect(context).toBe(`${emoji.repeat(5999)}.`);
+});
+
+/*
+ * The transcript skips re-rendering a voice-chat card whose message object is the same one it drew
+ * last time. Building a new object for every call on every render meant every card re-rendered on
+ * every token of a reply streaming below it.
+ */
+test("the same call gives the same card message on every render", () => {
+  const messages = [{ id: "before", role: "user" as const, content: "Before" }];
+  const calls = [call("first", "before")];
+
+  const once = withVoiceChats(messages, calls);
+  const again = withVoiceChats([...messages], calls);
+
+  expect(again[1]).toBe(once[1]);
 });

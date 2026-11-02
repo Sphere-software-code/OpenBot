@@ -20,6 +20,8 @@
  * `locked_until` — is exactly the duplicated firing mechanism #235 exists to prevent: two half-right
  * implementations of the same hard thing, one of which nobody tests.
  */
+
+import type { HeadlessWaiting } from "@openbot/toolkit/headless-tools";
 import {
   and,
   asc,
@@ -33,7 +35,6 @@ import {
   ne,
   sql,
 } from "drizzle-orm";
-import type { HeadlessWaiting } from "../computer/headless-tools";
 import type { Database } from "../db/client";
 import {
   channelAgents,

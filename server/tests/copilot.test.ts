@@ -5,9 +5,13 @@ import type { AbstractAgent, RunAgentInput } from "@ag-ui/client";
 import { HttpAgent } from "@ag-ui/client";
 import { LLMock } from "@copilotkit/aimock";
 import { BuiltInAgent } from "@copilotkit/runtime/v2";
+import {
+  computerGuidance,
+  PROVENANCE_GUIDANCE,
+} from "@openbot/shared/bot-prompt";
+import { defaultModelFor } from "@openbot/shared/model-providers";
 import { EMPTY, lastValueFrom } from "rxjs";
 import { z } from "zod";
-import { PROVENANCE_GUIDANCE } from "../../shared/bot-prompt";
 import { createActorAgentResolver } from "../src/agents/agent-resolver";
 import { MAX_INLINED_BYTES_PER_RUN } from "../src/channels/attachment-parts";
 import { loadConfig } from "../src/config";
@@ -16,6 +20,7 @@ import {
   buildAgents,
   builtInAgentConfiguration,
   createRequestAgents,
+  generativeUiMiddlewares,
   type LoadInstructions,
   registeredAgentFromRow,
   resolveRuntimeAgents,
@@ -217,6 +222,30 @@ describe("deployment model selection", () => {
       expect(request.model).toBe("gpt-5.6-terra");
     },
   );
+
+  /*
+   * Switching the provider away from the package's own, without naming a model. The two fallbacks are
+   * not the same source: OpenAI's is the built-in Bot's own (it speaks the Responses API), Anthropic's
+   * is the shared spec's. See BUILT_IN_OPENAI_FALLBACK_MODEL in copilot.ts.
+   */
+  test("switched to OpenAI with no model named, the built-in Bot falls back to its own OpenAI model", () => {
+    const model = runtimeModelForEnvironment(
+      { provider: "anthropic", defaultModel: "claude-from-package" },
+      { BOT_PROVIDER: "openai" },
+    );
+    expect(model.provider).toBe("openai");
+    expect(model.defaultModel).toBe("gpt-5.6-terra");
+  });
+
+  test("switched to Anthropic with no model named, the built-in Bot falls back to the shared spec's", () => {
+    const model = runtimeModelForEnvironment(
+      { provider: "openai", defaultModel: "gpt-from-package" },
+      { BOT_PROVIDER: "anthropic" },
+    );
+    expect(model.provider).toBe("anthropic");
+    expect(model.defaultModel).toBe(defaultModelFor("anthropic"));
+    expect(model.defaultModel).toBe("claude-sonnet-4-5");
+  });
 });
 
 describe("registered Copilot agents", () => {
@@ -964,7 +993,7 @@ function fakeAgUiEndpoint() {
  * A Bot is told what it holds, not only handed it.
  *
  * A tool array tells a model a tool exists. It does not say the tool is the right way to reach that
- * system, and it competes with `COMPUTER_GUIDANCE`: a page of emphatic prose about the browser that
+ * system, and it competes with `computerGuidance`: a page of emphatic prose about the browser that
  * every Bot gets whether or not it has a single connector, and that mentions connectors nowhere.
  *
  * The browser prose won. A Bot holding four Google Drive tools browsed to drive.google.com, met a
@@ -1046,6 +1075,53 @@ describe("what a Bot is told it holds", () => {
     );
   });
 
+  /*
+   * THE CARD TOOL. Every Bot holds `show_app_access`, and the sentences that used to end on "an
+   * administrator can grant it" now tell the Bot to call it — which puts a card with Request access
+   * in front of the person, where the sentence put the name of a role.
+   */
+  const card = { name: "show_app_access" } as never;
+
+  test("tells a Bot to show the card for a connected vendor it holds nothing for", () => {
+    const guidance = grantedToolGuidance([card], ["composio-gmail"])
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    expect(guidance).toContain("composio-gmail");
+    expect(guidance).toContain("you hold none of their tools");
+    expect(guidance).toContain("call show_app_access with its name");
+    expect(guidance).not.toContain(
+      "administrator can grant it on that connector",
+    );
+    expect(guidance).toContain("do not browse to its website");
+  });
+
+  test("tells a Bot to show the card for an app this deployment does not connect at all", () => {
+    const guidance = grantedToolGuidance([card])
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    expect(guidance).toContain("not named here at all");
+    expect(guidance).toContain("show_app_access");
+    expect(guidance).toContain("ask an administrator");
+  });
+
+  test("never lists the card tool as a system the Bot can reach", () => {
+    // Listed beside the vendors, it would read as one more system reached "as the person asking".
+    const guidance = grantedToolGuidance([...drive, card]);
+    expect(guidance).not.toMatch(/^- .*show_app_access/m);
+    expect(guidance).toContain("search_files");
+    expect(grantedToolGuidance([card])).not.toContain(
+      "You can reach these systems directly",
+    );
+  });
+
+  test("a Bot not offered the card is still told to name the administrator, as before", () => {
+    const guidance = grantedToolGuidance([], ["google-drive"])
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    expect(guidance).toContain("administrator can grant it on that connector");
+    expect(guidance).not.toContain("show_app_access");
+  });
+
   test("says nothing at all when the Bot holds nothing", () => {
     // A deployment with no connectors must not be told about connectors it does not have.
     expect(grantedToolGuidance([])).toBe("");
@@ -1063,7 +1139,7 @@ describe("what a Bot is told it holds", () => {
       { provider: "openai", defaultModel: "gpt-5.6-terra" },
       "openai-secret",
       drive,
-      "BROWSER GUIDANCE HERE",
+      () => "BROWSER GUIDANCE HERE",
     ).prompt as string;
 
     // Order is the fix, not merely presence: the grants have to land before the browser prose.
@@ -1071,6 +1147,88 @@ describe("what a Bot is told it holds", () => {
     expect(prompt.indexOf("google-drive")).toBeLessThan(
       prompt.indexOf("BROWSER GUIDANCE HERE"),
     );
+  });
+});
+
+/**
+ * Whether the browser leaves searching to a search tool, decided by what this run holds.
+ *
+ * "search for X" in a demo made a Bot drive its browser to a search engine. The guidance has two
+ * wordings, and which one a built-in Bot gets has to follow the tools it is built with, including a
+ * narrowed run that was not offered the search tool it was granted.
+ */
+describe("what a built-in Bot is told about searching", () => {
+  const promptHolding = (
+    tools: { name: string; ref: string }[],
+    guidance: typeof computerGuidance | null = computerGuidance,
+  ) => {
+    const configuration = builtInAgentConfiguration(
+      {
+        id: "general-assistant",
+        name: "General Assistant",
+        type: "built_in",
+        systemPrompt: "Be helpful.",
+      },
+      { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      "openai-secret",
+      tools as never[],
+      guidance ?? undefined,
+    );
+    return String((configuration as { prompt?: unknown }).prompt);
+  };
+  const card = { name: "show_app_access", ref: "app-access/show_app_access" };
+  const exaSearch = {
+    name: "mcp__exa__web_search_exa",
+    ref: "exa/web_search_exa",
+  };
+  const exaFetch = {
+    name: "mcp__exa__web_fetch_exa",
+    ref: "exa/web_fetch_exa",
+  };
+
+  test.each([
+    ["a provider's pair", [card, exaSearch, exaFetch]],
+    ["a search tool alone", [card, exaSearch]],
+    [
+      "another provider",
+      [
+        card,
+        {
+          name: "mcp__firecrawl__firecrawl_search",
+          ref: "firecrawl/firecrawl_search",
+        },
+      ],
+    ],
+  ])("holding %s, it is told to search with it", (_, tools) => {
+    const prompt = promptHolding(tools);
+    expect(prompt).toContain(computerGuidance({ search: true }));
+    expect(prompt).not.toContain(computerGuidance({ search: false }));
+  });
+
+  test.each([
+    ["nothing", []],
+    ["only the card", [card]],
+    ["a reader with no search", [card, exaFetch]],
+    [
+      "a tool called search that finds no sources",
+      [
+        card,
+        {
+          name: "mcp__google-drive__search_files",
+          ref: "google-drive/search_files",
+        },
+      ],
+    ],
+  ])("holding %s, it is told never to search in the browser", (_, tools) => {
+    const prompt = promptHolding(tools);
+    expect(prompt).toContain(computerGuidance({ search: false }));
+    expect(prompt).not.toContain(computerGuidance({ search: true }));
+  });
+
+  test("a deployment with no computer is told about neither", () => {
+    const prompt = promptHolding([card, exaSearch], null);
+    expect(prompt).toContain("Be helpful.");
+    expect(prompt).not.toContain("computer_navigate");
   });
 });
 
@@ -1130,6 +1288,13 @@ describe("where a Bot says its answer came from", () => {
     expect(guidance).toContain("this is not an instruction to go looking");
     expect(guidance).toContain("mark it plainly as unverified");
     expect(guidance).toContain("do not go hunting the open web");
+  });
+
+  test("it leaves finding sources to a search tool, and offers to check one without", () => {
+    // Without this, a Bot granted a search tool still answered current figures from memory.
+    const guidance = PROVENANCE_GUIDANCE.toLowerCase().replace(/\s+/g, " ");
+    expect(guidance).toContain("finding sources is what a search tool is for");
+    expect(guidance).toContain("offer to check a source the person names");
   });
 
   test("it names the answers that must not be stated without a source", () => {
@@ -1200,7 +1365,7 @@ describe("a person's standing instructions", () => {
       model,
       "openai-secret",
       [{ name: "mcp__google-drive__search_files" }] as never[],
-      "Computer guidance.",
+      () => "Computer guidance.",
       [],
       "Write in British English.",
     ).prompt as string;
@@ -1859,7 +2024,7 @@ describe("where an attachment reaches the model, and where it deliberately does 
   ];
 
   test("a built-in Bot's run fails naming the attachment it could not load", async () => {
-    // Protects `BuiltInAgentWithSaneHistory.run` (copilot.ts:~924). Drop the
+    // Protects `BuiltInAgentWithSaneHistory.run` (toolkit/src/copilotkit/agents.ts). Drop the
     // `inlineAttachments` call there and this run completes instead of erroring.
     const agents = await buildAgents(
       [assistant],
@@ -1930,7 +2095,7 @@ describe("where an attachment reaches the model, and where it deliberately does 
 
   test("the narrowed built-in path reads the attachment once, not twice", async () => {
     /*
-     * Protects the exclusion: `RunBuiltAgent.run` (copilot.ts:~989) deliberately does not call
+     * Protects the exclusion: `RunBuiltAgent.run` (toolkit/src/copilotkit/agents.ts) deliberately does not call
      * `resolveAttachmentParts` itself. It only delegates to the built-in agent its `build()`
      * produces, and that agent's own `run` is what inlines the attachment. Re-adding the call at
      * `RunBuiltAgent.run` would read the same attachment a second time, which is what turns this
@@ -2056,7 +2221,7 @@ describe("where an attachment reaches the model, and where it deliberately does 
      * The permanence half of the same argument. `inlineAttachments` maps over the WHOLE history and
      * history is replayed every turn, so a row deleted by the sweeper after an interrupted send
      * would otherwise fail this channel's every future turn for ever, exactly as the dangling call
-     * in `agents/history-sanitize.ts` did in production. The old part says the file is gone; the
+     * in `toolkit/history-sanitize.ts` did in production. The old part says the file is gone; the
      * one the person is actually asking about still arrives as bytes.
      */
     const agent = await builtInWith(async (id) =>
@@ -2506,5 +2671,21 @@ describe("where an attachment reaches the model, and where it deliberately does 
       (messages[4] as { content?: { source?: unknown }[] }).content?.[0]
         ?.source,
     ).toMatchObject({ type: "data" });
+  });
+});
+
+describe("generativeUiMiddlewares", () => {
+  test("a deployment that opted out refuses render_ui whatever the browser sends", () => {
+    // Omitted, the runtime would apply it to any run that carries a catalog.
+    expect(generativeUiMiddlewares(false).generativeUI).toBe(false);
+  });
+
+  test("a deployment that opted in applies render_ui to every run", () => {
+    expect(generativeUiMiddlewares(true).generativeUI).toBe(true);
+  });
+
+  test("the A2UI 0.9 middleware is off either way", () => {
+    expect(generativeUiMiddlewares(true).a2ui).toEqual({ enabled: false });
+    expect(generativeUiMiddlewares(false).a2ui).toEqual({ enabled: false });
   });
 });

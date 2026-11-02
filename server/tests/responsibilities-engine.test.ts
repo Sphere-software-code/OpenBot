@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { HeadlessToolSuspension } from "../src/computer/headless-tools";
+import { HeadlessToolSuspension } from "@openbot/toolkit/headless-tools";
 import { createResponsibilityEngine } from "../src/responsibilities/engine";
 import {
-  parseResponsibilityInput,
   parseResponsibilityEvent,
+  parseResponsibilityInput,
   type ResponsibilityRunContext,
   type ResponsibilityRunOutcome,
 } from "../src/responsibilities/types";

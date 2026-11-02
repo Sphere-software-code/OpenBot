@@ -78,7 +78,7 @@ startup.
 
 Compose puts it on a different network from PostgreSQL. A Bot has a shell, and a shell reaches whatever its container reaches, so the database is on a `data` network carrying only itself and `migrate`, and everything else is on `default`. A deployment that runs the API server inside Compose rather than on the host joins it to both, which is the one place the two meet.
 
-With `COMPUTER_SUPERVISOR_URL`, each Bot gets its own computer container, workspace volume, and browser profile. Without it, all Bots share `AGENT_COMPUTER_URL`.
+With `COMPUTER_SUPERVISOR_URL`, each person gets a computer container of their own, and every Bot they use has its own folder and browser profile in it; a Bot marked Isolated gets a container of its own instead. Without it, all Bots share `AGENT_COMPUTER_URL`, still with a profile and folder for each person and Bot.
 
 Each computer also filters its own outbound connections. The browser and shell commands go through a filter proxy that applies the Bot's network policy (`allow_all`, `defaults_plus_allowlist`, `allowlist_only` or `deny_all`, which is what a Bot gets when its owner's Cloud network access is switched off). The server pushes the policy before the computer acts and whenever it wakes, and until one arrives nothing may leave. `EGRESS_POLICY_REQUIRED=0` is for a computer run with no API server. Cloud metadata addresses are refused in every mode. A process that ignores the proxy variables and opens a raw socket is not stopped by this; that is a Kubernetes NetworkPolicy's job.
 
@@ -126,6 +126,18 @@ Computer actions carry the initiator too. A run with no browser attached (a rout
 a group turn) is given the computer tools server-side, with the Bot and the person bound before the
 model supplies any arguments, and the gateway writes that run's initiator on every decision.
 
+### Taking the trail out
+
+The Audit screen's **Export CSV** downloads the current filter as
+`GET /api/admin/audit-events?format=csv`: the same filtered query as the table, walked page by
+page up to 5,000 rows and returned as RFC 4180 CSV with the redacted payload as one JSON column.
+An export that hits the cap holds the newest 5,000 and answers with `X-Audit-Export-Truncated`
+(the row count), and the screen says so, so a reviewer narrows `from`/`to` or a filter instead of
+citing a partial trail. A cell that starts with `=`, `+`, `-` or `@` is prefixed with `'`, so a
+name or URL somebody chose opens in a spreadsheet as text, never as a formula. Every export is
+itself recorded as `audit.exported`, with who took it, how many rows, and under which filter. An
+unknown `format` is a 400, like any other malformed audit query.
+
 ## Human control and secrets
 
 Handovers are audited as control events:
@@ -136,11 +148,13 @@ Handovers are audited as control events:
 
 While a person controls the browser, Bot actions are refused rather than queued. A run with no browser attached pauses instead, waiting on the handover.
 
+The handover is also the designed fallback for a bot check a Bot cannot pass (a "Verify you are human" page, a CAPTCHA). OpenBot reduces how often that happens (headed Chromium, optional Web Bot Auth signatures, an optional residential proxy; see [Getting past bot checks](configuration.md#getting-past-bot-checks)) and never solves one on anyone's behalf: the Bot asks, the person solves it in the live screen, and hands back. A help request records the page it was made on, so a computer that restarted in between reopens that page rather than handing over a blank browser.
+
 Secret entry is separate from chat content. The audit trail records that a secret was requested or supplied and the character count, not the secret value.
 
 ## Watching a Bot work
 
-Two surfaces beside the conversation. The screen is the live browser, proxied over a websocket and gated on the same question as every other route about that Bot. The Activity tab is what the Bot did away from the browser: every command with its output and exit code, every file read, write and listing, newest first.
+Two surfaces beside the conversation. The screen is the live browser, proxied over a websocket and gated on the same question as every other route about that Bot. The Activity list under it is what the Bot did away from the browser: every command with its output and exit code, every file read, write and listing, newest first.
 
 Activity is held in the browser for the open conversation and is gone on reload. It is a window rather than a record; the record is the audit trail, which is server-side, survives restarts, and is what an investigation reads. A saved file contributes its path and size and never its contents, matching the write route, which declines to echo them because a Bot may be saving something it was told in confidence.
 
@@ -293,15 +307,17 @@ MCP servers and skills share the plugin grant table, but they have different own
 - MCP tools are admin-governed because they can reach external systems with stored credentials.
 - Skills are reusable instructions. A person can create personal skills and attach them only to Bots they own. Administrators create deployment skills.
 
-The curated MCP catalogue contains Parallel Search (anonymous, or with this deployment's API key; see [parallel-research.md](parallel-research.md)), Google Drive, Notion, and the built-in Routines server. Custom MCP servers must pass URL checks; unknown tools and custom-server tools are treated as writes unless positively classified as reads.
+The curated MCP catalogue contains the public-web research providers Parallel, Exa and Firecrawl (see [web-research.md](web-research.md)), Google Drive, Notion, and the built-in Routines server. Custom MCP servers must pass URL checks; unknown tools and custom-server tools are treated as writes unless positively classified as reads.
 
 A catalogue entry says whose credential a Bot reaches it with, which is a different question from whether it is reachable at all. A deployment-wide token answers the same for everybody; Google Drive and Notion are both `user-oauth`, so a Bot reaches them as the person asking and sees only what that person can see. An administrator enabling the connector and a person connecting their own account are two decisions, and neither can be made for the other. See [Google Drive](plugins/google-drive.md) and [Notion](plugins/notion.md).
 
 Every MCP call checks the grant first, then evaluates the same action policy engine with MCP context, then audits the result.
 
+Whether a person can use an app through a Bot is answered once, on the server, from those same facts — the app's row, the Bot's grants, the person's own connection, a Shared app's team account — as one of six states: `ready`, `not_connected`, `reconnect`, `shared_not_connected`, `disabled` or `not_granted` (`server/src/plugins/app-access.ts`). The last three are an administrator's to fix, so a person can file a request (`app_access_requests`) for exactly what the state is missing, and approving one performs it — switching the app on, granting it to the Bot — through the same code paths the admin screens use. See [Composio](plugins/composio.md#what-an-app-is-for-one-person-on-one-bot).
+
 ### Writing a skill in a conversation
 
-A skill can be written from the composer as well as from `/skills`. The deployment ships a skill called `skill-creator` whose instruction is how to interview somebody about the skill they want; a Bot holding it is also offered four tools the app registers — `list_skills`, `read_skill`, `list_skill_tools`, and `save_skill`, which suspends the run on a card showing the command, the title and the whole instruction. Nothing is written until the person presses the button.
+A skill can be written from the composer as well as from `/capabilities/skills`. The deployment ships a skill called `skill-creator` whose instruction is how to interview somebody about the skill they want; a Bot holding it is also offered four tools the app registers — `list_skills`, `read_skill`, `list_skill_tools`, and `save_skill`, which suspends the run on a card showing the command, the title and the whole instruction. Nothing is written until the person presses the button.
 
 The grant is the gate. Those four tools are offered only while the Bot holds `skill-creator`, because four extra tools on every run costs the narrowing above what it exists to buy, and a Bot for looking up transactions has no business drafting skills.
 
@@ -319,6 +335,31 @@ A skill declares the tools it needs (`skill_tools`). Before the run starts, the 
 
 This narrows the offer. It is not a boundary, and it never substitutes for one. The grant, the policy and the audit row decide what may happen; this decides only what the model can see. Every way it can fail — no skills declared, a model that cannot answer, a message that matches nothing, twelve tools or fewer — leaves the whole catalogue offered, because a narrowing that failed closed would remove capability an administrator granted, silently. `mcp.tools_discovered` records what was offered, out of how much, and why.
 
+## Personal memory
+
+A person's memory is kept in CopilotKit Intelligence when the deployment is entitled to Intelligence
+memory (`features.memory` in its runtime entitlement), and in OpenBot's own tables when it is not.
+
+- **Intelligence holds the content and does the recall.** Every memory the person has accepted is
+  mirrored there: one they wrote, a Bot-formed or imported one once they confirm it. Editing a memory
+  supersedes its Intelligence copy; pausing or forgetting it retires it, because Intelligence has no
+  field for "paused". Recall for a search is ranked by Intelligence.
+- **OpenBot keeps what Intelligence has no field for.** Intelligence stores only content, kind and
+  scope, so the OpenBot row stays the record of where a memory came from, its review state, which Bot
+  formed it and which source imported it. Those decide which Bot may see a memory, and they are applied
+  to everything Intelligence returns before a Bot sees it: a Bot-formed memory still reaches only the
+  Bot that formed it, while it holds the source app.
+- **Only the person's own memories.** Every call names the person and asks for `user` scope with no
+  project access, and project-scoped results are dropped, so one person's Bot never sees another
+  person's memory.
+- **Memories formed elsewhere.** A memory Intelligence holds for the person that no OpenBot row
+  describes (another app on the same project, or Intelligence itself) appears in their Memory page as
+  "Kept in Intelligence" and is recalled as their own. It can be edited or forgotten there, not paused.
+- **Without Intelligence memory** (not entitled, a lapsed licence, an outage), OpenBot reads and writes
+  its tables exactly as before and nothing fails. Writes made meanwhile are mirrored by the memory sweep
+  once Intelligence memory is available again; the first passes after a deployment becomes entitled are
+  the backfill of everything it already holds.
+
 ## Tenant package and knowledge
 
 `TENANT_PACKAGE_DIR` points at the tenant package. The default is `../examples/fintech`.
@@ -334,7 +375,7 @@ Required package files:
 Optional: `skills.yaml`, `theme.css`, and an `agents/` directory holding a coworker per file, read
 alongside `agents.yaml`. See [configuration.md](configuration.md#agents).
 
-The server validates the package at startup. Channel agent IDs must match declared agents. Knowledge sources currently support Google Drive and Microsoft OneDrive declarations.
+The server validates the package at startup. Channel agent IDs must match declared agents. `knowledge.yaml` accepts Google Drive and Microsoft OneDrive declarations and is validated, but nothing reads it yet; see [configuration.md](configuration.md#knowledgeyaml).
 
 Connector credentials are stored through the credential vault and referenced by id, not stored inline in YAML.
 

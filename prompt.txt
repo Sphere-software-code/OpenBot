@@ -49,7 +49,7 @@ B. CLONE: RUN OPENBOT LOCALLY, CHANGE IT, OR EDIT A TENANT PACKAGE
 Use this to run OpenBot from source on their machine, or to edit code or configuration.
 
 Requirements for the clone path:
-- Bun 1.3.14. The repository pins it in package.json.
+- Bun 1.4.3. The repository pins it in package.json.
 - Docker CLI plus Docker Compose, or a compatible `docker` command/socket. `scripts/start.sh`
   calls `docker compose` for PostgreSQL and shipped Bots; Podman works only when it is exposed
   through that Docker-compatible command path.
@@ -103,9 +103,9 @@ OpenBot root where `.env` is:
   npx copilotkit@latest local connect --approve-connection
 
 `local connect` writes INTELLIGENCE_API_URL, INTELLIGENCE_GATEWAY_WS_URL and
-CPK_INTELLIGENCE_API_KEY to `.env`. OpenBot reads the first two as they are but takes its project
-key only from INTELLIGENCE_API_KEY, so copy the `cpk-...` value of CPK_INTELLIGENCE_API_KEY into
-INTELLIGENCE_API_KEY before `bash scripts/start.sh`. The local licence lasts 30 days;
+CPK_INTELLIGENCE_API_KEY to `.env`. OpenBot reads those values directly; do not copy or rename
+the key. INTELLIGENCE_API_KEY remains a legacy fallback when the CLI key is empty or absent.
+When both are set, the non-empty CLI key takes precedence. The local licence lasts 30 days;
 `npx copilotkit@latest local renew` renews it as often as needed while the account is in good
 standing. Skip the managed `project select` and setup-learning commands on this path.
 

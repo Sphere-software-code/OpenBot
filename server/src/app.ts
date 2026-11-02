@@ -1,8 +1,8 @@
+import { MAX_IMAGE_BYTES } from "@openbot/shared/attachments";
 import type { Hono as HonoApp, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "hono/bun";
-import { MAX_IMAGE_BYTES } from "../../shared/attachments";
 import { enterpriseControls } from "./admin/controls";
 import { createEnterpriseGate } from "./admin/gate";
 import { createEnterpriseAdminRoutes } from "./admin/routes";
@@ -13,6 +13,7 @@ import {
   sameToken,
 } from "./agents/callback-token";
 import { computerAccessCheck } from "./agents/computer-access";
+import { deploymentCanIsolate } from "./agents/isolation";
 import {
   type BotLifecycleServices,
   createBotLifecycleRoutes,
@@ -28,8 +29,10 @@ import {
   AuditQueryError,
   type AuditReader,
   type AuditStore,
+  auditEventsToCsv,
   auditQueryFromUrl,
   DEPLOYMENT_INITIATOR,
+  readAuditExportRows,
   recordAuditEvent,
 } from "./audit";
 import { createDevRequireUser } from "./auth/dev-actor";
@@ -42,6 +45,15 @@ import {
 } from "./auth/guards";
 import type { IdentityProviderStore } from "./auth/identity-provider-store";
 import { desktopAuthPage } from "./auth/native-browser";
+import {
+  type BotBrowserRouteDeps,
+  createBotBrowser,
+} from "./browser/bot-browser";
+import {
+  type BrowserRouteDeps,
+  browserConnectionRevoked,
+  createBrowserRoutes,
+} from "./browser/routes";
 import {
   createAttachmentRoutes,
   createChannelAttachmentRoutes,
@@ -72,9 +84,6 @@ import {
   createDeliveryRoutes,
   createDeliveryWebhookRoutes,
 } from "./delivery/routes";
-import type { DemonstrationRecorder } from "./demonstrations/recording";
-import { createDemonstrationRoutes } from "./demonstrations/routes";
-import type { DemonstrationStore } from "./demonstrations/store";
 import { mountDesktopConnectionFailure } from "./desktop-connection-failure";
 import { createTranscriptionProvider } from "./dictation/provider";
 import { createDictationRoutes } from "./dictation/routes";
@@ -87,6 +96,10 @@ import {
   createLearningRoutes,
   type LearningAdminDependencies,
 } from "./learning/routes";
+import {
+  createPersonalLearningRoutes,
+  type PersonalLearningRouteDeps,
+} from "./learning/sharing-routes";
 import type { MemoryIngestion } from "./memory/ingestion";
 import { createMemoryRoutes } from "./memory/routes";
 import type { MemoryStore } from "./memory/store";
@@ -94,7 +107,9 @@ import { parsePageLimit } from "./paging";
 import { createPasswordRoutes, createSignInRoutes } from "./passwords/routes";
 import type { SignInService } from "./passwords/service";
 import type { OnboardingStore } from "./people/onboarding";
+import { createProfileRoutes, type ProfileStore } from "./people/profile";
 import { MAX_PAGE, type PeopleStore } from "./people/store";
+import type { BrokerProvider } from "./plugins/access";
 import type { AccountModeSwitch } from "./plugins/account-mode";
 import type { ComposioBroker } from "./plugins/broker";
 import { createPluginRoutes } from "./plugins/routes";
@@ -113,6 +128,9 @@ import {
   type ModelProviderProxy,
   mountProviderOAuthProxy,
 } from "./provider-oauth";
+import { createRequireRecorder } from "./recorder/guard";
+import { createRecorderRoutes } from "./recorder/routes";
+import type { RecorderExtensionDeps } from "./recorder/wiring";
 import type { ResponsibilityBindingStore } from "./responsibilities/bindings";
 import type { ResponsibilityEngine } from "./responsibilities/engine";
 import { createGithubResponsibilityRoutes } from "./responsibilities/github";
@@ -138,6 +156,10 @@ import { userPreferencesRoutes } from "./user-preferences-routes";
 import { createVoiceProvider } from "./voice/provider";
 import { createVoiceRoutes } from "./voice/routes";
 import type { VoiceSessionServices } from "./voice/session-routes";
+import {
+  DIRECTORY_PATH as WEB_BOT_AUTH_DIRECTORY_PATH,
+  directoryResponse as webBotAuthDirectory,
+} from "./web-bot-auth";
 
 /**
  * How much of a multipart body is boundary, headers and other fields rather than file.
@@ -380,18 +402,27 @@ export function createApp(
    * configured, which is the correct degraded behaviour: a deployment with no Composio API key has
    * no app directory to offer, rather than one that lists apps nobody can connect.
    */
-  composio?: { broker: ComposioBroker },
+  composio?: { broker: ComposioBroker; provider: BrokerProvider },
   /** Native model OAuth stays server-side; callers hold only a separate local bearer. */
   modelProviderProxy?: ModelProviderProxy,
   userPreferences?: UserPreferencesStore,
   voiceSessions?: VoiceSessionServices,
   learning?: LearningAdminDependencies,
   coworker?: {
-    demonstrations?: {
-      store: DemonstrationStore;
-      recorder: DemonstrationRecorder;
-    };
     approvals?: ApprovalService;
+    /** The Recorder extension's routes and guards (recorder/wiring.ts). Absent, nothing about it is mounted. */
+    recorder?: RecorderExtensionDeps;
+    /** A person's own OpenBot browser, with the Recorder in it already connected (browser/routes.ts). Absent, nothing
+     * about it is mounted and the app shows no Browser button. */
+    browser?: Omit<BrowserRouteDeps, "requireUser" | "auditStore">;
+    /** A Bot's browser worked by a person: its bar and Record (browser/bot-browser.ts), under the computer routes. Absent,
+     * or with no computer, nothing about it is mounted. */
+    botBrowser?: Omit<
+      BotBrowserRouteDeps,
+      "gateway" | "auditStore" | "botName"
+    >;
+    /** Settings, Learning: who else's Bots use a person's own learned Skills. Absent, the screen has nothing to read. */
+    personalLearning?: PersonalLearningRouteDeps;
     /**
      * Shared apps: who may use an app's one team account, and the switch that makes an app Shared.
      *
@@ -441,12 +472,21 @@ export function createApp(
   identity?: IdentityStore,
   /** The GitHub sign-in callback, built by the caller; mounted behind requireUser ahead of /api/identity. */
   identityGithubCallback?: Hono<{ Variables: AppVariables }>,
+  profileStore?: ProfileStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
   mountDesktopConnectionFailure(app, desktopHostToken);
   mountProviderOAuthProxy(app, modelProviderProxy);
 
   app.get("/health", (context) => context.json({ status: "ok" }));
+  // The public key Bots' browsers sign their requests with, where Cloudflare and any other verifier
+  // look for it. Public by design, and absent when Web Bot Auth is off. See web-bot-auth.ts.
+  const webBotAuth = config.webBotAuth;
+  if (webBotAuth) {
+    app.get(WEB_BOT_AUTH_DIRECTORY_PATH, (context) =>
+      webBotAuthDirectory(context.req.raw, webBotAuth),
+    );
+  }
   // Projected, never the raw runtime. config.runtime carries the Intelligence contract, including
   // INTELLIGENCE_API_KEY and the licence token, and this endpoint is reachable by anyone. Returning
   // the object wholesale would serve deployment secrets to the browser. Add fields here explicitly.
@@ -469,6 +509,16 @@ export function createApp(
       selfHostBanner: selfHostBanner
         ? await selfHostBanner.shown()
         : config.selfHostBanner,
+      /*
+       * Whether this is somebody trying OpenBot on their own machine, not an organization's
+       * deployment. Onboarding reads it to explain where OpenBot can run, which only the person
+       * evaluating it needs and an organization's employees should never be pitched.
+       *
+       * Single-user mode, not a new switch: it is already true only with no identity provider and
+       * no address anybody else can reach (see `singleUserAllowed` in config.ts), which is exactly
+       * a local trial, and an operator cannot forget to set it.
+       */
+      localEvaluation: config.singleUser,
       transcription: Boolean(config.transcription),
       voice: Boolean(config.voice),
       /*
@@ -546,7 +596,7 @@ export function createApp(
         : [];
       if (!roles.includes("admin")) {
         return context.json(
-          { error: "Only an administrator may change identity providers." },
+          { error: "Only an admin can change identity providers." },
           403,
         );
       }
@@ -640,6 +690,7 @@ export function createApp(
     context.json({
       user: {
         ...context.var.actor,
+        ...(profileStore ? await profileStore.read(context.var.actor.id) : {}),
         /*
          * Read here rather than in the guard, so only this route pays the extra query. Null means
          * this deployment does not track onboarding, which the app reads as nothing to finish;
@@ -651,6 +702,7 @@ export function createApp(
       },
     }),
   );
+  app.route("/api/me/profile", createProfileRoutes(requireUser, profileStore));
   app.post("/api/me/onboarding", requireUser, async (context) => {
     if (!onboardingStore) {
       return context.json({ error: "Onboarding is not available." }, 503);
@@ -833,9 +885,54 @@ export function createApp(
     }
 
     try {
-      return context.json(
-        await auditReader.list(auditQueryFromUrl(new URL(context.req.url))),
-      );
+      const url = new URL(context.req.url);
+      const format = url.searchParams.get("format");
+      if (
+        format !== null &&
+        format !== "" &&
+        format !== "json" &&
+        format !== "csv"
+      ) {
+        return context.json(
+          { error: 'Query parameter "format" must be "json" or "csv".' },
+          400,
+        );
+      }
+      /*
+       * The export answers the same filtered query as the list — `eventType`,
+       * `actorUserId`, `initiatorKind`, `targetType`, `targetId`, `from`, `to` — so the
+       * downloaded file and the table agree. Paging (`cursor`, `limit`) belongs to the
+       * JSON list and is ignored here; the export walks every matching page up to the
+       * cap in `readAuditExportRows` and names the file after the day it was pulled.
+       */
+      if (format === "csv") {
+        const query = auditQueryFromUrl(url);
+        const { events, truncated } = await readAuditExportRows(
+          auditReader,
+          query,
+        );
+        if (auditStore) {
+          const { cursor: _cursor, limit: _limit, ...filters } = query;
+          await recordAuditEvent(auditStore, {
+            eventType: "audit.exported",
+            targetType: "audit_trail",
+            actorUserId: context.var.actor.id,
+            payload: { format: "csv", rows: events.length, truncated, filters },
+          });
+        }
+        const day = new Date().toISOString().slice(0, 10);
+        context.header("Content-Type", "text/csv; charset=utf-8");
+        context.header(
+          "Content-Disposition",
+          `attachment; filename="audit-events-${day}.csv"`,
+        );
+        // The row count it stopped at, so the page can say how much the file holds.
+        if (truncated) {
+          context.header("X-Audit-Export-Truncated", String(events.length));
+        }
+        return context.body(auditEventsToCsv(events));
+      }
+      return context.json(await auditReader.list(auditQueryFromUrl(url)));
     } catch (error) {
       if (error instanceof AuditQueryError) {
         return context.json({ error: error.message }, 400);
@@ -946,7 +1043,7 @@ export function createApp(
      */
     if (context.var.actor.id === userId && role !== "admin") {
       return context.json(
-        { error: "You cannot remove your own administrator role." },
+        { error: "You can't remove your own admin role." },
         409,
       );
     }
@@ -1326,6 +1423,19 @@ export function createApp(
         agentProfileStore ? computerAccessCheck(agentProfileStore) : canUseBot,
         pageFrames,
         auditReader,
+        coworker?.botBrowser
+          ? createBotBrowser({
+              ...coworker.botBrowser,
+              gateway: computerGateway,
+              ...(auditStore ? { auditStore } : {}),
+              ...(agentProfileStore
+                ? {
+                    botName: async (actor, botId) =>
+                      (await agentProfileStore.get(actor, botId))?.name ?? null,
+                  }
+                : {}),
+            })
+          : undefined,
       ),
     );
   }
@@ -1386,6 +1496,19 @@ export function createApp(
         // stores as running at this address — can be told apart from one a person hosts.
         config.managedAgent?.endpoint?.toString(),
         coworker?.shared?.use,
+        // So testing one of our own addresses knocks with the token the run will use, rather than
+        // reporting a refusal for a Bot this deployment started itself.
+        config.managedAgent
+          ? {
+              token: config.managedAgent.token,
+              endpoints: [
+                config.managedAgent.endpoint,
+                config.managedAgent.alsoRun,
+              ].filter((url): url is URL => url !== undefined),
+            }
+          : undefined,
+        // Whether a Bot can have a computer of its own here: only where the provider makes computers.
+        { available: deploymentCanIsolate(config.computer) },
       ),
     );
     // Choosing a coworker for an untagged message needs the same permission-filtered roster the
@@ -1514,12 +1637,34 @@ export function createApp(
       createDeliveryRoutes({ ...coworker.delivery.authenticated, requireUser }),
     );
   }
-  if (coworker?.demonstrations)
+  if (coworker?.recorder) {
     app.route(
-      "/api/demonstrations",
-      createDemonstrationRoutes(
-        coworker.demonstrations.store,
-        coworker.demonstrations.recorder,
+      "/api/recorder",
+      createRecorderRoutes({
+        ...coworker.recorder,
+        // A Disconnect in Settings, Browsers reaches the person's own OpenBot browser at once.
+        ...(coworker.browser
+          ? { onRevoked: browserConnectionRevoked(coworker.browser) }
+          : {}),
+        requireUser,
+        requireRecorder: createRequireRecorder(
+          coworker.recorder.resolve,
+          coworker.recorder.onRefused,
+        ),
+        auditStore,
+      }),
+    );
+  }
+  if (coworker?.browser)
+    app.route(
+      "/api/browser",
+      createBrowserRoutes({ ...coworker.browser, requireUser, auditStore }),
+    );
+  if (coworker?.personalLearning)
+    app.route(
+      "/api/settings/learning",
+      createPersonalLearningRoutes(
+        { ...coworker.personalLearning, auditStore },
         requireUser,
       ),
     );

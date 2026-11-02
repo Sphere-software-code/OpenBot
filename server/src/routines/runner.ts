@@ -22,40 +22,12 @@
  * within a firing never sees the routine that fails cleanly, once, every single night.
  */
 
-import type { Message } from "@ag-ui/client";
+import { HeadlessToolSuspension } from "@openbot/toolkit/headless-tools";
+import type { TurnRunner } from "@openbot/toolkit/run-turn";
 import { BOT_PAUSED_REASON, isBotPaused } from "../agents/lifecycle";
 import type { AgentActor } from "../agents/profile-types";
-import type { ApprovalContinuation } from "../approvals/types";
-import type { AuditInitiator } from "../audit";
 import type { ChannelStore } from "../channels/routes";
-import { HeadlessToolSuspension } from "../computer/headless-tools";
 import type { RoutineStore } from "./store";
-
-/** Everything a headless turn needs, injectable so tests never dial a model. */
-export type TurnRunner = (input: {
-  ownerUserId: string; // the actor the run asserts — grants and connections resolve to them
-  routineId: string; // what the trail names as having started this turn, rather than the owner
-  agentId: string;
-  threadId: string; // the owner's thread for the routine's channel
-  instruction: string; // the user message of this turn
-  initiator?: AuditInitiator;
-  signal?: AbortSignal;
-  continuation?: {
-    snapshot: ApprovalContinuation;
-    result: { content: string; error?: string };
-    messageId: string;
-  };
-  userMessage?: Message;
-  /** Durable inbound delivery id; reused by lock, runner and emitted events. */
-  runId?: string;
-  /** How deep in a Bot-to-Bot chain this turn is. Absent is a person's own turn, depth zero. */
-  depth?: number;
-  /** The reply so far, each time more of it arrives, for a surface that shows a turn in progress. */
-  onText?: (text: string) => void;
-}) => Promise<{ replyText: string; components?: DrawnComponent[] }>;
-
-/** A display component the Bot drew in a turn and the server allowed, with the props it drew. */
-export type DrawnComponent = { name: string; args: Record<string, unknown> };
 
 export type RoutineRunner = { run(routineRunId: string): Promise<void> };
 
@@ -86,8 +58,9 @@ const SWITCHED_OFF =
  *
  * Four minutes, because the clock is already running: the sweep's reaper closes a run row ten minutes
  * old (`ABANDONED_RUN_MS` in `./sweep`), and the turn may still take five once it starts
- * (`DEFAULT_TURN_TIMEOUT_MS` in `./run-turn`). Asking again is safe because a refused turn has run
- * nothing and written nothing, and it reads the thread afresh, so the Bot sees what was just said.
+ * (`TURN_LIMITS.turnTimeoutMs` in `@openbot/toolkit/limits`). Asking again is safe because a refused
+ * turn has run nothing and written nothing, and it reads the thread afresh, so the Bot sees what was
+ * just said.
  */
 const BUSY_THREAD_WAIT_MS = 4 * 60_000;
 const BUSY_THREAD_POLL_MS = 15_000;
@@ -95,7 +68,8 @@ const BUSY_THREAD_POLL_MS = 15_000;
 /**
  * Whether a turn was refused because another turn holds its thread.
  *
- * Matched on the shape, as `isMissingThread` in `../copilot` matches a 404 and for its reason: the
+ * Matched on the shape, as `isMissingThread` in `@openbot/toolkit/thread-history` matches a 404 and
+ * for its reason (and as `isLockConflict` in `@openbot/toolkit/lease` matches a lost renewal): the
  * platform's `PlatformRequestError` is not exported to test against, but every instance carries its
  * name and `status`. 409 is the lock's refusal, `THREAD_LOCK_FAILED`; of the platform calls a turn
  * makes before the lock, the only other that can answer 409 is `getOrCreateThread`, which settles its
@@ -214,11 +188,24 @@ export function createRoutineRunner(options: {
       return;
     }
     /*
+     * The conversation shown as working while the firing runs, and told it is over once the run
+     * row has its outcome. The run row is what the conversation reads "a routine is running" from
+     * (see channels/working.ts), so the signal that ends it comes after `finishRun`, not after the
+     * turn. Best-effort both ways: a firing is not worth failing over a dot.
+     */
+    await channelStore.signalBusy(channel.threadId, true).catch(() => {});
+    try {
+      await fire(channel.threadId);
+    } finally {
+      await channelStore.signalBusy(channel.threadId, false).catch(() => {});
+    }
+
+    /*
      * The turn, asked again while the conversation is busy (see BUSY_THREAD_WAIT_MS). Undefined when
      * the routine or its Bot was paused during the wait, which is recorded as a skip, the same as a
      * pause noticed before the first try: whoever paused it has said what they want.
      */
-    const turnWhenFree = async () => {
+    async function turnWhenFree(threadId: string) {
       const giveUpAt = Date.now() + waitMs;
       for (;;) {
         try {
@@ -226,7 +213,7 @@ export function createRoutineRunner(options: {
             ownerUserId,
             routineId,
             agentId,
-            threadId: channel.threadId,
+            threadId,
             instruction,
           });
         } catch (error) {
@@ -255,69 +242,71 @@ export function createRoutineRunner(options: {
           return undefined;
         }
       }
-    };
-
-    let replyText: string;
-    try {
-      const turn = await turnWhenFree();
-      if (!turn) return;
-      ({ replyText } = turn);
-    } catch (error) {
-      if (error instanceof HeadlessToolSuspension) {
-        await routineStore.finishRun(
-          routineRunId,
-          "waiting",
-          error.message,
-          error.waiting,
-        );
-        await say(error.message);
-        return;
-      }
-      const reason = reasonOf(error);
-      await routineStore.finishRun(routineRunId, "failed", reason);
-
-      /*
-       * THE FATIGUE RULE, read after the failure is recorded — the count has to include this
-       * firing, or the tenth failure in a row reads as the ninth and the routine keeps going.
-       *
-       * Its own try/catch, around the read and the switching-off as well as the message: this all
-       * happens after `finishRun`, and nothing in it is allowed to throw its way out of a firing
-       * whose failure is already on the row.
-       */
-      try {
-        const failures = await routineStore.consecutiveFailures(routineId);
-        if (failures === 1) {
-          // Only the first failure after a success. A routine that fails every night at three has
-          // one line in the channel, not one line a night for a month.
-          await say(`This routine failed: ${shorten(reason)}`);
-        } else if (failures >= FATIGUE_LIMIT) {
-          // A dead integration should not burn model spend for ever. Switched off, and said out
-          // loud, because a routine that goes quiet without explaining itself is worse than one
-          // that fails.
-          await routineStore.setEnabled(ownerUserId, routineId, false);
-          await say(SWITCHED_OFF);
-        }
-        // In between, nothing is said. The run rows carry it, and the routines page reads them.
-      } catch (fatigueError) {
-        console.error(
-          JSON.stringify({
-            type: "routine-fatigue-rule-failed",
-            routineId,
-            routineRunId,
-            reason: reasonOf(fatigueError),
-          }),
-        );
-      }
-      return;
     }
 
-    /*
-     * The reply, then the outcome. `say` cannot throw, and `finishRun` is finish-once, so neither
-     * order can lose the run row — this one is the browser's order: what was said lands in the
-     * channel, and then the firing is closed.
-     */
-    await say(replyText);
-    await routineStore.finishRun(routineRunId, "succeeded");
+    async function fire(threadId: string): Promise<void> {
+      let replyText: string;
+      try {
+        const turn = await turnWhenFree(threadId);
+        if (!turn) return;
+        ({ replyText } = turn);
+      } catch (error) {
+        if (error instanceof HeadlessToolSuspension) {
+          await routineStore.finishRun(
+            routineRunId,
+            "waiting",
+            error.message,
+            error.waiting,
+          );
+          await say(error.message);
+          return;
+        }
+        const reason = reasonOf(error);
+        await routineStore.finishRun(routineRunId, "failed", reason);
+
+        /*
+         * THE FATIGUE RULE, read after the failure is recorded — the count has to include this
+         * firing, or the tenth failure in a row reads as the ninth and the routine keeps going.
+         *
+         * Its own try/catch, around the read and the switching-off as well as the message: this all
+         * happens after `finishRun`, and nothing in it is allowed to throw its way out of a firing
+         * whose failure is already on the row.
+         */
+        try {
+          const failures = await routineStore.consecutiveFailures(routineId);
+          if (failures === 1) {
+            // Only the first failure after a success. A routine that fails every night at three has
+            // one line in the channel, not one line a night for a month.
+            await say(`This routine failed: ${shorten(reason)}`);
+          } else if (failures >= FATIGUE_LIMIT) {
+            // A dead integration should not burn model spend for ever. Switched off, and said out
+            // loud, because a routine that goes quiet without explaining itself is worse than one
+            // that fails.
+            await routineStore.setEnabled(ownerUserId, routineId, false);
+            await say(SWITCHED_OFF);
+          }
+          // In between, nothing is said. The run rows carry it, and the routines page reads them.
+        } catch (fatigueError) {
+          console.error(
+            JSON.stringify({
+              type: "routine-fatigue-rule-failed",
+              routineId,
+              routineRunId,
+              reason: reasonOf(fatigueError),
+            }),
+          );
+        }
+        return;
+      }
+
+      /*
+       * The reply, then the outcome. `say` cannot throw, and `finishRun` is finish-once, so neither
+       * order can lose the run row — this one is the browser's order: what was said lands in the
+       * channel, and then the firing is closed.
+       */
+      await say(replyText);
+      await routineStore.finishRun(routineRunId, "succeeded");
+    }
   }
 
   return {

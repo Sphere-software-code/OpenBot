@@ -1,5 +1,5 @@
+import type { DrawnComponent } from "@openbot/toolkit/run-turn";
 import { resolveUpdateRoute, type UpdateRoute } from "../agents/lifecycle";
-import type { DrawnComponent } from "../routines/runner";
 import type { WorkItem, WorkQueue } from "../work/queue";
 import type { ExpoPushTransport } from "./push";
 import type { DeliveryStore } from "./store";

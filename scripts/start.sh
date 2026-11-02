@@ -296,6 +296,20 @@ green "  coworker tables migrated"
 # and masks it. So: report what was resolved, and do not re-read the file.
 green "  managed coworker endpoint: $MANAGED_AGENT_AG_UI_URL"
 
+# Automatic Learning collects nothing until a container is assigned. The server assigns this
+# project's `openbot` container on its own once it exists (server/src/learning/auto-assign.ts), but
+# the runtime key it holds cannot create one. A CopilotKit CLI login can, whether or not a project is
+# selected here, and so can INTELLIGENCE_SERVICE_TOKEN on a local evaluation install, so make sure the
+# container exists before the server looks. Never fatal and never interactive: one line, whatever
+# happens, and with nothing that can create it the line says exactly what to run.
+LEARNING_CONTAINER="$(setting CPK_INTELLIGENCE_LEARNING_CONTAINER_ID "")"
+LEARNING_AUTO_ASSIGN="$(setting OPENBOT_LEARNING_AUTO_ASSIGN true)"
+if [ -z "$LEARNING_CONTAINER" ] && [ "$LEARNING_AUTO_ASSIGN" != "false" ] \
+   && [ "$LEARNING_AUTO_ASSIGN" != "0" ] && { [ -n "$(setting CPK_INTELLIGENCE_API_KEY "")" ] || [ -n "$(setting INTELLIGENCE_API_KEY "")" ]; }; then
+  LEARNING_LINE="$(bun scripts/setup-learning.ts --non-interactive 2>>"$LOGS/learning-setup.log" | tail -1 || true)"
+  info "  ${LEARNING_LINE:-Automatic Learning: the container check did not run. Log: $LOGS/learning-setup.log}"
+fi
+
 info "2/4  Server"
 require_free_or_ours "$SERVER_PORT" server
 #
@@ -412,7 +426,7 @@ const status = info.licenseStatus;
 const agents = Object.keys(info.agents ?? {});
 if (status !== "valid") {
   console.log(`\x1b[31m  licence is '${status}', not 'valid'.\x1b[0m`);
-  console.log("\x1b[31m  Check INTELLIGENCE_API_KEY: npx copilotkit@latest login && npx copilotkit@latest project select\x1b[0m");
+  console.log("\x1b[31m  Check CPK_INTELLIGENCE_API_KEY (or INTELLIGENCE_API_KEY): npx copilotkit@latest login && npx copilotkit@latest project select\x1b[0m");
   console.log("\x1b[31m  See README.md for Intelligence setup.\x1b[0m");
   process.exit(1);
 }

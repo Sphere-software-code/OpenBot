@@ -12,6 +12,7 @@ import { type AppVariables, requireAdmin } from "../auth/guards";
 import { scimStatus } from "../auth/scim";
 import {
   hasIdentityProvider,
+  peopleWithoutSso,
   revokeSessionsWithoutSso,
 } from "../auth/sso-required";
 import {
@@ -19,6 +20,7 @@ import {
   parseEgressRules,
 } from "../computer/policy-network";
 import { mcpServers } from "../db/schema";
+import { parsePageLimit } from "../paging";
 import { otelConfigured } from "../telemetry/otel";
 import {
   CAPABILITIES,
@@ -28,6 +30,40 @@ import {
 } from "./capabilities";
 import { ACTION_RECORD_RETENTION_DAYS, enterpriseControls } from "./controls";
 import type { EnterpriseSettings } from "./settings-store";
+
+/**
+ * Strict readers for the two paged enterprise GETs, matching the shared `parsePageLimit`
+ * rule every other paged list follows: a run of digits is clamped into range, anything
+ * else is a 400 naming the parameter rather than a silently coerced page.
+ *
+ * `GET /models/usage?days=` used `Number(raw) || 30`, so `?days=abc`, `?days=12abc`
+ * and `?days=` all quietly returned the 30-day view, and `?days=3.9` averaged a
+ * fractional window. `GET /actions?limit=` did the same with the 100-row default.
+ * Exported pure so the 400 paths are unit-tested without standing up the controls.
+ */
+export const ENTERPRISE_DAYS_ERROR =
+  'Query parameter "days" must be a positive integer.';
+
+export function parseEnterpriseDays(
+  raw: string | null,
+): { ok: true; days: number } | { ok: false; error: string } {
+  if (raw === null || raw.trim() === "") return { ok: true, days: 30 };
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed))
+    return { ok: false, error: ENTERPRISE_DAYS_ERROR };
+  return {
+    ok: true,
+    days: Math.min(Math.max(Number.parseInt(trimmed, 10), 1), 365),
+  };
+}
+
+export function parseEnterpriseActionsLimit(
+  raw: string | null,
+): { ok: true; limit: number } | { ok: false; error: string } {
+  const parsed = parsePageLimit(raw, 500);
+  if (!parsed.ok) return parsed;
+  return { ok: true, limit: parsed.limit ?? 100 };
+}
 
 const capabilityInput = z.strictObject({
   scopeKind: z.enum(["organization", "role", "group"]),
@@ -61,6 +97,7 @@ const settingInputs: {
     enabled: z.boolean(),
     servers: z.array(SERVER).max(500),
   }),
+  skillSharing: z.boolean(),
 };
 
 export function createEnterpriseAdminRoutes(
@@ -237,6 +274,33 @@ export function createEnterpriseAdminRoutes(
     // sessions made before it, or everyone already signed in another way stays in. Every time it is
     // saved on, not only on the change: a failed attempt is then put right by saving again.
     if (key === "ssoRequired" && parsed.data === true) {
+      /*
+       * Their browsers' Recorders end with their sessions, and first: a Recorder outlives any session it was made from
+       * while it is used, so one left standing would go on recording as somebody who can no longer sign in. Asked of
+       * everybody holding one, not of the sessions, so saving again finishes a save that failed here after the
+       * sessions had gone. When one cannot be ended, the save says so and no session has ended yet.
+       */
+      const recorders = controls.deps.recorders;
+      if (recorders) {
+        const signingOut = await peopleWithoutSso(
+          controls.deps.database,
+          controls.deps.initialAdminEmails ?? [],
+          await recorders.holders(),
+          context.var.actor.id,
+        );
+        try {
+          for (const userId of signingOut)
+            await recorders.signOut(userId, "sso_required");
+        } catch {
+          return context.json(
+            {
+              error:
+                "SSO is now required, but not everybody could be signed out yet. Save it again to finish.",
+            },
+            503,
+          );
+        }
+      }
       const ended = await revokeSessionsWithoutSso(
         controls.deps.database,
         controls.deps.initialAdminEmails ?? [],
@@ -326,10 +390,11 @@ export function createEnterpriseAdminRoutes(
   routes.get("/models/usage", async (context) => {
     const controls = enterpriseControls();
     if (!controls) return unavailable(context);
-    const days = Math.min(
-      Math.max(Number(context.req.query("days") ?? 30) || 30, 1),
-      365,
-    );
+    const parsedDays = parseEnterpriseDays(context.req.query("days") ?? null);
+    if (!parsedDays.ok) {
+      return context.json({ error: parsedDays.error }, 400);
+    }
+    const days = parsedDays.days;
     const summary = await controls.store.modelUsageSummary(days);
     const recent = await controls.store.recentModelUsage(50);
     const emails = await controls.store.usersById([
@@ -348,8 +413,15 @@ export function createEnterpriseAdminRoutes(
   routes.get("/actions", async (context) => {
     const controls = enterpriseControls();
     if (!controls) return unavailable(context);
-    const limit = Number(context.req.query("limit") ?? 100) || 100;
-    return context.json({ actions: await controls.store.actions(limit) });
+    const parsedLimit = parseEnterpriseActionsLimit(
+      context.req.query("limit") ?? null,
+    );
+    if (!parsedLimit.ok) {
+      return context.json({ error: parsedLimit.error }, 400);
+    }
+    return context.json({
+      actions: await controls.store.actions(parsedLimit.limit),
+    });
   });
 
   routes.post("/people/:userId/terminate-computers", async (context) => {

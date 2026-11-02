@@ -19,6 +19,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
+import { DELIVERY_REQUEST_TIMEOUT_MS } from "../timeouts";
 import {
   type BindingTransport,
   type ChatTransport,
@@ -116,7 +117,7 @@ export function createOpenTagTransport(config: OpenTagConfig) {
       try {
         response = await wire(new URL("/openbot/deliver", config.url), {
           method: "POST",
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(DELIVERY_REQUEST_TIMEOUT_MS),
           headers: {
             authorization: bearer,
             "content-type": "application/json",
@@ -552,6 +553,38 @@ export function chartForOpenTag(component: {
     };
   }
   return null;
+}
+
+/**
+ * The line said under a chart drawn natively, saying where its figures came from, or "" when the
+ * Bot said nothing about that. OpenTag's chart has no caption, so without it a Slack or Teams chart
+ * would lose what the same chart says in OpenBot. Mirrors `Sources` in the app's gallery charts.
+ */
+export function chartSourcesLine(args: Record<string, unknown>): string {
+  const seen = new Set<string>();
+  const named: string[] = [];
+  for (const entry of Array.isArray(args.sources) ? args.sources : []) {
+    const title = typeof entry?.title === "string" ? entry.title.trim() : "";
+    if (!title) continue;
+    const url =
+      typeof entry.url === "string" && /^https?:\/\//i.test(entry.url)
+        ? entry.url
+        : undefined;
+    const key = `${title}|${url ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    named.push(url ? `[${title}](${url})` : title);
+  }
+  const asOf = typeof args.asOf === "string" ? args.asOf.trim() : "";
+  return [
+    args.basis === "own-knowledge"
+      ? "From the Bot's own knowledge. Not checked against a source."
+      : "",
+    named.length ? `Sources: ${named.join(", ")}` : "",
+    asOf ? `As of ${asOf}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 /** A component call for the Channel to draw, as AG-UI tool-call events. */

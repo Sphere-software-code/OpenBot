@@ -27,13 +27,27 @@ publish() {
   fi
 }
 
+# Where a workspace keeps its sites. Before upstream #871 a Bot's volume held them at its root
+# (openbot-workspace-<bot>/_data/sites). Since then a computer runs with COMPUTER_SEPARATE_WORKSPACES=on
+# and each Bot's files sit in their own folder (openbot-workspace-bot-<bot>/_data/computers/<bot>/sites),
+# so both layouts are searched.
+sites_dirs() {
+  local vol="$1"
+  [ -d "$vol/_data/sites" ] && echo "$vol/_data/sites"
+  for d in "$vol/_data/computers"/*/sites; do [ -d "$d" ] && echo "$d"; done
+  return 0
+}
+
 if [ "${1:-}" = "--once" ]; then
-  publish "$VOLUMES_ROOT/$2/_data/sites/$3/dist" "$3"; exit
+  for dir in $(sites_dirs "$VOLUMES_ROOT/$2"); do
+    [ -d "$dir/$3/dist" ] && { publish "$dir/$3/dist" "$3"; exit; }
+  done
+  echo "no site $3 in volume $2"; exit 1
 fi
 
 for vol in "$VOLUMES_ROOT"/openbot-workspace-*; do
-  [ -d "$vol/_data/sites" ] || continue
-  for site in "$vol/_data/sites"/*/; do
+ for sites in $(sites_dirs "$vol"); do
+  for site in "$sites"/*/; do
     slug="$(basename "$site")"
     dest="$PROJECTS/$slug"
     # Changed since last publish? Compare newest file in dist against the marker.
@@ -42,4 +56,5 @@ for vol in "$VOLUMES_ROOT"/openbot-workspace-*; do
     fi
     publish "$site/dist" "$slug"
   done
+ done
 done

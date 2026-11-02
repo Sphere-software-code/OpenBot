@@ -5,6 +5,7 @@ import {
   type RunAgentInput,
 } from "@ag-ui/client";
 import { BuiltInAgent } from "@copilotkit/runtime/v2";
+import type { GrantedTool } from "@openbot/toolkit/granted-tool";
 import { EMPTY, lastValueFrom, of } from "rxjs";
 import { z } from "zod";
 import { createActorAgentResolver } from "../src/agents/agent-resolver";
@@ -17,7 +18,6 @@ import {
 } from "../src/agents/wake-up";
 import type { AgentChannel } from "../src/channels/routes";
 import type { HandoffForRun, RegisteredAgent } from "../src/copilot";
-import type { GrantedTool } from "../src/plugins/tools";
 
 /**
  * Where a Bot's follow-up wakes, and that the Bot is offered its follow-up tools exactly once.

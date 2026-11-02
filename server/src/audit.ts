@@ -1,3 +1,4 @@
+import type { AuditInitiator } from "@openbot/toolkit/initiator";
 import {
   and,
   desc,
@@ -216,6 +217,8 @@ export const auditEventTypes = [
    * thing they are entitled to see a record of. Carries the scope the vendor actually granted.
    */
   "mcp.account_connected",
+  /** A vendor authorization answer could not be reconciled with its pending attempt. */
+  "mcp.authorization_unreconciled",
   /*
    * One person's connector access retired, by them or on their behalf.
    *
@@ -234,6 +237,30 @@ export const auditEventTypes = [
    * while the grant at Google stood untouched.
    */
   "mcp.account_disconnected",
+  /*
+   * One person retracted their own pending per-action authorization before it completed.
+   *
+   * The counterpart of `mcp.account_connected` on the same lifecycle: that row is the attempt
+   * ending in a yes, this one is the person deliberately ending it themselves. Without it, pressing
+   * Cancel deleted the attempt and nothing recorded who withdrew what — on a lifecycle whose whole
+   * point is that consent is attributable. Filed under the app's slug, as its two siblings are.
+   *
+   * NEVER THE CONSENT URL AND NEVER THE VENDOR'S HANDLE FOR THE FLOW: the first is a bearer
+   * capability, and neither is in the payload. `minted` says only whether a flow had been started at
+   * the vendor at all, which is the one fact about it a reader of the trail needs.
+   */
+  "mcp.authorization_cancelled",
+  /*
+   * A cancelled per-action consent completed at the vendor anyway, and its grant was LEFT LIVE
+   * there: withdrawing it would have ended more than the cancelled consent — on Arcade a revoke ends
+   * the whole `(identity, auth provider)` connection, which the account already held for this app or
+   * shares with a sibling — or the withdrawal was asked and not confirmed. `why` says which. Calls
+   * are gated by the vendor's own authorization, so a Bot
+   * may still take the cancelled action — for a Shared app, as the team. Filed beside
+   * `mcp.authorization_cancelled` so the trail does not read as a clean withdrawal. `why` is this
+   * deployment's own phrase; nothing of the vendor's and no handle for the flow is in the payload.
+   */
+  "mcp.cancelled_grant_left_live",
   // An administrator switched a brokered app between each person's account and one shared account.
   "mcp.account_mode_changed",
   // A Bot's use of a Shared app needs an administrator's approval: filed by a refused call or by the
@@ -243,6 +270,34 @@ export const auditEventTypes = [
   "shared_use.approved",
   // An administrator answered a request to use a Shared app through a Bot.
   "shared_use.declined",
+  /*
+   * A Bot's owner gave it a Shared app whose rule lets owners decide, and that set who may use the
+   * team account through the Bot (`approved_as = owner`); and that audience withdrawn, because the
+   * owner took the app back or an administrator stopped letting owners decide. Target the app;
+   * payload `bot`, `server`, and the `audience` set or `why` it went.
+   */
+  "shared_use.owner_approved",
+  "shared_use.owner_withdrawn",
+  /*
+   * A person asking an administrator to switch a work app on, grant it to a Bot, or connect a
+   * Shared app's team account (`app_access_requests`), and what became of it: cancelled by the
+   * person, approved or dismissed by an administrator, or refused — a request that could not be
+   * filed, or an approval that could not be carried out. Target the app key; payload `request`,
+   * `app`, `bot`, `kind`, and for a refusal `reason`.
+   */
+  "app_access.requested",
+  "app_access.cancelled",
+  "app_access.approved",
+  "app_access.dismissed",
+  "app_access.refused",
+  /*
+   * A Bot's owner giving one of their own apps to their own Bot, or taking it back, without an
+   * administrator (`plugins/owner-grants.ts`). Target the app key; payload `app`, `bot`, and the
+   * refs given or taken. Each ref also has its own `plugin_granted` / `plugin_revoked` row marked
+   * `grantedAs: owner`.
+   */
+  "app_access.owner_granted",
+  "app_access.owner_revoked",
   // Every action a Bot takes on its computer, allowed or refused. Both, always: a trail that records
   // only what was permitted cannot answer whether the Bot tried.
   "computer.action_allowed",
@@ -268,6 +323,8 @@ export const auditEventTypes = [
   // A Bot asking its owner to sign it in to a website, and how that ended. Never the username, the
   // password or a code: the row says which site, which request and whether a saved login was used.
   "computer.sign_in_requested",
+  // The site accepted the password and asked for a verification code. Whether one was asked, never it.
+  "computer.sign_in_code_requested",
   "computer.sign_in_completed",
   "computer.sign_in_failed",
   "computer.sign_in_cancelled",
@@ -279,6 +336,9 @@ export const auditEventTypes = [
   // when is exactly the sort of thing an investigator needs and nothing else records.
   "computer.stopped",
   "computer.reset",
+  // A browser's data wiped by the person working it: a Bot's, by whoever held its wheel, or the person's own. Every
+  // login in it goes, as with a reset, so who did it and to which browser is worth a row; the Bot's files stay.
+  "computer.browser_cleared",
   // A computer moved onto the current image. Its files and sign-ins are kept, but a running one is
   // restarted, which interrupts whatever it was doing, so who asked is worth a row.
   "computer.updated",
@@ -369,6 +429,11 @@ export const auditEventTypes = [
   "person.access_revoked",
   "person.access_restored",
   /*
+   * An administrator took the trail out as a file. The trail is evidence, so who copied how much of
+   * it, under which filter, belongs on it too.
+   */
+  "audit.exported",
+  /*
    * Getting in, and being turned away.
    *
    * The trail had nothing about sign-in at all, which left two questions unanswerable. Anybody who
@@ -414,6 +479,12 @@ export const auditEventTypes = [
   "bot.deleted",
   "bot.callback_token_issued",
   "bot.callback_token_revoked",
+  /*
+   * A Bot was asked for a computer of its own and refused it: the person does not hold "Isolated
+   * Bots", the Bot belongs to no person, or this deployment cannot make a second computer. The row is
+   * the only trace of the attempt, since nothing about the Bot changed. `payload.reason` says which.
+   */
+  "bot.isolation_refused",
   /*
    * A Bot's lifecycle as one person runs it: paused, resumed, reset, how loudly it may reach them,
    * a follow-up it scheduled for itself, and a delegated task somebody stopped. See agents/lifecycle.ts.
@@ -545,18 +616,63 @@ export const auditEventTypes = [
   "routine.enabled_changed",
   /* A run refused because its model is not on the team model allowlist. */
   "model.refused",
+  /*
+   * A Recorder extension's bearer turned away: malformed, unknown or revoked, the person removed,
+   * their organization sign-in ended, or no role. Target the first 16 hex digits of the token's
+   * SHA-256, never the token; payload `reason` and `path`. At most one row per digest and reason a
+   * minute per replica, because a browser retrying a dead token would otherwise flood the trail.
+   */
+  "recorder.bearer_refused",
+  /*
+   * A browser connected to OpenBot as the Recorder, by whom and through which extension copy. Never
+   * the token or the code; the label is the person's own name for the browser.
+   */
+  "recorder.connected",
+  /*
+   * A connection refused before it was made; payload `reason`: `origin`, an origin that is not the Recorder's (payload
+   * `origin`, the one offered); `code`, a connect code that is unknown, expired or already used (payload `extensionId`
+   * and `installId`, never the code); or `too_many_codes`, the person already holding ten unused codes (payload `via`).
+   * A row that cannot be written is logged and the refusal stands.
+   */
+  "recorder.connect_refused",
+  /*
+   * A connection ended; payload `via`, how it was made (as on `recorder.connected`), and `reason`: replaced (the same
+   * copy connected again), disconnected, revoked, signed_out (the person's sign-in here ended: payload `ending` says how,
+   * a sign-out, sessions ended another way, the person removed, their organization ending the session it holds a copy
+   * of) or expired (its lifetime ran out: the deployment ended it, payload `owner`); for a Bot's browser's connection,
+   * which lasts one recording, stopped (the person's Stop), ended (the recording ended without one) or not-started (the
+   * start it was for did not happen); for the person's own OpenBot browser's, cleared (they cleared that browser, and its
+   * token went with the profile). Written in the transaction that ends the connection, as `recorder.connected` is in
+   * the one that makes it.
+   */
+  "recorder.revoked",
+  /*
+   * A security row: a person's sign-in here was ending (payload `ending`) and their Recorder connections could not be
+   * ended, after `attempts` tries (payload `error`, the database's complaint, never the query). The sign-in did not end
+   * either, and whoever was ending it was told: the person signing out, the administrator, the directory. Target the
+   * person.
+   */
+  "recorder.sign_out_failed",
+  /*
+   * The capture pass (the runtime's trajectory/connect) turned a caller away: an id that is not a UUID, no
+   * Recorder bearer or one that no longer resolves, no role, the organization unable to answer, or a trajectory
+   * already bound to another person. Target the trajectory id; payload `reason`. At most one row per person,
+   * trajectory and reason a minute per replica.
+   */
+  "recorder.trajectory_refused",
+  /*
+   * A person changed who else's Bots use the Skills learned in their own Learning space (Settings, Learning). Target
+   * the person; payload `from` and `to`, each `closed`, `open` or `choose`.
+   */
+  "learning.sharing_changed",
+  /* A person opened one of their own learned Skills to every Bot, or closed it again. Target and payload `skill`. */
+  "learning.skill_opened",
+  "learning.skill_closed",
 ] as const;
 
 export type AuditEventType = (typeof auditEventTypes)[number];
 
-/** What caused a row, where `actorUserId` is only whose authority it borrowed. */
-export type AuditInitiator =
-  | { kind: "person" }
-  | { kind: "deployment" }
-  | { kind: "routine"; id: string }
-  | { kind: "responsibility"; id: string }
-  | { kind: "memory"; id: string }
-  | { kind: "handoff"; id: string; origin?: AuditInitiator };
+export type { AuditInitiator };
 
 export const PERSON_INITIATOR: AuditInitiator = { kind: "person" };
 
@@ -696,6 +812,20 @@ export async function recordAuditEvent(
     ...event,
     payload: redactAuditPayload(event.payload) as Record<string, unknown>,
   });
+}
+
+/**
+ * Where code that should not hold the store writes to the trail.
+ *
+ * A sink rather than the store, so that code never touches the database. Written through
+ * `recordAuditEvent`, which redacts the payload the same way every other write does.
+ */
+export type AuditSink = {
+  record: (event: AuditEventInput) => Promise<void>;
+};
+
+export function auditSink(store: AuditStore): AuditSink {
+  return { record: (event) => recordAuditEvent(store, event) };
 }
 
 function initiatorColumns(initiator: AuditInitiator | undefined) {
@@ -999,4 +1129,118 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     from,
     to,
   };
+}
+
+/**
+ * CSV export for the admin audit trail.
+ *
+ * The table at Admin > Audit is the only read surface, so a review that needs evidence —
+ * a compliance pull, an incident timeline, a count of what policy refused — has nowhere to
+ * take it. `GET /api/admin/audit-events?format=csv` answers the same filtered query as the
+ * JSON list and returns it as RFC 4180 CSV, capped so an unbounded trail cannot become an
+ * unbounded response. Payloads arrive here already redacted (see `redactAuditPayload`), and
+ * the export carries them as one JSON column rather than spreading unknown keys across
+ * columns a spreadsheet would then misread.
+ */
+export const AUDIT_EXPORT_MAX_ROWS = 5_000;
+export const AUDIT_EXPORT_PAGE_SIZE = 500;
+
+export const AUDIT_EXPORT_COLUMNS = [
+  "id",
+  "createdAt",
+  "eventType",
+  "actorUserId",
+  "initiatorKind",
+  "initiatorId",
+  "targetType",
+  "targetId",
+  "decisionAllowed",
+  "decisionRule",
+  "bot",
+  "payload",
+] as const;
+
+/**
+ * One CSV cell.
+ *
+ * A spreadsheet runs a cell that starts with `=`, `+`, `-` or `@` (or a tab or carriage return
+ * ahead of one) as a formula, and audit rows carry text people and Bots control: names, URLs,
+ * target IDs. Such a cell is prefixed with `'` so it opens as the text it is (OWASP's CSV injection
+ * guidance). JSON payloads start with `{` and timestamps and IDs with a digit or letter, so nothing
+ * the trail itself writes is changed.
+ */
+function toCsvCell(value: string): string {
+  const text = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  if (
+    text.includes('"') ||
+    text.includes(",") ||
+    text.includes("\n") ||
+    text.includes("\r")
+  ) {
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+  return text;
+}
+
+function auditEventToCsvRow(event: AuditEvent): string {
+  const payload = event.payload ?? {};
+  const decision = (payload.decision ?? {}) as {
+    allowed?: unknown;
+    rule?: unknown;
+  };
+  const cells = [
+    event.id,
+    event.createdAt,
+    event.eventType,
+    event.actorUserId ?? "",
+    event.initiatorKind ?? "",
+    event.initiatorId ?? "",
+    event.targetType ?? "",
+    event.targetId ?? "",
+    typeof decision.allowed === "boolean" ? String(decision.allowed) : "",
+    typeof decision.rule === "string" ? decision.rule : "",
+    typeof payload.bot === "string" ? payload.bot : "",
+    JSON.stringify(payload),
+  ];
+  return cells.map(toCsvCell).join(",");
+}
+
+export function auditEventsToCsv(events: AuditEvent[]): string {
+  const header = AUDIT_EXPORT_COLUMNS.join(",");
+  if (events.length === 0) return `${header}\n`;
+  return `${header}\n${events.map(auditEventToCsvRow).join("\n")}\n`;
+}
+
+/**
+ * The rows behind an export, walked page by page through the same reader the JSON list
+ * uses, so the CSV and the table never disagree about what a filter matches.
+ *
+ * `cursor` and `limit` are the JSON list's paging, not the export's, and are ignored here:
+ * the export takes everything the filters match up to `maxRows` and says whether it
+ * stopped early, so the caller can narrow the range instead of silently receiving a
+ * partial trail.
+ */
+export async function readAuditExportRows(
+  reader: AuditReader,
+  baseQuery: AuditEventQuery,
+  options?: { maxRows?: number; pageSize?: number },
+): Promise<{ events: AuditEvent[]; truncated: boolean }> {
+  const maxRows = options?.maxRows ?? AUDIT_EXPORT_MAX_ROWS;
+  const pageSize = options?.pageSize ?? AUDIT_EXPORT_PAGE_SIZE;
+  const { cursor: _paging, limit: _limit, ...filters } = baseQuery;
+  const events: AuditEvent[] = [];
+  let cursor: string | undefined;
+  let truncated = false;
+  for (;;) {
+    const page = await reader.list({ ...filters, limit: pageSize, cursor });
+    for (const event of page.events) {
+      if (events.length >= maxRows) {
+        truncated = true;
+        return { events, truncated };
+      }
+      events.push(event);
+    }
+    if (!page.nextCursor) return { events, truncated };
+    cursor = page.nextCursor;
+  }
 }

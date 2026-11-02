@@ -3,13 +3,13 @@ import {
   CopilotKitIntelligence,
   LearnedSkillsError,
 } from "@copilotkit/runtime/v2";
+import type { LearningSettings } from "@openbot/shared/learning";
 import {
-  createLearningRuntime,
   clearLearningRevisionFallback,
+  createLearningRuntime,
   selectLearningTarget,
 } from "../src/learning/runtime";
 import type { LearningSettingsStore } from "../src/learning/settings";
-import type { LearningSettings } from "../../shared/learning";
 import { skillSnapshot } from "./fixtures/learned-skills";
 
 function fixture() {
@@ -25,6 +25,8 @@ function fixture() {
       settings = next;
       return settings;
     },
+    saved: async () => true,
+    adoptDefault: async () => false,
     bindThread: async ({ userId, threadId, containerId }) => {
       const key = JSON.stringify([userId, threadId]);
       if (!bindings.has(key)) bindings.set(key, containerId);

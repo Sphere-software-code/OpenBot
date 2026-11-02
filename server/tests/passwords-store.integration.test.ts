@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { inArray } from "drizzle-orm";
 import type { AuditEventInput } from "../src/audit";
+import { personSeat } from "../src/computer/computer-key";
 import { createDatabase } from "../src/db/client";
 import { users } from "../src/db/schema/core";
 import { savedLogins, signInRequests } from "../src/db/schema/passwords";
@@ -26,6 +27,7 @@ const service = createSignInService({
   encryptionKey: Buffer.alloc(32, 3).toString("base64"),
   auditStore: { insert: async (event) => void audit.push(event) },
   gateway: {
+    seatFor: async (botId, personId) => personSeat(personId, botId),
     signIn: async () => {
       await new Promise<void>((resolve) => {
         releaseFill = resolve;
@@ -33,8 +35,12 @@ const service = createSignInService({
       return {
         submitted: true,
         passwordFieldVisible: false,
+        codeRequested: false,
         url: "https://example.com/",
       };
+    },
+    signInCode: async () => {
+      throw new Error("not used");
     },
     requestHelp: async () => {
       throw new Error("not used");
@@ -102,4 +108,62 @@ test("a request and a saved login are their owner's alone, and only the envelope
   expect(
     (await service.deleteLogin(owner, rows[0]?.id ?? "", actor)).deleted,
   ).toBe(true);
+});
+
+/**
+ * A site that asks for a verification code after the password. `code_required` is a status the
+ * table's check constraint must accept (migration 0056), and an open request the person still sees.
+ */
+test("a request waiting on its verification code is stored, listed, and then signed in", async () => {
+  const codes: string[] = [];
+  const mfa = createSignInService({
+    store,
+    encryptionKey: Buffer.alloc(32, 3).toString("base64"),
+    gateway: {
+      seatFor: async (botId, personId) => personSeat(personId, botId),
+      signIn: async () => ({
+        submitted: true,
+        passwordFieldVisible: false,
+        codeRequested: true,
+        url: "https://example.com/mfa",
+      }),
+      signInCode: async (_botId, input) => {
+        codes.push(input.code);
+        return {
+          submitted: true,
+          codeFieldVisible: false,
+          passwordFieldVisible: false,
+          url: "https://example.com/",
+        };
+      },
+      requestHelp: async () => {
+        throw new Error("not used");
+      },
+    },
+  });
+  const request = await mfa.request({
+    ownerUserId: owner,
+    botId: `${prefix}-bot`,
+    site: "https://example.com/login",
+    actor,
+  });
+  const waiting = await mfa.submit(owner, request.id, actor, {
+    username: "alice",
+    password: PASSWORD,
+  });
+  expect(waiting.status).toBe("code_required");
+  expect((await mfa.pending(owner)).map((row) => row.status)).toContain(
+    "code_required",
+  );
+  const done = await mfa.submitCode(owner, request.id, actor, {
+    code: "551234",
+  });
+  expect(done.status).toBe("signed_in");
+  expect(codes).toEqual(["551234"]);
+  const [stored] = await database
+    .select()
+    .from(signInRequests)
+    .where(inArray(signInRequests.id, [request.id]));
+  expect(JSON.stringify(stored)).not.toContain("551234");
+  expect(JSON.stringify(stored)).not.toContain(PASSWORD);
 });

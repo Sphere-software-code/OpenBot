@@ -1,3 +1,4 @@
+import type { HeadlessWaiting } from "@openbot/toolkit/headless-tools";
 import {
   boolean,
   index,
@@ -8,7 +9,6 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import type { HeadlessWaiting } from "../../computer/headless-tools";
 import type {
   TriggerConfig,
   TriggerKind,

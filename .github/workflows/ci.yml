@@ -30,11 +30,21 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run format:check
       - run: bun run lint
       - run: bun run typecheck
+      # `typecheck` is `bun run --filter '*' typecheck`, and each workspace's `tsc --noEmit` reads
+      # its own tsconfig, none of which includes a test tree. The suite is therefore the one part
+      # of this repository that no type-checker has ever read: bun erases types rather than
+      # checking them, so a test could pass an options object where a connection string belongs,
+      # or import a type from a path that does not exist and silently get `any`, and every check
+      # here stayed green. This reads `server/tests` under the server's own compiler options and
+      # fails on any error that is not in `server/tests/typecheck-baseline.txt` — the errors that
+      # were already there when the check was turned on. New ones are new defects.
+      - name: server/tests types (baselined)
+        run: bun run typecheck:tests
       - name: Desktop version tracks the release version
         run: bun desktop/scripts/desktop-version.ts check
       # The chart's default image tag is its appVersion, and a release must move both together. They
@@ -75,7 +85,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       # Two installs, and the root one is load-bearing. Both packages set `types: ["bun"]` in
       # their tsconfig while `@types/bun` is a root devDependency, so tsc resolves it by walking up
       # to the root node_modules. Without it the typecheck fails with TS2688 on a fresh checkout.
@@ -118,19 +128,36 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: agent-computer
-      - run: bunx playwright install --with-deps chromium
+      # `--no-shell` as the image does, so the headless run below proves nothing needs the shell.
+      - run: bunx playwright install --with-deps --no-shell chromium
         working-directory: agent-computer
+      # Headless here: these launch through the profile path without the computer's own X server.
+      # The headless run of the Web Bot Auth test is also the one that checks the user agent fix.
       - run: >-
           bun test tests/sign-in.test.ts tests/session-cookies.test.ts tests/follows-popup.test.ts
-          tests/demonstration-live.test.ts tests/webrtc-proxy.test.ts
+          tests/webrtc-proxy.test.ts tests/web-bot-auth-browser.test.ts
+          tests/handoff-page-restore.test.ts tests/enter-text.test.ts tests/person-browser.test.ts tests/person-browser-computer.test.ts
+          tests/bot-browser.test.ts tests/bot-browser-computer.test.ts
+          tests/screencast-keys-browser.test.ts tests/browser-memory.test.ts
         working-directory: agent-computer
         env:
           OPENBOT_COMPUTER_BROWSER: '1'
-          OPENBOT_DEMONSTRATION_LIVE: '1'
+          COMPUTER_BROWSER_MODE: headless
+      # Headed is the default for hosted computers, so it is tested as one: the computer starting its
+      # own Xvfb, and the signing again with cross-site frames in processes of their own.
+      - run: bun test tests/headed-browser.test.ts
+        working-directory: agent-computer
+        env:
+          OPENBOT_HEADED_BROWSER: '1'
+      - run: xvfb-run --auto-servernum bun test tests/web-bot-auth-browser.test.ts
+        working-directory: agent-computer
+        env:
+          OPENBOT_COMPUTER_BROWSER: '1'
+          COMPUTER_BROWSER_MODE: headed
 
   chart:
     name: chart (${{ matrix.target }})
@@ -153,7 +180,7 @@ jobs:
       # For the coherence check below, which is a Bun script like everything else here.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       # Nothing rendered this chart until now, which is how four values files that produce a server
       # unable to start were shipped and stayed shipped. Rendering is the cheap half; the refusals in
       # validation.yaml are the half that catches a missing value before a cluster does.
@@ -176,6 +203,21 @@ jobs:
       # question: every secret key a container demands has to be one the chart actually writes.
       # Getting that wrong is invisible until a pod starts, and every shipped target had it wrong.
       - run: bun scripts/check-rendered-chart.ts rendered.yaml
+      # No target names a Learning credential, so the setup Job renders nowhere above. Render it with
+      # one of each, and hold it to the same coherence check.
+      - name: Learning setup Job renders
+        run: |
+          helm template ci charts/openbot \
+            --values charts/openbot/ci/${{ matrix.target }}-values.yaml \
+            --set-string secrets.keyEncryptionKey="$(openssl rand -base64 32)" \
+            --api-versions agents.x-k8s.io/v1beta1/Sandbox \
+            --api-versions extensions.agents.x-k8s.io/v1beta1/SandboxTemplate \
+            --set-string config.learning.setup.cliLoginSecret.name=openbot-copilotkit-cli \
+            --set-string config.learning.setup.serviceTokenSecret.name=intelligence-service-token \
+            --set-string config.learning.setup.projectId=7 \
+            > rendered-learning.yaml
+          grep -q 'app.kubernetes.io/component: learning-setup' rendered-learning.yaml
+          bun scripts/check-rendered-chart.ts rendered-learning.yaml
       # And that the refusals are load-bearing rather than decorative. A chart full of `fail`
       # messages nothing ever triggers is a chart that has never been shown to refuse anything, and
       # every one of these describes a state that shipped in a values file at some point.
@@ -218,6 +260,19 @@ jobs:
             --set networkPolicy.enabled=true \
             --set computers.extraEnv[0].name=EGRESS_PROXY_DEFAULT \
             --set-string computers.extraEnv[0].value=http://proxy.internal:3128
+          # The residential proxy setting, whose address is a secret the template cannot read, with
+          # network policies on and no path opened to it.
+          refuses "a residential proxy with no path through the network policy" \
+            --set networkPolicy.enabled=true --set computers.egressProxy.enabled=true \
+            --set-string secrets.egressProxyUrl=http://user:pass@gateway.example:8000
+          # The same setting switched on with no URL behind it, where this chart holds the secret.
+          if ! grep -qE '^ *enabled: true' <(sed -n '/^externalSecrets:/,/^[a-z]/p' charts/openbot/ci/${{ matrix.target }}-values.yaml) \
+             && ! grep -qE '^ *existingSecret: [^"]' <(sed -n '/^secrets:/,/^[a-z]/p' charts/openbot/ci/${{ matrix.target }}-values.yaml); then
+            refuses "a residential proxy switched on with no URL" \
+              --set computers.egressProxy.enabled=true
+          else
+            echo "skipped: the proxy URL refusal is armed only where this chart writes the Secret"
+          fi
           # A delivery or directory switch with no secret behind it. Armed on every target: the chart
           # requires the value when it holds the secret, and requires the store to name the key when
           # a store does.
@@ -225,6 +280,8 @@ jobs:
             --set config.opentag.enabled=true
           refuses "SCIM switched on with no bearer token" \
             --set config.scim.enabled=true
+          refuses "a Learning service token with no project to create the container in" \
+            --set-string config.learning.setup.serviceTokenSecret.name=intelligence-service-token
           # The rest are refusals the server makes at boot, mirrored so the value is named at install.
           refuses "an OpenTag URL with the pairing switched off" \
             --set-string config.opentag.url=https://opentag.example.com
@@ -282,7 +339,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       # The Bots are not root workspaces and each keeps its own lockfile. The startup tests spawn
       # the real entrypoint, so its dependencies have to be installed as well.
@@ -292,6 +349,10 @@ jobs:
       # Bot's own tree and not in the root one.
       - run: bun install --frozen-lockfile
         working-directory: agent-langgraph
+      # Same for the computer: its Web Bot Auth tests import `web-bot-auth`, which lives in
+      # agent-computer's own tree and not in the root one.
+      - run: bun install --frozen-lockfile
+        working-directory: agent-computer
       # Same for the Mastra Bot: root test discovery imports its receiver tests, which load Mastra
       # from that Bot's own dependency tree.
       - run: bun install
@@ -300,9 +361,12 @@ jobs:
       # pinned by the desktop lockfile rather than the root one.
       - run: bun install --frozen-lockfile
         working-directory: desktop
-      # Not the db:migrate script: that one loads ../.env, which does not exist in CI. DATABASE_URL
-      # comes from the job env instead, which drizzle.config.ts already reads.
-      - run: bunx drizzle-kit migrate --config=drizzle.config.ts
+      # The same migrator a deployment runs, rather than `drizzle-kit migrate`: it is the one that
+      # refuses a database holding a stamp newer than the migrations it is about to walk past
+      # (server/src/db/migration-reach.ts), and a CI database that is ever reused rather than
+      # recreated is one of the places that can happen. Not the db:migrate script, which loads
+      # ../.env; that file does not exist in CI, and DATABASE_URL comes from the job env instead.
+      - run: bun scripts/migrate.ts
         working-directory: server
       # A passing job must include the expected test floor. Import-time failures can otherwise skip
       # files before their tests are registered.
@@ -321,7 +385,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun test app/tests/build-cache.test.ts
 
@@ -332,12 +396,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - name: CrewAI provider-boundary regression
         run: |
           set -euo pipefail
@@ -394,6 +458,13 @@ jobs:
           . .venv-adk/bin/activate
           python -m pip install --requirement agent-adk/requirements.txt --requirement agent-adk/requirements-test.txt
           python -m pytest agent-adk/tests -q
+      - name: Antigravity provider pin and token gate
+        run: |
+          set -euo pipefail
+          python -m venv .venv-antigravity
+          . .venv-antigravity/bin/activate
+          python -m pip install --requirement agent-antigravity/requirements.txt --requirement agent-antigravity/requirements-test.txt
+          python -m pytest agent-antigravity/tests -q
       - name: Langroid model-choice and tool-call regressions
         run: |
           set -euo pipefail
@@ -430,7 +501,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
 
@@ -449,7 +520,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       # Collisions and gaps between the migration files themselves.
       - run: bunx drizzle-kit check --config=drizzle.config.ts

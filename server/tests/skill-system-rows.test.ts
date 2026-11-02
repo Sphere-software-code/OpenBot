@@ -58,18 +58,21 @@ describe("skill instructions on a built-in Bot", () => {
       const body = requests[0]?.body as {
         messages?: { role: string; content: unknown }[];
       };
+      // OpenAI's newer models take system rows as `developer` (the AI SDK maps them); either counts.
+      const isSystem = (role: string) =>
+        role === "system" || role === "developer";
       const roles = (body.messages ?? []).map((message) => message.role);
       const systemTexts = (body.messages ?? [])
-        .filter((message) => message.role === "system")
+        .filter((message) => isSystem(message.role))
         .map((message) => String(message.content));
 
       // The skill is there, as its own system message.
       expect(systemTexts.some((text) => text.includes(SKILL))).toBe(true);
       // And it sits ahead of every user and assistant turn, where any provider accepts it.
-      const firstTurn = roles.findIndex((role) => role !== "system");
+      const firstTurn = roles.findIndex((role) => !isSystem(role));
       const skillAt = (body.messages ?? []).findIndex(
         (message) =>
-          message.role === "system" && String(message.content).includes(SKILL),
+          isSystem(message.role) && String(message.content).includes(SKILL),
       );
       expect(skillAt).toBeGreaterThanOrEqual(0);
       expect(skillAt).toBeLessThan(firstTurn);

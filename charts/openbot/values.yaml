@@ -15,6 +15,11 @@ image:
   # Empty means the chart's appVersion prefixed with `v` (the form published tags take), so an
   # upgrade of the chart moves the image with it. A value set here is used verbatim.
   tag: ""
+  # The image digest, `sha256:` and 64 hex characters, from the release's `container-images.json`.
+  # Set, the image becomes `repository:tag@digest` and Kubernetes pulls exactly those bytes, which is
+  # how docs/releasing.md says to deploy: a tag can be moved, a digest cannot. The tag stays in the
+  # reference for whoever reads it. Empty pulls by tag alone, as before.
+  digest: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -119,6 +124,14 @@ migrations:
 config:
   # Where people reach this deployment. Sets the OAuth callback and the trusted origin.
   publicUrl: ""
+  # Web Bot Auth: every request a Bot's browser makes is signed as coming from this deployment, and
+  # the public key is published at `<publicUrl>/.well-known/http-message-signatures-directory`, so a
+  # site behind Cloudflare that allows signed agents lets the Bot through instead of challenging it.
+  # Off unless "on": signing announces the deployment's URL to every site a Bot visits. "on" needs an
+  # https `publicUrl` (verifiers fetch the key from it) and earns nothing until the deployment is
+  # registered with Cloudflare, a manual step described in the chart README. The key is derived from
+  # `secrets.keyEncryptionKey` unless `secrets.webBotAuthKey` gives one.
+  webBotAuth: ""
   # Administrators by email address, comma-separated. Required unless singleUser is on.
   initialAdminEmails: ""
   # Email domains admitted at sign-in, comma-separated. Empty admits everybody, which is what the
@@ -161,13 +174,43 @@ config:
     gatewayWsUrl: ""
     # The two secret halves live under `secrets` below, never here.
   # Learning defaults on; collection and delivery require an existing, assigned container.
-  # Fresh self-hosted setup: run scripts/setup-learning.ts on a computer with Chrome/Edge access
-  # to Intelligence, then transfer its runtime key through your secret manager and use openbot here.
-  # Existing key-only installs create it through authenticated Intelligence administration first.
+  # With nothing saved in Admin and no containerId below, the server assigns the project's openbot
+  # container on its own once it exists. The runtime key cannot create it, so `setup` below gives the
+  # chart a credential that can; without one, the server log and Admin → Automatic Learning say
+  # exactly what to run (scripts/setup-learning.ts, from a computer that can sign in to Intelligence).
   # Optional initial defaults; saved Admin → Automatic Learning settings take precedence, including off.
   learning:
     containerId: ""
     revision: ""
+    # false stops the automatic assignment (OPENBOT_LEARNING_AUTO_ASSIGN=false).
+    autoAssign: true
+    # Creating the container. Name either Secret and a Job runs on every install and upgrade that
+    # creates it in the runtime key's project, proves it with that key, and exits; the server then
+    # assigns it. Both Secrets are yours: create them before installing.
+    setup:
+      # A CopilotKit CLI login, for managed Intelligence. Sign in into an empty folder and store the
+      # file it writes (a person's 30-day session, so keep the Secret as tight as that warrants):
+      #   COPILOTKIT_CONFIG_DIR="$(mktemp -d)"; export COPILOTKIT_CONFIG_DIR
+      #   npx --yes copilotkit@latest login
+      #   kubectl create secret generic openbot-copilotkit-cli \
+      #     --from-file=config.json="$COPILOTKIT_CONFIG_DIR/auth/config.json"
+      # The Job reads it once. The server never holds it.
+      cliLoginSecret:
+        name: ""
+        key: config.json
+      # An Intelligence service token, which creates Learning containers on a CopilotKit local
+      # evaluation install only. Requires projectId: the numeric ID of the runtime key's project.
+      # Passed to the server too, so Admin → Automatic Learning can create the container again.
+      serviceTokenSecret:
+        name: ""
+        key: token
+      projectId: ""
+  # Memory sources and background research, on by default for each person and Bot (OpenBot turns
+  # them on when a person talks to a Bot, and never back on once the person turns one off or removes
+  # it). false stops new defaults for the whole deployment; existing settings are left as they are.
+  memory:
+    sourceDefaults: true
+    researchDefaults: true
   # How far one Bot may hand work to another.
   #
   # A Bot addressing another is a grant an administrator makes, and these are the ceilings on what
@@ -266,14 +309,34 @@ config:
   # Free-form additions, for anything this chart has no opinion about.
   extraEnv: []
   extraEnvFrom: []
+  # Volumes, and where to mount them, on every pod that loads this deployment's configuration: the
+  # server and the routines and computer-culler CronJobs, the same pods `extraEnv` reaches. The usual
+  # reason is a tenant package of your own, from a ConfigMap, with `tenantPackageDir` pointed at its
+  # mount; every one of those pods reads the package, so mounting it on the server alone is not enough.
+  #
+  #   extraVolumes:
+  #     - name: tenant
+  #       configMap: { name: my-tenant-package }
+  #   extraVolumeMounts:
+  #     - name: tenant
+  #       mountPath: /tenant
+  #       readOnly: true
+  extraVolumes: []
+  extraVolumeMounts: []
 
 # How a Bot gets a computer.
 #
 #   shared    One browser for every Bot, run by this chart. Needs nothing installed in the cluster,
-#             and is what a first install should use.
-#   sandbox   A computer each, as a `Sandbox` from kubernetes-sigs/agent-sandbox, suspended when
-#             idle and resumed with its logins intact. Needs that controller in the cluster.
-#   external  Neither. `url` points at a computer somebody else runs.
+#             and is what a first install should use. Each person's Bots keep their own logins
+#             and files, but a command one Bot runs can read another's files. For that reason a
+#             person's own OpenBot browser does not run here, and nobody records in a Bot's browser:
+#             the Browser page and the Bot's screen say so.
+#   sandbox   A computer for each person, and for each Isolated Bot, as a `Sandbox` from
+#             kubernetes-sigs/agent-sandbox, suspended when idle and resumed with its logins
+#             intact. Needs that controller in the cluster. Each person's own OpenBot browser gets a
+#             computer of its own the same way.
+#   external  Neither. `url` points at a computer somebody else runs, which is shared like the
+#             first, so it runs no person's browser and records in no Bot's browser either.
 computers:
   mode: shared
   # Only for `mode: external`. The other modes derive the address from what they created.
@@ -343,6 +406,38 @@ computers:
   # the process default, which is a handful and thirty minutes.
   maxBrowsers: ""
   browserIdleMs: ""
+  # At what share of the pod's memory limit the computer starts closing browsers nobody is using,
+  # least recently used first, down to ten points under it. Measured as the kubelet measures it (the
+  # working set), before each launch and once a minute: it stops idle browsers filling the pod one
+  # launch at a time, and a page that grows between two checks can still run the pod out of memory.
+  # Empty means 85; 0 switches it off.
+  memoryHighPercent: ""
+  # How long a Bot's background tab (one it left behind, such as the page a sign-in popup opened from)
+  # is kept untouched before it is closed. The page the Bot is on is never closed. Empty means ten
+  # minutes; 0 keeps them.
+  tabIdleMs: ""
+
+  # Which Chromium a Bot's computer runs. `headed` is full Chromium drawing to the pod's own X server
+  # (Xvfb, started by the computer), behind the same streamed screen: it is what sites see from a
+  # person's browser, and Cloudflare's bot check challenges it far less than headless Chromium. Costs
+  # a little more memory and CPU than `headless`, which is still available.
+  browserMode: headed
+
+  # A residential or ISP proxy for every Bot's outbound traffic. OFF BY DEFAULT, and an operator's
+  # choice to make knowingly: through one, a Bot's traffic leaves from an address a consumer ISP owns,
+  # so a site sees what looks like a person at home rather than a datacenter. That is the point (a
+  # datacenter address is the other thing bot checks key on) and also the thing to be comfortable
+  # with. The credentialed URL (`http://user:password@gateway.provider.example:8000`) is a secret:
+  # `secrets.egressProxyUrl`, or a key in a Secret of your own. It reaches every computer as
+  # `EGRESS_PROXY_DEFAULT`, behind the egress filter, so the network policy still decides what a Bot
+  # may reach. With `networkPolicy.enabled`, also name the proxy in
+  # `networkPolicy.computerExtraEgress`. One Bot's own proxy is still `EGRESS_PROXY_<BOT>` in
+  # `extraEnv` below.
+  egressProxy:
+    enabled: false
+    # Empty uses the chart's Secret (`secrets.egressProxyUrl`).
+    existingSecret: ""
+    existingSecretKey: egress-proxy-url
 
   persistence:
     # EMPTY MEANS THE CLUSTER'S DEFAULT CLASS. Naming `gp3` or `pd-balanced` is how a chart stops
@@ -355,13 +450,19 @@ computers:
     # safe default; `Delete` is for a trial you want to leave no trace of.
     whenDeleted: Retain
 
+  # SIZED FOR A PERSON, NOT A BOT. A computer is one person's and runs a browser for each of their
+  # Bots in use at once, up to `maxBrowsers` (8 when empty), closing each after `browserIdleMs`
+  # untouched (30 minutes when empty). Chromium is roughly 200-500MB per browser (a little more
+  # headed, plus a few MB for Xvfb) and up to 2GB with real pages open. Running out of memory takes
+  # down every one of that person's browsers at once, so size the limit to `maxBrowsers` times what
+  # one browser takes on your Bots' sites, plus headroom; on a small node, lower `maxBrowsers` (the
+  # least recently used browser closes first) rather than the limit.
   resources:
     requests:
       cpu: 500m
-      # Chromium is roughly 200-500MB headless and up to 2GB with real pages open.
-      memory: 1Gi
+      memory: 2Gi
     limits:
-      memory: 4Gi
+      memory: 8Gi
 
   nodeSelector: {}
   tolerations: []
@@ -540,8 +641,14 @@ secrets:
   # Intelligence missing.
   intelligenceApiKey: ""
   # Optional. Managed Intelligence issues no licence token; set this only for a self-hosted
-  # Intelligence that has one, and it is passed to the server as COPILOTKIT_LICENSE_TOKEN.
+  # Intelligence that has one, and it is passed to the server as COPILOTKIT_LICENSE_TOKEN. From a
+  # store, name `license-token` in `externalSecrets.data` instead; it is passed the same way. That
+  # Intelligence needs the licence on its own deployment too, or it refuses memory.
   licenseToken: ""
+  # Optional. One key for the whole deployment, for Composio, the broker holding people's accounts for
+  # a few hundred apps (docs/plugins/composio.md). Passed to the server alone as COMPOSIO_API_KEY.
+  # From a store, name `composio-api-key` in `externalSecrets.data` instead.
+  composioApiKey: ""
   # Sent to `config.managedAgent.url` on every call. Required when that url is set.
   managedAgentToken: ""
   # Required when `routines.enabled`: what the CronJob presents to the API server to be recognised
@@ -565,6 +672,12 @@ secrets:
   # logs ones are unset.
   otelLogsHeaders: ""
   otelHeaders: ""
+  # Optional, with `config.webBotAuth`. An Ed25519 private key as a JSON Web Key, to sign with instead
+  # of the one derived from `keyEncryptionKey`. Read from key `web-bot-auth-key` of whichever Secret
+  # this chart uses, when present.
+  webBotAuthKey: ""
+  # Required when `computers.egressProxy.enabled` and no `existingSecret` is named there.
+  egressProxyUrl: ""
 
 externalSecrets:
   enabled: false

@@ -3,10 +3,17 @@
  * for durable threads and memory. Configuration the product cannot function without belongs at the
  * boot boundary.
  */
+import { intelligenceApiKey } from "@openbot/shared/intelligence-key";
 import {
   isLearningContainerId,
   type LearningTarget,
-} from "../../shared/learning";
+} from "@openbot/shared/learning";
+import {
+  BROWSER_ABSENT_ENV,
+  BROWSER_URL_ENV,
+  type BrowserAbsence,
+  isBrowserAbsence,
+} from "@openbot/shared/openbot-browser";
 import { singleUserEnabled } from "./auth/dev-actor";
 import { normalizeDomain } from "./auth/email-domain";
 import { organizationAuthority } from "./auth/organization";
@@ -16,7 +23,9 @@ import {
   type TranscriptionConfig,
   transcriptionConfig,
 } from "./dictation/config";
+import type { BrokerProvider } from "./plugins/access";
 import { type VoiceConfig, voiceConfig } from "./voice/config";
+import { type WebBotAuth, webBotAuthFromEnv } from "./web-bot-auth";
 
 export type RuntimeCapabilities = {
   mode: "intelligence";
@@ -36,6 +45,11 @@ export type IntelligenceSettings = {
   gatewayWsUrl: string;
   apiKey: string;
   licenseToken?: string;
+  /**
+   * The gateway as the browser reaches it, when that is not where this server reaches it. See
+   * `INTELLIGENCE_BROWSER_GATEWAY_WS_URL` in `runtimeCapabilities`.
+   */
+  browserGatewayWsUrl?: string;
 };
 
 export type DockerComputerConfig = {
@@ -169,8 +183,37 @@ export type HandoffCaps = {
 };
 
 export type DeploymentConfig = {
+  /**
+   * Browser extension ids OpenBot trusts as the Recorder besides its own fixed id, for a fork or a
+   * build signed with another key. From OPENBOT_RECORDER_EXTRA_EXTENSION_IDS, never from NODE_ENV.
+   */
+  recorder: { extraExtensionIds: string[] };
   /** Optional environment default. A saved Admin setting takes precedence. */
   learning?: LearningTarget;
+  /**
+   * Whether OpenBot assigns the Intelligence project's `openbot` Learning container as the default
+   * when nobody has chosen one (learning/auto-assign.ts). On unless OPENBOT_LEARNING_AUTO_ASSIGN is
+   * "false" or "0", and off whenever CPK_INTELLIGENCE_LEARNING_CONTAINER_ID names a container. It
+   * never overrides a saved Admin setting. It creates the container only with a credential that can
+   * (see `learningSetup`), never with the runtime key.
+   */
+  learningAutoAssign: boolean;
+  /**
+   * A credential that can create Learning containers, for a deployment whose operator supplied one.
+   *
+   * The runtime key cannot: Intelligence creates containers for a person's session, a CopilotKit CLI
+   * login, or, on a CopilotKit local evaluation install only, a service token. The server holds
+   * neither of the first two, so this is the service token, sent as `x-copilotkit-ei-service-token`
+   * to `/api/learning/projects/:projectId/containers` with the project it belongs to. Both or
+   * neither: a token without its project is refused at startup.
+   */
+  learningSetup?: { serviceToken: string; projectId: string };
+  /**
+   * Memory sources and background research OpenBot switches on for each person (memory/defaults.ts).
+   * Both on unless OPENBOT_MEMORY_SOURCE_DEFAULTS or OPENBOT_PROACTIVE_DEFAULTS is "false" or "0".
+   * Switching either off stops new defaults and leaves every existing row as it is.
+   */
+  memoryDefaults: { sources: boolean; research: boolean };
   /** Audio configuration is independent of agent model providers. */
   transcription?: TranscriptionConfig;
   voice?: VoiceConfig;
@@ -246,6 +289,16 @@ export type DeploymentConfig = {
   /** GitHub App user sign-in, so people can link their GitHub account. Both or neither of GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET. */
   githubApp?: GithubAppConfig;
   /**
+   * The Arcade API key, from `ARCADE_API_KEY`. Unset is the ordinary state. Trimmed and never
+   * validated here, for the same reason as `composioApiKey`.
+   */
+  arcadeApiKey: string | undefined;
+  /**
+   * Which tool broker the operator asked for, from `OPENBOT_BROKER_PROVIDER`. Only read and
+   * validated here: which provider is active is decided elsewhere. Unset is `undefined`.
+   */
+  brokerProvider: BrokerProvider | undefined;
+  /**
    * Where this deployment is reached from outside, with no trailing slash.
    *
    * Needed because an OAuth redirect URI has to match what an administrator registered with the
@@ -258,6 +311,11 @@ export type DeploymentConfig = {
    * deployment running without authentication — and there is nothing to connect there anyway.
    */
   publicUrl: string | undefined;
+  /**
+   * The key Bots' browsers sign their requests with, and the address its public half is published
+   * under. Undefined when Web Bot Auth is off; see `web-bot-auth.ts` for when that is.
+   */
+  webBotAuth?: WebBotAuth;
   /**
    * Where the browser app is served from, with no trailing slash.
    *
@@ -350,6 +408,19 @@ export type DeploymentConfig = {
    * mounted and failing: a capability that is not configured should be missing, not broken.
    */
   computer?: ComputerConfig;
+  /**
+   * The computer that runs people's own OpenBot browsers here when it is not the Bots' (`OPENBOT_BROWSER_URL`): OpenBot
+   * Desktop's host-side local Chrome computer, so a person's browser is a window on their own desktop while Bots'
+   * computers stay where they are. Called with the same COMPUTER_TOKEN as every computer. Absent, the Bots' computer
+   * provider runs people's browsers too.
+   */
+  browser?: { url: string; token?: string };
+  /**
+   * Why OpenBot Desktop found no browser of the person's own to run on this machine (`OPENBOT_BROWSER_ABSENT`), which
+   * the person is told beside whatever browser runs for them instead. A name this server does not know is left out:
+   * Desktop and the deployment it runs are released apart, and an explanation is no reason to refuse to start.
+   */
+  browserAbsent?: BrowserAbsence;
   /** How far one Bot handing work to another may go. */
   handoff: HandoffCaps;
   /**
@@ -410,6 +481,17 @@ function required(environment: Environment, name: string): string {
 
 function optional(environment: Environment, name: string): string | undefined {
   return environment[name]?.trim() || undefined;
+}
+
+function brokerProvider(environment: Environment): BrokerProvider | undefined {
+  const raw = optional(environment, "OPENBOT_BROKER_PROVIDER");
+  if (raw === undefined) return undefined;
+  if (raw !== "composio" && raw !== "arcade") {
+    throw new Error(
+      `OPENBOT_BROKER_PROVIDER must be "composio" or "arcade", got "${raw}". Leave it unset to choose by which API key is configured.`,
+    );
+  }
+  return raw;
 }
 
 /**
@@ -551,6 +633,7 @@ function reachOf(raw: string): Reach {
     return "public";
   }
   bare = bare.replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+  if (!bare) return "public";
 
   if (
     bare === "localhost" ||
@@ -940,14 +1023,14 @@ function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
   const settings = {
     apiUrl: url(environment, "INTELLIGENCE_API_URL"),
     gatewayWsUrl: url(environment, "INTELLIGENCE_GATEWAY_WS_URL"),
-    apiKey: optional(environment, "INTELLIGENCE_API_KEY"),
+    apiKey: intelligenceApiKey(environment),
     licenseToken: optional(environment, "COPILOTKIT_LICENSE_TOKEN"),
   };
 
   const missing = Object.entries({
     INTELLIGENCE_API_URL: settings.apiUrl,
     INTELLIGENCE_GATEWAY_WS_URL: settings.gatewayWsUrl,
-    INTELLIGENCE_API_KEY: settings.apiKey,
+    "CPK_INTELLIGENCE_API_KEY (or INTELLIGENCE_API_KEY)": settings.apiKey,
   })
     .filter(([, value]) => !value)
     .map(([name]) => name);
@@ -958,10 +1041,26 @@ function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
     );
   }
 
+  /*
+   * Optional, and only ever a second address for the same gateway. The browser opens the gateway
+   * itself, at the address `/info` gives it, so a server that reaches Intelligence somewhere the
+   * browser cannot follow names the browser's address here. The server in OpenBot Desktop's
+   * container does: it reaches local Intelligence at `host.docker.internal`, and the window on the
+   * host reaches the same gateway at `localhost`. Unset, the browser is given `gatewayWsUrl`, as
+   * before.
+   */
+  const browserGatewayWsUrl = url(
+    environment,
+    "INTELLIGENCE_BROWSER_GATEWAY_WS_URL",
+  );
+
   return {
     mode: "intelligence",
     durableHistory: true,
-    intelligence: settings as IntelligenceSettings,
+    intelligence: {
+      ...(settings as IntelligenceSettings),
+      ...(browserGatewayWsUrl ? { browserGatewayWsUrl } : {}),
+    },
   };
 }
 
@@ -1091,6 +1190,19 @@ export function durationMs(value: string): number {
     default:
       return amount;
   }
+}
+
+function browserConfig(
+  environment: Environment,
+): Pick<DeploymentConfig, "browser" | "browserAbsent"> {
+  const address = url(environment, BROWSER_URL_ENV);
+  if (!address) {
+    // Only where there is no browser of the person's own: one that runs needs no reason why it does not.
+    const absent = optional(environment, BROWSER_ABSENT_ENV);
+    return absent && isBrowserAbsence(absent) ? { browserAbsent: absent } : {};
+  }
+  const token = optional(environment, "COMPUTER_TOKEN");
+  return { browser: { url: address, ...(token ? { token } : {}) } };
 }
 
 function computerConfig(environment: Environment): ComputerConfig | undefined {
@@ -1326,13 +1438,19 @@ export function loadConfig(
     );
   }
   const workerSharedSecret = optional(environment, "WORKER_SHARED_SECRET");
+  const deploymentKey = keyEncryptionKey(environment);
+  const webBotAuth = webBotAuthFromEnv(environment, {
+    publicUrl,
+    keyEncryptionKey: deploymentKey,
+  });
 
   return {
     port: serverPort(environment),
     transcription: transcriptionConfig(environment),
     voice: voiceConfig(environment),
     databaseUrl: required(environment, "DATABASE_URL"),
-    keyEncryptionKey: keyEncryptionKey(environment),
+    keyEncryptionKey: deploymentKey,
+    ...(webBotAuth ? { webBotAuth } : {}),
     ...(managedAgent ? { managedAgent } : {}),
     ...(githubApp ? { githubApp } : {}),
     agentEndpointAllowedHosts: agentEndpointAllowedHosts(environment),
@@ -1343,6 +1461,8 @@ export function loadConfig(
     ),
     deploymentId: optional(environment, "DEPLOYMENT_ID"),
     composioApiKey: optional(environment, "COMPOSIO_API_KEY"),
+    arcadeApiKey: optional(environment, "ARCADE_API_KEY"),
+    brokerProvider: brokerProvider(environment),
     publicUrl,
     appUrl: (
       optional(environment, "OPENBOT_APP_URL") ??
@@ -1353,7 +1473,14 @@ export function loadConfig(
     tenantPackageDirectory:
       optional(environment, "TENANT_PACKAGE_DIR") ?? "../examples/fintech",
     runtime: runtimeCapabilities(environment),
+    recorder: { extraExtensionIds: recorderExtraExtensionIds(environment) },
     learning: learningDefault(environment),
+    learningAutoAssign: learningAutoAssignEnabled(environment),
+    ...learningSetupCredential(environment),
+    memoryDefaults: {
+      sources: switchedOn(environment, "OPENBOT_MEMORY_SOURCE_DEFAULTS"),
+      research: switchedOn(environment, "OPENBOT_PROACTIVE_DEFAULTS"),
+    },
     agentStallTimeoutMs: agentStallTimeoutMs(environment),
     auditRetentionDays: auditRetentionDays(environment),
     oauth: { google },
@@ -1374,12 +1501,62 @@ export function loadConfig(
       ? { appDistDir: optional(environment, "APP_DIST_DIR") as string }
       : {}),
     computer: computerConfig(environment),
+    ...browserConfig(environment),
     handoff: handoffCaps(environment),
     ...(optional(environment, "AGENT_TOOL_TOKEN")
       ? { agentToolToken: optional(environment, "AGENT_TOOL_TOKEN") as string }
       : {}),
     ...(workerSharedSecret ? { workerSharedSecret } : {}),
   };
+}
+
+/**
+ * Same rule as generated interfaces: on unless explicitly "false" or "0". A container named in the
+ * environment is a choice, so there is nothing to assign.
+ */
+function learningAutoAssignEnabled(environment: Environment): boolean {
+  if (optional(environment, "CPK_INTELLIGENCE_LEARNING_CONTAINER_ID"))
+    return false;
+  const value = optional(environment, "OPENBOT_LEARNING_AUTO_ASSIGN");
+  return value !== "false" && value !== "0";
+}
+
+/** Comma separated, each trimmed, each a Chrome extension id (32 letters a to p). */
+function recorderExtraExtensionIds(environment: Environment): string[] {
+  const value = optional(environment, "OPENBOT_RECORDER_EXTRA_EXTENSION_IDS");
+  if (!value) return [];
+  const ids = value.split(",").map((id) => id.trim());
+  for (const id of ids) {
+    if (!/^[a-p]{32}$/.test(id))
+      throw new Error(
+        `OPENBOT_RECORDER_EXTRA_EXTENSION_IDS lists "${id}", which is not an extension id. An id is 32 letters from a to p; separate several with commas.`,
+      );
+  }
+  return ids;
+}
+
+/** On unless the variable is "false" or "0", the rule every default-on switch here follows. */
+function switchedOn(environment: Environment, name: string): boolean {
+  const value = optional(environment, name);
+  return value !== "false" && value !== "0";
+}
+
+/** The service token and its project, both or neither. See `DeploymentConfig.learningSetup`. */
+function learningSetupCredential(environment: Environment): {
+  learningSetup?: { serviceToken: string; projectId: string };
+} {
+  const serviceToken = optional(environment, "INTELLIGENCE_SERVICE_TOKEN");
+  const projectId = optional(environment, "INTELLIGENCE_PROJECT_ID");
+  if (!serviceToken && !projectId) return {};
+  if (!serviceToken || !projectId)
+    throw new Error(
+      "INTELLIGENCE_SERVICE_TOKEN and INTELLIGENCE_PROJECT_ID go together: the token creates the openbot Learning container in that project. Set both, or neither.",
+    );
+  if (!/^[1-9][0-9]{0,15}$/.test(projectId))
+    throw new Error(
+      "INTELLIGENCE_PROJECT_ID must be the Intelligence project's numeric ID.",
+    );
+  return { learningSetup: { serviceToken, projectId } };
 }
 
 /** Optional container default; the enabled preference alone does not collect or deliver. */
