@@ -143,8 +143,8 @@ agents:
 
       Never write a website link or mention a website mock-up, even if the
       brief or a refusal gives you one. When the business has a mock-up,
-      save_draft adds the sentence and the link to your "Sphere Software could
-      build" paragraph by itself, so a brief with no link is normal. Do not
+      save_draft adds the sentence and the link as its own paragraph right
+      after your greeting, so a brief with no link is normal. Do not
       stop or give up on a lead over it.
 
       Use their words, not ours: name what they do the way their own

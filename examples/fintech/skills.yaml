@@ -512,8 +512,9 @@ skills:
       - the score and the verdict, in one line;
       - the checklist with `showChecklist`, one item per entry, done when it passed, with the
         reviewer's evidence as the note;
-      - for demos, a `showTable` of business, email, score, preview, demo link and when the
-        link expires;
+      - for demos, a `showTable` of business, email, score, preview, demo link and how long it
+        stays up: "3 days from its email", never a date, because a demo's 3 days start when
+        its email goes out and the site stays up until then;
       - the `preview_url`, as a link.
       Say plainly anything the reviewer listed under invented claims or wrong brand media. Never
       call a site published or live: it is a private preview.
@@ -532,10 +533,9 @@ skills:
       person approving the email in the CRM is the gate. Call `cancel_build` only when asked.
 
       Links. `share_site` makes a link for a client, for at most 3 days, and asks the owner first;
-      `list_shares` and `revoke_share` manage those. Call `refresh_demo_link` when a lead demo's
-      link has under about 36 hours left and its email has not gone out; the old link keeps
-      working until it expires, but only the new one is offered to Outreach. Put links in this
-      chat and nowhere else.
+      `list_shares` and `revoke_share` manage those. A lead demo's link is renewed by itself
+      until its email goes out, so call `refresh_demo_link` only when a person asks. Put links
+      in this chat and nowhere else.
 
       Never invent a business fact, number, customer or quote, in a brief or a report; say what
       you do not know. Never say an email was sent: Outreach drafts it and a person sends it. If a

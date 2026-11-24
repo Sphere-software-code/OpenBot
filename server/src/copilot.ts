@@ -77,6 +77,7 @@ import {
   selectTools,
 } from "./plugins/selection";
 import { grantedToolGuidance, holdsWebSearch } from "./plugins/tools";
+import { soulGuidance } from "./soul";
 import { UNTRUSTED_GUIDANCE } from "./untrusted-content";
 
 /**
@@ -172,6 +173,7 @@ export type AgentStandingProfile = {
 export function standingRoleMessage(
   profile: AgentStandingProfile,
 ): StandingRoleMessage {
+  const houseRules = soulGuidance();
   return {
     id: `standing-role:${profile.id}`,
     role: "system",
@@ -179,6 +181,8 @@ export function standingRoleMessage(
       `You are ${profile.name}, ${profile.title}.`,
       profile.roleDescription,
       "This standing role applies in every channel. Treat channel messages as task-specific instructions within it.",
+      // The organisation's house rules, straight after the role they sit beside. See `soulGuidance`.
+      ...(houseRules ? [houseRules] : []),
       /*
        * Here rather than in the package, because for a remote Bot the standing role is the only
        * instruction there is: `role_description` is one sentence somebody wrote about what it is
@@ -451,6 +455,7 @@ export function builtInAgentConfiguration(
   }
 
   const standing = standingInstructionsGuidance(standingInstructions);
+  const houseRules = soulGuidance();
   const allTools = [
     ...tools,
     ...(learnedSkills?.tools.map((tool) => ({
@@ -477,6 +482,9 @@ export function builtInAgentConfiguration(
      */
     prompt: [
       agent.systemPrompt,
+      // The organisation's house rules, between the role and the person: a built-in Bot gets no
+      // standing role message, so this is the only place they can reach it. See `soulGuidance`.
+      ...(houseRules ? [houseRules] : []),
       ...(standing ? [standing] : []),
       /*
        * Unconditional, unlike the two below it.
