@@ -21,12 +21,14 @@ function summary(overrides: Partial<RoutineSummary> = {}): RoutineSummary {
     id: "routine-1",
     agentId: "agent-1",
     instruction: "Post the weather every weekday morning.",
+    title: null,
     schedule: "Weekdays at 09:00",
     timezone: "UTC",
     enabled: true,
     nextRunAt: new Date("2026-08-27T09:00:00.000Z"),
     channelId: "channel-1",
     channelName: "Assistant channel",
+    channelTitle: "Standup notes",
     channelDeleted: false,
     lastRun: {
       status: "succeeded",
@@ -44,6 +46,24 @@ function fakeStore(
   const calls: StoreCall[] = [];
   const base: RoutineStore = {
     async create() {
+      throw new Error("not used by these tests");
+    },
+    async conversationFor() {
+      throw new Error("not used by these tests");
+    },
+    async linkGoal() {
+      throw new Error("not used by these tests");
+    },
+    async startManualRun() {
+      throw new Error("not used by these tests");
+    },
+    async listRuns() {
+      throw new Error("not used by these tests");
+    },
+    async reapAbandonedRuns() {
+      throw new Error("not used by these tests");
+    },
+    async markUnschedulable() {
       throw new Error("not used by these tests");
     },
     async listFor(ownerUserId) {
@@ -126,7 +146,13 @@ describe("GET /", () => {
           schedule: "Weekdays at 09:00",
           timezone: "UTC",
           instruction: "Post the weather every weekday morning.",
-          channel: { id: "channel-1", name: "Assistant channel", gone: false },
+          title: null,
+          channel: {
+            id: "channel-1",
+            name: "Assistant channel",
+            title: "Standup notes",
+            gone: false,
+          },
           enabled: true,
           nextRunAt: "2026-08-27T09:00:00.000Z",
           lastRun: { status: "succeeded", at: "2026-08-26T09:00:00.000Z" },
@@ -162,7 +188,11 @@ describe("GET /", () => {
   test("a channel with no name and gone reads as gone with a null name", async () => {
     const store = fakeStore({
       listFor: async () => [
-        summary({ channelName: null, channelDeleted: true }),
+        summary({
+          channelName: null,
+          channelTitle: null,
+          channelDeleted: true,
+        }),
       ],
     });
     const response = await appFor(store).request("http://openbot.test/");
@@ -170,6 +200,7 @@ describe("GET /", () => {
     expect((await json(response)).routines[0].channel).toEqual({
       id: "channel-1",
       name: null,
+      title: null,
       gone: true,
     });
   });

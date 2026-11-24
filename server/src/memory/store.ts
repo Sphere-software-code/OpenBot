@@ -38,7 +38,7 @@ import {
  * it from an OpenBot row id without a lookup, and so it can never collide with one.
  */
 const INTELLIGENCE_ID_PREFIX = "intelligence:";
-const INTELLIGENCE_PROVENANCE = "CopilotKit Intelligence";
+const INTELLIGENCE_PROVENANCE = "OpenBot memory";
 
 const digestOf = (content: string) =>
   createHash("sha256").update(content).digest("hex");
@@ -377,9 +377,10 @@ export function createMemoryStore(
     /**
      * A memory a Bot formed from something it observed, awaiting the person's review.
      *
-     * Deduplicated on content, deleted rows included: a memory the person forgot stays forgotten
-     * even when the Bot reads the same record again tomorrow. It reaches Intelligence only once the
-     * person accepts it.
+     * Deduplicated on content per Bot, since each Bot is given only the memories it formed itself:
+     * a second Bot forming the same fact keeps its own row. Forgetting is the person's, so a fact
+     * they forgot from any Bot stays forgotten, even when a Bot reads the same record again
+     * tomorrow. It reaches Intelligence only once the person accepts it.
      */
     async formMemory(ownerUserId: string, input: FormedMemoryInput) {
       const parsed = formedMemorySchema.safeParse({
@@ -406,8 +407,14 @@ export function createMemoryStore(
             eq(personalMemories.ownerUserId, ownerUserId),
             eq(personalMemories.formedBy, "bot"),
             eq(personalMemories.importDigest, digest),
+            or(
+              eq(personalMemories.formedByAgentId, input.agentId),
+              isNotNull(personalMemories.deletedAt),
+            ),
           ),
         )
+        // A forgotten row first, so another Bot's tombstone wins over this Bot's live row.
+        .orderBy(sql`${personalMemories.deletedAt} IS NULL`)
         .limit(1);
       if (existing)
         return {
@@ -437,7 +444,11 @@ export function createMemoryStore(
           importDigest: digest,
         })
         .onConflictDoNothing({
-          target: [personalMemories.ownerUserId, personalMemories.importDigest],
+          target: [
+            personalMemories.ownerUserId,
+            personalMemories.formedByAgentId,
+            personalMemories.importDigest,
+          ],
           where: sql`${personalMemories.formedBy} = 'bot'`,
         })
         .returning({ id: personalMemories.id });
@@ -453,6 +464,7 @@ export function createMemoryStore(
           and(
             eq(personalMemories.ownerUserId, ownerUserId),
             eq(personalMemories.formedBy, "bot"),
+            eq(personalMemories.formedByAgentId, input.agentId),
             eq(personalMemories.importDigest, digest),
           ),
         )
@@ -470,7 +482,7 @@ export function createMemoryStore(
         // Intelligence keeps the content and nothing else, so there is nothing to pause or review.
         if (patch.enabled !== undefined)
           throw new MemoryRefusedError(
-            "A memory kept in CopilotKit Intelligence can be edited or forgotten, not paused.",
+            "A memory kept in the backend can be edited or forgotten, not paused.",
           );
         const remoteId = id.slice(INTELLIGENCE_ID_PREFIX.length);
         if (!patch.content) {

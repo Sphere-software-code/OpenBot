@@ -8,12 +8,13 @@ import {
   isLearningContainerId,
   type LearningTarget,
 } from "@openbot/shared/learning";
+import { listenPort } from "@openbot/shared/listen-port";
+import { BROWSER_URL_ENV } from "@openbot/shared/openbot-browser";
 import {
-  BROWSER_ABSENT_ENV,
-  BROWSER_URL_ENV,
-  type BrowserAbsence,
-  isBrowserAbsence,
-} from "@openbot/shared/openbot-browser";
+  addressesBeyondThisMachine,
+  deploymentAddresses,
+  isLoopbackHost,
+} from "@openbot/shared/this-machine";
 import { singleUserEnabled } from "./auth/dev-actor";
 import { normalizeDomain } from "./auth/email-domain";
 import { organizationAuthority } from "./auth/organization";
@@ -23,6 +24,8 @@ import {
   type TranscriptionConfig,
   transcriptionConfig,
 } from "./dictation/config";
+import { type Edition, parseEdition } from "./edition";
+import { proxiedClientSocketUrl } from "./intelligence-gateway-proxy";
 import type { BrokerProvider } from "./plugins/access";
 import { type VoiceConfig, voiceConfig } from "./voice/config";
 import { type WebBotAuth, webBotAuthFromEnv } from "./web-bot-auth";
@@ -50,6 +53,11 @@ export type IntelligenceSettings = {
    * `INTELLIGENCE_BROWSER_GATEWAY_WS_URL` in `runtimeCapabilities`.
    */
   browserGatewayWsUrl?: string;
+  /**
+   * This server carries the browser's gateway socket itself (`INTELLIGENCE_GATEWAY_PROXY=on`), and
+   * `browserGatewayWsUrl` is its own address for it. See `intelligence-gateway-proxy.ts`.
+   */
+  gatewayProxy?: true;
 };
 
 export type DockerComputerConfig = {
@@ -104,6 +112,12 @@ export type AuthProviderId = "google" | "microsoft" | "okta";
 /** An OAuth client, as every provider here needs one. */
 export type OAuthClient = { clientId: string; clientSecret: string };
 
+export type MicrosoftAuthConfig = OAuthClient & {
+  tenantId: string;
+  apiScope: string;
+  allowedClients: string[];
+};
+
 export type GithubAppConfig = {
   clientId: string;
   clientSecret: string;
@@ -126,8 +140,18 @@ export type AuthConfig = {
    * `tenantId` decides who may sign in at all, so it is not a detail. `common` admits any Microsoft
    * account including personal ones, `organizations` any work or school account anywhere, and a GUID
    * admits one directory. A deployment that wants only its own company needs the GUID.
+   *
+   * `apiScope` is OpenBot's own API in Entra, as a scope: what a person's app asks for a token to
+   * OpenBot with, and what OpenBot asks for from a person's stored sign-in before exchanging it on
+   * their behalf (`auth/entra.ts`). `api://<client id>/.default` unless MICROSOFT_OAUTH_API_SCOPE says
+   * otherwise.
+   *
+   * `allowedClients` is which apps may call OpenBot with a person's token, by application (client)
+   * id, lower-cased: a token's `azp` must be one of them. Entra issues a token for OpenBot's API to
+   * any app a person or an admin consents to, so the token alone does not say the app is one this
+   * company meant. Empty, from MICROSOFT_OAUTH_ALLOWED_CLIENTS unset, no app's token is taken.
    */
-  microsoft?: OAuthClient & { tenantId: string };
+  microsoft?: MicrosoftAuthConfig;
   /** Okta is an OIDC provider rather than a named one, so it is identified by its issuer. */
   okta?: OAuthClient & { issuer: string };
 };
@@ -182,6 +206,26 @@ export type HandoffCaps = {
   maxPerRun: number;
 };
 
+/**
+ * Which requests a single-user deployment admits as its one administrator.
+ *
+ * `thisMachineOnly` is true for a server running on the person's own machine (OpenBot Desktop,
+ * `scripts/start.sh`, `bun run dev`) with no address beyond it configured: only a caller connecting
+ * from this machine's loopback is the administrator. False in a container, where every caller arrives
+ * through the engine's network and none of them is on loopback, and wherever the operator named an
+ * address on their network, which is them saying other machines reach it.
+ *
+ * `hosts` are the names, besides this machine's loopback names, a request may be addressed to: the
+ * hosts of the configured URLs. A request addressed to any other name is a page whose name an attacker
+ * pointed at this machine (DNS rebinding), which is same-origin with itself and sends no telling
+ * `Origin`. Where `thisMachineOnly` is false, any IP address is accepted too: a name can be rebound,
+ * an address typed into the browser cannot.
+ */
+export type SingleUserAccess = {
+  thisMachineOnly: boolean;
+  hosts: string[];
+};
+
 export type DeploymentConfig = {
   /**
    * Browser extension ids OpenBot trusts as the Recorder besides its own fixed id, for a fork or a
@@ -193,9 +237,10 @@ export type DeploymentConfig = {
   /**
    * Whether OpenBot assigns the Intelligence project's `openbot` Learning container as the default
    * when nobody has chosen one (learning/auto-assign.ts). On unless OPENBOT_LEARNING_AUTO_ASSIGN is
-   * "false" or "0", and off whenever CPK_INTELLIGENCE_LEARNING_CONTAINER_ID names a container. It
-   * never overrides a saved Admin setting. It creates the container only with a credential that can
-   * (see `learningSetup`), never with the runtime key.
+   * "false" or "0". A container CPK_INTELLIGENCE_LEARNING_CONTAINER_ID names stands it aside once
+   * Intelligence confirms it has that container; one it does not have is ignored, and this assigns
+   * as though nothing was named. It never overrides a saved Admin setting. It creates the container
+   * only with a credential that can (see `learningSetup`), never with the runtime key.
    */
   learningAutoAssign: boolean;
   /**
@@ -264,12 +309,26 @@ export type DeploymentConfig = {
    */
   routineFreshContextBots: readonly string[];
   /**
+   * The name this server's container reaches the person's machine by, from
+   * `OPENBOT_THIS_MACHINE_HOST`. OpenBot Desktop sets it (`host.docker.internal`), because there the
+   * server runs in a container and `127.0.0.1` is the container, so an agent the person registers on
+   * their own loopback is dialled through this name (`onThisMachine` in agents/endpoint.ts). Absent
+   * wherever the server is a host process or hosted, and nothing is translated.
+   */
+  thisMachineHost?: string;
+  /**
    * What this deployment calls itself, when more than one shares an Intelligence project.
    *
    * Absent, the tenant package's id stands in, which separates deployments running different
    * packages but not a copy of one running alongside the original. See channels/thread-identity.ts.
    */
   deploymentId: string | undefined;
+  /**
+   * The OpenBot release this server runs, such as `v0.3.1`, from OPENBOT_BUILD_VERSION: release CI
+   * bakes it into the image, and OpenBot Desktop sets it from the release it installed. Absent in
+   * development and in a local image build.
+   */
+  version?: string;
   /**
    * The key this deployment talks to Composio with, the broker that holds people's accounts for a
    * few hundred apps so a Bot can act in Gmail or Slack without an OAuth client of this
@@ -361,6 +420,25 @@ export type DeploymentConfig = {
    * reaching somewhere other people can get to.
    */
   singleUser: boolean;
+  /**
+   * Which requests single-user mode admits as its administrator. Undefined unless {@link singleUser}.
+   *
+   * The flag says there is one person. It cannot say that every request is theirs, and before this,
+   * every request was: a page on any website could drive the install, anybody on the same network
+   * could reach it, and a name an attacker controls could be pointed at it. See `request-trust.ts`.
+   */
+  singleUserAccess?: SingleUserAccess;
+  /**
+   * The origins this deployment's own pages are served from, besides the server's own: the public URL,
+   * the app's URL, `TRUSTED_ORIGINS`, and in single-user mode the app's port on this machine's loopback
+   * names and on each of those addresses' hosts. A browser request from any other origin may read nothing
+   * and change nothing (`request-trust.ts`).
+   *
+   * Origins, not URLs: `scheme://host:port`, as a browser writes its `Origin` header.
+   */
+  browserOrigins: string[];
+  /** Which product this is. `personal` requires single-user mode and the one shared computer. */
+  edition: Edition;
   /** Names OpenBot on the analytics the runtime already sends. Off with OPENBOT_ACCESSIBILITY_DISABLED. */
   accessibility: boolean;
   /**
@@ -409,18 +487,12 @@ export type DeploymentConfig = {
    */
   computer?: ComputerConfig;
   /**
-   * The computer that runs people's own OpenBot browsers here when it is not the Bots' (`OPENBOT_BROWSER_URL`): OpenBot
-   * Desktop's host-side local Chrome computer, so a person's browser is a window on their own desktop while Bots'
-   * computers stay where they are. Called with the same COMPUTER_TOKEN as every computer. Absent, the Bots' computer
-   * provider runs people's browsers too.
+   * The computer that runs people's own OpenBot browsers here when it is not the Bots' (`OPENBOT_BROWSER_URL`): a
+   * host-side local Chrome computer (`scripts/start-local-chrome-computer.ts`), so a person's browser is a window on
+   * their own desktop while Bots' computers stay where they are. Called with the same COMPUTER_TOKEN as every computer.
+   * Absent, the Bots' computer provider runs people's browsers too, shown in the page.
    */
   browser?: { url: string; token?: string };
-  /**
-   * Why OpenBot Desktop found no browser of the person's own to run on this machine (`OPENBOT_BROWSER_ABSENT`), which
-   * the person is told beside whatever browser runs for them instead. A name this server does not know is left out:
-   * Desktop and the deployment it runs are released apart, and an explanation is no reason to refuse to start.
-   */
-  browserAbsent?: BrowserAbsence;
   /** How far one Bot handing work to another may go. */
   handoff: HandoffCaps;
   /**
@@ -610,6 +682,89 @@ function singleUserAllowed(
 }
 
 /**
+ * Which requests single-user mode admits. See {@link SingleUserAccess}.
+ *
+ * WHERE THE SERVER RUNS IS SAID BY THE IMAGE, NOT GUESSED. `OPENBOT_IN_CONTAINER=true` is set by both
+ * Dockerfiles that run this server (`server/Dockerfile`, used by Compose and the chart, and the
+ * one-container `Dockerfile`), so every container gets it without anybody writing it down, and every
+ * other way of starting the server (OpenBot Desktop, `scripts/start.sh`, `bun run dev`) does not.
+ * The default is the strict one: a server nobody said is in a container admits only this machine.
+ * Inside a container that would refuse everybody, because the engine's proxy is the peer of every
+ * request, which is the one place the flag is needed and the one place it is always present.
+ */
+function singleUserAccess(environment: Environment): SingleUserAccess {
+  const inContainer = optional(environment, "OPENBOT_IN_CONTAINER") === "true";
+  const hosts = new Set<string>();
+  for (const address of deploymentAddresses(environment)) {
+    try {
+      const { hostname } = new URL(address);
+      if (hostname) hosts.add(hostname.toLowerCase().replace(/\.+$/, ""));
+    } catch {
+      // singleUserAllowed has already refused an address that does not parse.
+    }
+  }
+  return {
+    thisMachineOnly:
+      !inContainer && addressesBeyondThisMachine(environment).length === 0,
+    hosts: [...hosts],
+  };
+}
+
+/**
+ * The origins this deployment's own pages are served from. See {@link DeploymentConfig.browserOrigins}.
+ *
+ * In single-user mode the app's port as well, on all three loopback names, whatever else is configured,
+ * because that is where OpenBot Desktop and `scripts/start.sh` open it, and on the host of every configured
+ * address, because that is where another machine opens it once one is configured
+ * (`OPENBOT_PUBLIC_URL=http://192.168.1.10:3001` puts the app at `http://192.168.1.10:3010`). The app's
+ * servers proxy API calls to this one, so the browser's `Origin` names the app's port and the request's
+ * `Host` this server's, and the socket the app opens in development goes straight to this port from the
+ * app's origin. Only that port on those hosts: another port, or another host, is still another site.
+ */
+function browserOrigins(
+  environment: Environment,
+  input: {
+    publicUrl: string | undefined;
+    appUrl: string | undefined;
+    auth: AuthConfig | undefined;
+    singleUser: boolean;
+  },
+): string[] {
+  const appPort = listenPort(environment.APP_PORT, 3010);
+  const port = appPort.ok ? appPort.port : 3010;
+  const configured = [
+    input.publicUrl,
+    input.appUrl,
+    input.auth?.baseUrl,
+    ...commaSeparated(environment, "TRUSTED_ORIGINS"),
+    ...(input.auth?.trustedOrigins ?? []),
+  ].flatMap((value) => {
+    if (!value) return [];
+    try {
+      const url = new URL(value);
+      return url.origin === "null" ? [] : [url];
+    } catch {
+      // Not an origin anybody's browser could send.
+      return [];
+    }
+  });
+  const origins = new Set(configured.map((url) => url.origin));
+  if (input.singleUser) {
+    for (const host of [
+      new URL("http://127.0.0.1"),
+      new URL("http://localhost"),
+      new URL("http://[::1]"),
+      ...configured,
+    ]) {
+      const app = new URL(host.origin);
+      app.port = String(port);
+      origins.add(app.origin);
+    }
+  }
+  return [...origins];
+}
+
+/**
  * How far an address reaches, which is the question `OPENBOT_SINGLE_USER` actually turns on.
  *
  * Not two answers but three, because the middle one is most of the deployments this flag exists
@@ -635,14 +790,9 @@ function reachOf(raw: string): Reach {
   bare = bare.replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   if (!bare) return "public";
 
-  if (
-    bare === "localhost" ||
-    bare === "::1" ||
-    bare === "0:0:0:0:0:0:0:1" ||
-    /^127(\.\d{1,3}){3}$/.test(bare)
-  ) {
-    return "loopback";
-  }
+  // The one definition the app's own servers use too, so the address that decides whether this mode is
+  // allowed is the address that decides who it admits and where the app listens.
+  if (isLoopbackHost(bare)) return "loopback";
 
   if (bare.includes(":")) {
     // fc00::/7 is the unique local range and fe80::/10 the link-local one. Both are unroutable on
@@ -816,7 +966,7 @@ const MULTI_TENANT_AUDIENCES = new Set([
   "consumers",
 ]);
 
-function namesNoDirectory(tenantId: string | undefined): boolean {
+export function namesNoDirectory(tenantId: string | undefined): boolean {
   return (
     tenantId !== undefined &&
     MULTI_TENANT_AUDIENCES.has(tenantId.trim().toLowerCase())
@@ -970,13 +1120,41 @@ function authConfig(
  */
 function microsoftAuth(
   environment: Environment,
-): (OAuthClient & { tenantId: string }) | undefined {
+): MicrosoftAuthConfig | undefined {
   const client = oauthClient(environment, "MICROSOFT");
   if (!client) return undefined;
   return {
     ...client,
     tenantId: optional(environment, "MICROSOFT_OAUTH_TENANT_ID") ?? "common",
+    apiScope:
+      optional(environment, "MICROSOFT_OAUTH_API_SCOPE") ??
+      `api://${client.clientId}/.default`,
+    allowedClients: allowedEntraClients(environment),
   };
+}
+
+/** An application (client) id as Entra writes it in a token's `azp`: a GUID. */
+const ENTRA_CLIENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The apps whose tokens OpenBot takes, from MICROSOFT_OAUTH_ALLOWED_CLIENTS.
+ *
+ * Refused at start-up when an entry is not a client id, because the likely mistake is pasting the
+ * app's `api://` URI or its name, which no token's `azp` will ever equal: every app would then be
+ * refused at the door with nothing said about why.
+ */
+function allowedEntraClients(environment: Environment): string[] {
+  const named = commaSeparated(environment, "MICROSOFT_OAUTH_ALLOWED_CLIENTS");
+  const wrong = named.find(
+    (client) => !ENTRA_CLIENT_ID.test(client.toLowerCase()),
+  );
+  if (wrong !== undefined) {
+    throw new Error(
+      `MICROSOFT_OAUTH_ALLOWED_CLIENTS names \`${wrong}\`, which is not an application (client) id. Give each app's client id, a GUID from its app registration, separated by commas.`,
+    );
+  }
+  return named.map((client) => client.toLowerCase());
 }
 
 /**
@@ -1054,14 +1232,43 @@ function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
     "INTELLIGENCE_BROWSER_GATEWAY_WS_URL",
   );
 
+  /*
+   * Or OpenBot carries the browser's socket itself, for an Intelligence that only OpenBot can reach:
+   * one in the same cluster, behind a `kubectl port-forward` or a single Ingress host. The browser
+   * is then told OpenBot's own address for it, so naming a second one as well is a contradiction.
+   */
+  const gatewayProxy = onOrOff(environment, "INTELLIGENCE_GATEWAY_PROXY");
+  if (gatewayProxy && browserGatewayWsUrl) {
+    throw new Error(
+      "INTELLIGENCE_GATEWAY_PROXY=on and INTELLIGENCE_BROWSER_GATEWAY_WS_URL both say where the browser reaches the Intelligence gateway. Set one of them.",
+    );
+  }
+
   return {
     mode: "intelligence",
     durableHistory: true,
     intelligence: {
       ...(settings as IntelligenceSettings),
-      ...(browserGatewayWsUrl ? { browserGatewayWsUrl } : {}),
+      ...(gatewayProxy
+        ? {
+            browserGatewayWsUrl: proxiedClientSocketUrl(
+              optional(environment, "OPENBOT_PUBLIC_URL"),
+            ),
+            gatewayProxy: true as const,
+          }
+        : browserGatewayWsUrl
+          ? { browserGatewayWsUrl }
+          : {}),
     },
   };
+}
+
+/** `on` or `off`, and unset is off. Anything else is a typo that would otherwise read as off. */
+function onOrOff(environment: Environment, name: string): boolean {
+  const value = optional(environment, name);
+  if (value === undefined || value === "off") return false;
+  if (value === "on") return true;
+  throw new Error(`${name} must be "on" or "off".`);
 }
 
 /**
@@ -1109,6 +1316,27 @@ function agentEndpointAllowedHosts(
     hosts.add(normalizeAllowedHost(entry, host));
   }
   return hosts;
+}
+
+/**
+ * `OPENBOT_THIS_MACHINE_HOST`, as one host name. See {@link DeploymentConfig.thisMachineHost}.
+ *
+ * A scheme, port or path is refused at boot, naming the value, rather than producing addresses that
+ * silently never connect.
+ */
+function thisMachineHost(environment: NodeJS.ProcessEnv): {
+  thisMachineHost?: string;
+} {
+  const host = optional(environment, "OPENBOT_THIS_MACHINE_HOST")
+    ?.trim()
+    .toLowerCase();
+  if (!host) return {};
+  if (!/^[a-z0-9.-]+$/.test(host)) {
+    throw new Error(
+      `OPENBOT_THIS_MACHINE_HOST "${host}" must be a host name, without a scheme, port or path.`,
+    );
+  }
+  return { thisMachineHost: host };
 }
 
 /**
@@ -1194,13 +1422,9 @@ export function durationMs(value: string): number {
 
 function browserConfig(
   environment: Environment,
-): Pick<DeploymentConfig, "browser" | "browserAbsent"> {
+): Pick<DeploymentConfig, "browser"> {
   const address = url(environment, BROWSER_URL_ENV);
-  if (!address) {
-    // Only where there is no browser of the person's own: one that runs needs no reason why it does not.
-    const absent = optional(environment, BROWSER_ABSENT_ENV);
-    return absent && isBrowserAbsence(absent) ? { browserAbsent: absent } : {};
-  }
+  if (!address) return {};
   const token = optional(environment, "COMPUTER_TOKEN");
   return { browser: { url: address, ...(token ? { token } : {}) } };
 }
@@ -1443,8 +1667,17 @@ export function loadConfig(
     publicUrl,
     keyEncryptionKey: deploymentKey,
   });
+  const appUrl = (
+    optional(environment, "OPENBOT_APP_URL") ??
+    commaSeparated(environment, "TRUSTED_ORIGINS")[0] ??
+    optional(environment, "OPENBOT_PUBLIC_URL") ??
+    auth?.baseUrl
+  )?.replace(/\/+$/, "");
 
-  return {
+  const edition = parseEdition(optional(environment, "OPENBOT_EDITION"));
+
+  // Built first and checked after, so every refusal the team edition gives keeps its order.
+  const loaded = {
     port: serverPort(environment),
     transcription: transcriptionConfig(environment),
     voice: voiceConfig(environment),
@@ -1459,17 +1692,16 @@ export function loadConfig(
       environment,
       "ROUTINE_FRESH_CONTEXT_BOTS",
     ),
+    ...thisMachineHost(environment),
     deploymentId: optional(environment, "DEPLOYMENT_ID"),
+    ...(optional(environment, "OPENBOT_BUILD_VERSION")
+      ? { version: optional(environment, "OPENBOT_BUILD_VERSION") as string }
+      : {}),
     composioApiKey: optional(environment, "COMPOSIO_API_KEY"),
     arcadeApiKey: optional(environment, "ARCADE_API_KEY"),
     brokerProvider: brokerProvider(environment),
     publicUrl,
-    appUrl: (
-      optional(environment, "OPENBOT_APP_URL") ??
-      commaSeparated(environment, "TRUSTED_ORIGINS")[0] ??
-      optional(environment, "OPENBOT_PUBLIC_URL") ??
-      auth?.baseUrl
-    )?.replace(/\/+$/, ""),
+    appUrl,
     tenantPackageDirectory:
       optional(environment, "TENANT_PACKAGE_DIR") ?? "../examples/fintech",
     runtime: runtimeCapabilities(environment),
@@ -1479,7 +1711,10 @@ export function loadConfig(
     ...learningSetupCredential(environment),
     memoryDefaults: {
       sources: switchedOn(environment, "OPENBOT_MEMORY_SOURCE_DEFAULTS"),
-      research: switchedOn(environment, "OPENBOT_PROACTIVE_DEFAULTS"),
+      // Off unless asked for: a Bot offers a check-in in the conversation instead (`offer_check_in`).
+      research: ["true", "1"].includes(
+        optional(environment, "OPENBOT_PROACTIVE_DEFAULTS") ?? "",
+      ),
     },
     agentStallTimeoutMs: agentStallTimeoutMs(environment),
     auditRetentionDays: auditRetentionDays(environment),
@@ -1494,6 +1729,7 @@ export function loadConfig(
     singleUser:
       !organizationAuthUrl &&
       singleUserAllowed(environment, configuredAuthProviders(auth).length > 0),
+    edition,
     accessibility: accessibilityEnabled(environment),
     generativeUi: generativeUiEnabled(environment),
     selfHostBanner: selfHostBannerEnabled(environment),
@@ -1508,15 +1744,76 @@ export function loadConfig(
       : {}),
     ...(workerSharedSecret ? { workerSharedSecret } : {}),
   };
+  // Read once the rest has been, so a deployment missing something more basic is told that first.
+  const config: DeploymentConfig = {
+    ...loaded,
+    ...(loaded.singleUser
+      ? { singleUserAccess: singleUserAccess(environment) }
+      : {}),
+    browserOrigins: browserOrigins(environment, {
+      publicUrl,
+      appUrl,
+      auth,
+      singleUser: loaded.singleUser,
+    }),
+  };
+  if (edition === "personal") personalEditionRequirements(environment, config);
+  return config;
+}
+
+const PROVIDER_VARIABLE: Record<AuthProviderId, string> = {
+  google: "GOOGLE_OAUTH_CLIENT_ID",
+  microsoft: "MICROSOFT_OAUTH_CLIENT_ID",
+  okta: "OKTA_OAUTH_CLIENT_ID",
+};
+
+/**
+ * What the personal edition is: one person, nobody signing in, one computer.
+ *
+ * Checked in this order so the sentence names the variable somebody actually has to change. A team
+ * deployment's `.env` copied across carries a provider, and that would otherwise read as "single-user
+ * mode is off", which is true and not the fix.
+ */
+function personalEditionRequirements(
+  environment: Environment,
+  resolved: Pick<
+    DeploymentConfig,
+    "auth" | "organizationAuthUrl" | "singleUser" | "computer"
+  >,
+): void {
+  const providers = configuredAuthProviders(resolved.auth);
+  if (providers.length > 0) {
+    throw new Error(
+      `OPENBOT_EDITION=personal has nobody signing in, so remove ${providers.map((provider) => PROVIDER_VARIABLE[provider]).join(", ")} and the rest of that provider's settings.`,
+    );
+  }
+  if (resolved.organizationAuthUrl) {
+    throw new Error(
+      "OPENBOT_EDITION=personal has nobody signing in, so remove OPENBOT_ORGANIZATION_AUTH_URL.",
+    );
+  }
+  if (!resolved.singleUser) {
+    throw new Error("OPENBOT_EDITION=personal needs OPENBOT_SINGLE_USER=true.");
+  }
+  if (resolved.computer?.provider === "shared") return;
+  const named = optional(environment, "COMPUTER_SANDBOX_NAMESPACE")
+    ? "COMPUTER_SANDBOX_NAMESPACE"
+    : optional(environment, "COMPUTER_SUPERVISOR_URL")
+      ? "COMPUTER_SUPERVISOR_URL"
+      : undefined;
+  throw new Error(
+    named
+      ? `OPENBOT_EDITION=personal runs one computer, so remove ${named} and set AGENT_COMPUTER_URL instead.`
+      : "OPENBOT_EDITION=personal runs one computer. Set AGENT_COMPUTER_URL to its address.",
+  );
 }
 
 /**
  * Same rule as generated interfaces: on unless explicitly "false" or "0". A container named in the
- * environment is a choice, so there is nothing to assign.
+ * environment is a choice only if the Intelligence this server talks to has it, which the server asks
+ * at boot (learning/auto-assign.ts), not here.
  */
 function learningAutoAssignEnabled(environment: Environment): boolean {
-  if (optional(environment, "CPK_INTELLIGENCE_LEARNING_CONTAINER_ID"))
-    return false;
   const value = optional(environment, "OPENBOT_LEARNING_AUTO_ASSIGN");
   return value !== "false" && value !== "0";
 }

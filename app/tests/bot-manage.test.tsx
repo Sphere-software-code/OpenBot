@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { ManageSection } from "@/components/bot-profile/manage";
 import type { AgentProfile } from "@/lib/agents/queries";
+import type { ResetPlan } from "@/lib/bot-lifecycle/queries";
+import { deploymentKeys } from "@/lib/deployment/queries";
 import { settleReactWork } from "./settle-react-work";
 
 /**
@@ -63,10 +65,19 @@ function draw(
     onDuplicated?: (copyId: string) => void;
     onDeleted?: () => void;
   } = {},
+  edition?: "team" | "personal",
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  if (edition) {
+    client.setQueryData(deploymentKeys.capabilities(), {
+      generativeUi: true,
+      selfHostBanner: false,
+      localEvaluation: edition === "personal",
+      edition,
+    });
+  }
   return render(
     <QueryClientProvider client={client}>
       <ManageSection
@@ -148,4 +159,115 @@ test("rows that open a dialog show a chevron, and Duplicate, which acts at once,
   expect(chevron(/^Reset/)).not.toBeNull();
   expect(chevron(/^Delete/)).not.toBeNull();
   expect(chevron(/^Duplicate/)).toBeNull();
+});
+
+/** A reset plan with a conversation to delete, so the notice lists something. */
+function servingResetPlan() {
+  const plan: ResetPlan = {
+    conversations: 1,
+    sharedConversationsKept: 0,
+    memorySources: 0,
+    memories: 0,
+    routines: 0,
+    responsibilities: 0,
+    followUps: 0,
+    formedMemories: 0,
+    backgroundResearch: 0,
+    standingApprovals: 0,
+  };
+  global.fetch = (async () =>
+    Response.json({ plan })) as unknown as typeof fetch;
+}
+
+/*
+ * The personal edition has no memory (see `offersMemory`), so Reset promises none: neither the row
+ * nor the notice it opens says the Bot remembers anything for you.
+ */
+test("Reset promises no memory in the personal edition", async () => {
+  servingResetPlan();
+  const view = draw(BOT, {}, "personal");
+  const row = view.getByRole("button", { name: /^Reset/ });
+  expect(row.textContent).toContain(
+    "Delete your conversations with it and its scheduled work.",
+  );
+  expect(row.textContent).not.toMatch(/remember|memor/i);
+  fireEvent.click(row);
+  expect(await view.findByText("1 conversation")).toBeTruthy();
+  expect(document.body.textContent).not.toMatch(/remember|memor/i);
+});
+
+test("Reset still names what a Bot remembers for you in the team edition", async () => {
+  servingResetPlan();
+  const view = draw(BOT, {}, "team");
+  const row = view.getByRole("button", { name: /^Reset/ });
+  expect(row.textContent).toContain("what it remembers for you");
+  fireEvent.click(row);
+  expect(await view.findByText("1 conversation")).toBeTruthy();
+  expect(
+    view.getByText("Memories you told a Bot yourself are kept."),
+  ).toBeTruthy();
+});
+
+/*
+ * The personal edition has one person. Nobody else has a Bots list for "only your list" to set
+ * apart, and nobody else for "everyone" to mean. Its Delete says what's true for them: the Bot goes,
+ * and its conversations stay readable (channel-chat.tsx: "You can still read this conversation").
+ */
+test("the personal edition's rows say nothing about other people", async () => {
+  const view = draw(BOT, {}, "personal");
+  const text = () => document.body.textContent ?? "";
+  expect(view.getByText("Keep it at the top of your Bots list.")).toBeTruthy();
+  expect(view.getByText("Take it off your Bots list.")).toBeTruthy();
+  const remove = view.getByRole("button", { name: /^Delete/ });
+  expect(remove.textContent).toContain(
+    "Deletes it. You can still read your conversations with it. You can't undo this.",
+  );
+  expect(text()).not.toMatch(/only your list|for everyone/i);
+  fireEvent.click(remove);
+  expect(
+    await view.findByText(
+      "You can still read your conversations with it, but it can't reply. You can't undo this.",
+    ),
+  ).toBeTruthy();
+  expect(text()).not.toMatch(/for everyone|other people/i);
+});
+
+test("the personal edition's Reset notice doesn't mention other people's data", async () => {
+  servingResetPlan();
+  const view = draw(BOT, {}, "personal");
+  fireEvent.click(view.getByRole("button", { name: /^Reset/ }));
+  expect(
+    await view.findByText(
+      "This deletes what Expenses has with you. You can't undo this.",
+    ),
+  ).toBeTruthy();
+  expect(document.body.textContent).not.toMatch(/other people/i);
+});
+
+test("a hidden or pinned Bot in the personal edition says where it is, and no more", () => {
+  const view = draw({ ...BOT, hidden: true, pinned: true }, {}, "personal");
+  expect(view.getByText("At the top of your Bots list.")).toBeTruthy();
+  expect(view.getByText("Under Hidden on your Bots list.")).toBeTruthy();
+});
+
+test("a team deployment keeps saying whose list changes and who a delete reaches", async () => {
+  servingResetPlan();
+  const view = draw(BOT, {}, "team");
+  expect(
+    view.getByText(
+      "Keep it at the top of your Bots list. Only your list changes.",
+    ),
+  ).toBeTruthy();
+  expect(
+    view.getByText("Take it off your Bots list. Only your list changes."),
+  ).toBeTruthy();
+  expect(view.getByRole("button", { name: /^Delete/ }).textContent).toContain(
+    "Deletes it for everyone. You can't undo this.",
+  );
+  fireEvent.click(view.getByRole("button", { name: /^Reset/ }));
+  expect(
+    await view.findByText(
+      "This deletes what Expenses has with you. Other people's conversations and data stay. You can't undo this.",
+    ),
+  ).toBeTruthy();
 });

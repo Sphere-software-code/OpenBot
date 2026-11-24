@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { reservePort } from "../../tests/support/reserved-port";
 import type { Page } from "playwright";
 import type {
   BrowserState,
@@ -31,6 +32,7 @@ import {
 import type { Profiles } from "../src/profiles";
 import { startScreencast } from "../src/screencast";
 import { setWebBotAuth } from "../src/web-bot-auth";
+import { browsersOnProfile } from "./fixtures/browser-process";
 
 /**
  * A person's browser, launched for real and driven through the real browser routes.
@@ -207,38 +209,19 @@ function disabledFeatures(switches: string[]): string[] {
 }
 
 /**
- * The browser's own process, found by the profile it runs on: the one with no `--type`, which its renderers, GPU and
- * utility processes all have. That process answers DevTools, so stopping it is a browser that does not answer.
+ * The browser's own process, found by the profile it runs on (see `browsersOnProfile`). That process answers
+ * DevTools, so stopping it is a browser that does not answer.
  */
 async function browserProcess(profile: string): Promise<number> {
-  const listing = Bun.spawnSync(["ps", "-axo", "pid=,command="]);
-  const found = listing.stdout
-    .toString()
-    .split("\n")
-    .filter(
-      (line) =>
-        line.includes(`--user-data-dir=${profile}`) &&
-        !line.includes("--type="),
-    )
-    .map((line) => Number.parseInt(line.trim(), 10));
-  if (found.length !== 1)
+  const listing = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]);
+  const browsers = browsersOnProfile(listing.stdout.toString(), profile);
+  // Each one whole when there are two: which process the second one is (its parent, its program,
+  // its switches) is what says why.
+  if (browsers.length !== 1)
     throw new Error(
-      `Expected one browser on ${profile}, found ${found.length}.`,
+      `Expected one browser on ${profile}, found ${browsers.length}:\n${browsers.map(({ line }) => line.slice(0, 600)).join("\n")}`,
     );
-  return found[0] as number;
-}
-
-/** A port nothing listens on, so a page there is refused. */
-async function closedPort(): Promise<number> {
-  const probe = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: () => new Response(),
-  });
-  const { port } = probe;
-  await probe.stop(true);
-  if (port === undefined) throw new Error("The port probe did not listen.");
-  return port;
+  return (browsers[0] as { pid: number }).pid;
 }
 
 /** Every browser the tests start, closed at the end whatever happened. */
@@ -608,7 +591,7 @@ for (const variant of VARIANTS) {
         (await api("/browser/tabs", { action: "new" })).json as BrowserState,
       );
       if (!before || !blank) throw new Error("Both tabs should be listed.");
-      const port = await closedPort();
+      const port = await reservePort();
       expect(
         await api("/browser/navigate", { url: `http://127.0.0.1:${port}/` }),
       ).toEqual({
@@ -628,7 +611,7 @@ for (const variant of VARIANTS) {
         (await api("/browser/tabs", { action: "new" })).json as BrowserState,
       );
       if (!before || !blank) throw new Error("Both tabs should be listed.");
-      const port = await closedPort();
+      const port = await reservePort();
       const failed = `http://127.0.0.1:${port}/`;
       expect((await api("/browser/navigate", { url: failed })).status).toBe(
         502,
@@ -1168,6 +1151,37 @@ for (const variant of VARIANTS) {
      * row each time. So an open that brings no connection leaves the Recorder holding its own, and says which it holds
      * (`recorder.connectionId`), for OpenBot to decide whether it stands.
      */
+    /*
+     * One browser on the profile from the moment it is opened again, read every few milliseconds. Google Chrome on
+     * Linux runs its own binary with the browser's command line and `--product-version` a moment after it starts, to see
+     * whether a newer version was installed under it: a child that exits without opening the profile, and alive for a
+     * few milliseconds. Counted as a browser, it failed the test above on CI as "found 2". A second browser started on a
+     * profile the first still held would be found here too.
+     */
+    test("there is one browser on its profile through a close and an open, though Chrome checks its own version", async () => {
+      const profile = join(root, PERSON);
+      expect((await api("/browser/close", {})).status).toBe(200);
+      const seen: string[] = [];
+      let settled = 0;
+      const opening = api("/browser/open", { connection: CONNECTION }).finally(
+        () => {
+          settled = Date.now();
+        },
+      );
+      while (settled === 0 || Date.now() - settled < 10_000) {
+        const ps = Bun.spawn(["ps", "-axo", "pid=,ppid=,command="]);
+        const browsers = browsersOnProfile(
+          await new Response(ps.stdout).text(),
+          profile,
+        );
+        if (browsers.length > 1)
+          seen.push(browsers.map(({ line }) => line.slice(0, 600)).join("\n"));
+        await wait(2);
+      }
+      expect((await opening).status).toBe(200);
+      expect(seen).toEqual([]);
+    }, 60_000);
+
     test("an open that brings no connection leaves the Recorder the one it holds, open, and closed and opened again", async () => {
       const held = {
         connected: true,

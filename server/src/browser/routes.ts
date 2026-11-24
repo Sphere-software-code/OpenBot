@@ -56,6 +56,11 @@ export type BrowserComputers = {
   shows: BrowserWindow;
   /** The browser's computer, started when it must be. Throws when it cannot be reached. */
   locate(computerId: string): Promise<string>;
+  /**
+   * The token the browser's computer takes: its own where a provider made it for this browser alone, never the
+   * deployment's token there (computer/computer-token.ts).
+   */
+  tokenFor(computerId: string): string | undefined;
   /** Whether its computer is up, never starting it: the Browser page asks every few seconds, and asking must not start
    * a computer for everybody who opens OpenBot. */
   running(computerId: string): Promise<boolean>;
@@ -67,12 +72,10 @@ export type BrowserRouteDeps = {
   computers?: BrowserComputers;
   /**
    * What the person is told about where their browser runs (`BrowserApiState.note`), in one plain sentence: why there
-   * are no `computers` for it here (its Bots share one computer, browser/host.ts), or, on OpenBot Desktop, why it is not
-   * their own installed Chrome or Edge (`OPENBOT_BROWSER_ABSENT`). Absent when there is nothing to explain.
+   * are no `computers` for it here (its Bots share one computer, browser/host.ts). Absent when there is nothing to
+   * explain.
    */
   note?: string;
-  /** The computer token, the same one every computer requires. */
-  token?: string;
   /** The Recorder's connections and what goes with them (recorder/wiring.ts). */
   recorder: Pick<
     RecorderExtensionDeps,
@@ -424,10 +427,11 @@ const NOT_ANSWERED = {
   unreachable: SENTENCES.unreachable,
 };
 
-/** One computer route for a person's browser (or a Bot's, browser/bot-browser.ts), under the computer token with the
- * browser in `x-openbot-bot-id`: a GET, or a POST of `body` (a POST with no body when `method` says so). */
+/** One computer route for a person's browser (or a Bot's, browser/bot-browser.ts), under that computer's token
+ * (`token`, which the caller names because the computer it goes to decides it) with the browser in `x-openbot-bot-id`:
+ * a GET, or a POST of `body` (a POST with no body when `method` says so). */
 export function computerCaller(
-  deps: Pick<BrowserRouteDeps, "token" | "fetchImpl" | "callTimeoutMs">,
+  deps: Pick<BrowserRouteDeps, "fetchImpl" | "callTimeoutMs">,
   words: { slow: string; unreachable: string } = NOT_ANSWERED,
 ) {
   const doFetch = deps.fetchImpl ?? fetch;
@@ -438,6 +442,8 @@ export function computerCaller(
     computerId: SeatAddress,
     path: string,
     options: {
+      /** The token of the computer at `base`. */
+      token?: string;
       body?: unknown;
       method?: "POST";
       timeoutMs?: number;
@@ -467,7 +473,9 @@ export function computerCaller(
         method: options.method ?? (body === undefined ? "GET" : "POST"),
         headers: {
           ...seatHeaders(computerId),
-          ...(deps.token ? { "x-openbot-computer-token": deps.token } : {}),
+          ...(options.token
+            ? { "x-openbot-computer-token": options.token }
+            : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -513,6 +521,25 @@ export function computerCaller(
   };
 }
 
+/** `computerCaller` for a person's own browser, under the token its computer takes. */
+function browserCaller(
+  deps: Pick<BrowserRouteDeps, "computers" | "fetchImpl" | "callTimeoutMs">,
+) {
+  const ask = computerCaller(deps);
+  return (
+    base: string,
+    computerId: string,
+    path: string,
+    options: Omit<NonNullable<Parameters<typeof ask>[3]>, "token"> = {},
+  ) => {
+    const token = deps.computers?.tokenFor(computerId);
+    return ask(base, computerId, path, {
+      ...options,
+      ...(token ? { token } : {}),
+    });
+  };
+}
+
 /** Whether these, a person's live connections, hold one for their OpenBot browser: the one stored under the browser's
  * install id, which an open keeps while the Recorder holds it and replaces when it does not. */
 function holdsBrowserConnectionIn(
@@ -532,22 +559,42 @@ async function holdsBrowserConnection(
 }
 
 /**
- * Whether the Recorder in this browser holds the connection `connectionId` for `userId`, with the narration its window
- * wants: then it is kept rather than made again (`connectNow`). A Recorder from before it named its connection never
- * matches, and is connected again as before.
+ * Whether the Recorder in this browser holds the connection `connectionId` for `userId`, at `openbotUrl`, with the
+ * narration its window wants: then it is kept rather than made again (`connectNow`). A Recorder from before it named
+ * its connection, or the address it reaches OpenBot at, never matches, and is connected again as before.
  */
 function keeps(
   state: BrowserState,
   connectionId: string,
   userId: string,
+  openbotUrl: string,
 ): boolean {
   const recorder = state.recorder;
   return (
     recorder?.connected === true &&
     recorder.userId === userId &&
     recorder.connectionId === connectionId &&
+    reachesAt(recorder, openbotUrl) &&
     recorder.narration === narrationOf(state)
   );
+}
+
+/**
+ * Whether the Recorder reaches OpenBot at `openbotUrl`, the address OpenBot hands a browser now.
+ *
+ * WHY. The Recorder keeps the address it was handed with its connection, in its profile, and every capture pass goes
+ * there. OpenBot's own address can move under it: OpenBot Desktop gives the app another port when the one it had is
+ * held at Start (desktop/src-tauri/src/env.rs, `Ports::available`), and the computer then relays only the new one. A
+ * Recorder kept on the old port reached nothing, and every recording made in that browser stayed in it. Compared as
+ * origins, the form the Recorder stores (`normaliseOpenBotOrigin`).
+ */
+function reachesAt(recorder: LauncherState, openbotUrl: string): boolean {
+  if (recorder.openbotUrl === undefined) return false;
+  try {
+    return new URL(recorder.openbotUrl).origin === new URL(openbotUrl).origin;
+  } catch {
+    return false;
+  }
 }
 
 /** A Recorder's own report as the red dot reads it: what it is recording, and nothing of how it hears the person. */
@@ -633,10 +680,10 @@ function lastHeardFrom<T extends ReportingConnection>(
 export function browserConnectionRevoked(
   deps: Pick<
     BrowserRouteDeps,
-    "computers" | "token" | "recorder" | "fetchImpl" | "callTimeoutMs"
+    "computers" | "recorder" | "fetchImpl" | "callTimeoutMs"
   >,
 ): (userId: string, connection: RecorderConnection) => Promise<void> {
-  const ask = computerCaller(deps);
+  const ask = browserCaller(deps);
   return async (userId, connection) => {
     const computers = deps.computers;
     const computerId = personBrowserId(userId);
@@ -755,7 +802,7 @@ export function createBrowserRoutes(deps: BrowserRouteDeps) {
   /** The route's budget, from the request's arrival: every wait in it shares it (`answerBy`). */
   const openBudget = withBudget(deps.budgetMs?.open ?? OPEN_BUDGET_MS);
   const callBudget = withBudget(deps.budgetMs?.call ?? CALL_BUDGET_MS);
-  const ask = computerCaller(deps);
+  const ask = browserCaller(deps);
   /** What the person is told when OpenBot's own setup stops their browser opening: ask an admin, unless they are it. */
   const notSetUp = deps.singleUser
     ? SENTENCES.notSetUpSingleUser
@@ -1211,7 +1258,8 @@ export function createBrowserRoutes(deps: BrowserRouteDeps) {
     if (held) {
       const kept = await openOn(base, computerId, {});
       if (!kept.ok) return kept;
-      if (kept.state && keeps(kept.state, held.id, actor.id)) return kept;
+      if (kept.state && keeps(kept.state, held.id, actor.id, openbotUrl))
+        return kept;
     }
 
     const minted = await deps.recorder.connections.mintCode(
@@ -1302,11 +1350,15 @@ export function createBrowserRoutes(deps: BrowserRouteDeps) {
       deps.recorder.connections,
       asker.actor.id,
     );
-    // A Recorder that has not answered yet is taken at OpenBot's word.
+    // A Recorder that has not answered yet is taken at OpenBot's word. One that reaches OpenBot at an address it has
+    // left (`reachesAt`) is connected again too, so the recording goes where OpenBot is now.
     const recorder = state.recorder;
+    const openbotUrl = deps.openbotUrl(asker.origin);
     const holdsIt =
       recorder === undefined ||
-      (recorder.connected && recorder.userId === asker.actor.id);
+      (recorder.connected &&
+        recorder.userId === asker.actor.id &&
+        (openbotUrl === null || reachesAt(recorder, openbotUrl)));
     if (standing && holdsIt) return null;
     const again = await connect(asker);
     return again.ok ? null : again.response;

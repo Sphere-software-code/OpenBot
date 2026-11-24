@@ -18,6 +18,7 @@ import {
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { BotRoster } from "@/components/bots/bot-roster";
 import { type AgentProfile, agentKeys } from "@/lib/agents/queries";
+import { deploymentKeys } from "@/lib/deployment/queries";
 import { settleReactWork } from "./settle-react-work";
 
 /**
@@ -61,7 +62,10 @@ function bot(overrides: Partial<AgentProfile> & { id: string }): AgentProfile {
   };
 }
 
-/** Serves the visible roster, the hidden roster, and an empty attention list. */
+/**
+ * Serves the visible roster, the hidden roster, and an empty attention list, with nothing found by
+ * check-ins and no tasks.
+ */
 function serving(
   visible: AgentProfile[],
   hidden: AgentProfile[],
@@ -70,7 +74,12 @@ function serving(
   global.fetch = (async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/api/bots/attention"))
-      return Response.json({ bots: attention });
+      return Response.json({ bots: attention, lastPingId: null });
+    if (url === "/api/proactive/suggestions")
+      return Response.json({ suggestions: [] });
+    if (url === "/api/tasks") return Response.json({ tasks: [] });
+    if (url.startsWith("/api/channels"))
+      return Response.json({ channels: [], nextCursor: null });
     return Response.json({
       agents: url.includes("hidden=true") ? hidden : visible,
     });
@@ -191,10 +200,12 @@ test("a failed refetch keeps the roster it already had, not the error", async ()
     ),
   );
   expect(view.getByText("Mine")).toBeTruthy();
-  expect(view.queryByRole("alert")).toBeNull();
+  expect(
+    view.queryByText("Couldn't load your Bots. Reload the page."),
+  ).toBeNull();
 });
 
-test("a Bot with something waiting comes first, under Needs you, with its count", async () => {
+test("a Bot with something waiting stays in its own section, with its count", async () => {
   serving(
     [
       bot({ id: "mine", name: "Mine" }),
@@ -211,16 +222,57 @@ test("a Bot with something waiting comes first, under Needs you, with its count"
         unread: 0,
         paused: false,
         notify: "all",
+        items: 0,
+        tasks: { needsInput: 0, ready: 0, failed: 0 },
       },
     ],
   );
   const view = draw();
-  expect(await view.findByText("Needs you")).toBeTruthy();
+  expect(await view.findByText("2")).toBeTruthy();
   const headings = [...view.container.querySelectorAll("h2")].map(
     (heading) => heading.textContent,
   );
-  expect(headings).toEqual(["Needs you", "Yours", "Shared with you"]);
-  // Once, under Needs you, not again under Shared with you.
+  // What it waits on is on the Needs you board, by name; the Bot itself stays where it is.
+  expect(headings).toEqual(["Yours", "Shared with you"]);
   expect(view.getAllByText("Waiting")).toHaveLength(1);
-  expect(view.getByText("2")).toBeTruthy();
+});
+
+test("a Bot's check-in items are counted in the words the badge and Needs you use", async () => {
+  serving(
+    [bot({ id: "scout", name: "Scout", mine: false })],
+    [],
+    [
+      {
+        agentId: "scout",
+        name: "Scout",
+        questions: 0,
+        approvals: 0,
+        handoffs: 0,
+        unread: 0,
+        paused: false,
+        notify: "all",
+        items: 2,
+        tasks: { needsInput: 0, ready: 0, failed: 0 },
+      },
+    ],
+  );
+  const view = draw();
+  expect(await view.findByText("2 things need you")).toBeTruthy();
+  expect(view.container.textContent).not.toContain("suggestion");
+});
+
+test("personal edition labels starter Bots as included with OpenBot", async () => {
+  queryClient.setQueryData(deploymentKeys.capabilities(), {
+    edition: "personal",
+  });
+  serving(
+    [bot({ id: "starter", name: "Starter", mine: false, systemOwned: true })],
+    [],
+  );
+  const view = draw();
+  await view.findByText("Starter");
+  expect(
+    view.getByRole("heading", { name: "Included with OpenBot" }),
+  ).toBeTruthy();
+  expect(view.queryByText("Shared with you")).toBeNull();
 });

@@ -54,6 +54,9 @@ pub enum Blocker {
     VirtualMachinePlatformDisabled,
     /// Virtualization is off in firmware. Only the person, in their BIOS, can fix this.
     VirtualizationDisabled,
+    /// This Windows is itself a virtual machine whose host does not pass virtualization through,
+    /// so WSL 2 cannot start one. Only the host can fix this.
+    NestedVirtualizationUnavailable,
     /// The account cannot elevate.
     NotAdministrator,
 }
@@ -97,6 +100,12 @@ impl Blocker {
                  there, which OpenBot cannot do: restart, open the firmware settings, and enable \
                  Intel VT-x or AMD-V."
             }
+            Blocker::NestedVirtualizationUnavailable => {
+                "This Windows runs in a virtual machine whose host does not pass virtualization \
+                 through to it, so Windows Subsystem for Linux cannot start. Turn on nested \
+                 virtualization for this virtual machine in its host, then start it and OpenBot \
+                 again."
+            }
             Blocker::NotAdministrator => {
                 "Setting up Windows Subsystem for Linux needs administrator rights. Ask an \
                  administrator to open Windows Terminal or PowerShell as an administrator and run \
@@ -108,13 +117,9 @@ impl Blocker {
         }
     }
 
-    /// Whether the shell can clear this itself. Two of the four are ours; two are not.
-    /// Whether OpenBot could fix this itself, one day.
-    ///
-    /// Nothing acts on this yet. `wsl --install` needs elevation and a restart, and the resumable
-    /// state machine that would carry somebody across that reboot is designed and not built, so
-    /// every blocker screen currently tells a person what to run. Kept because the two halves are
-    /// genuinely different: WSL is installable and a firmware setting is not.
+    /// Whether this account can clear it without anybody else. A standard account can still use
+    /// `fix`, with an administrator typing their password into the prompt; a firmware setting
+    /// cannot be fixed from Windows at all.
     pub fn ours_to_fix(self) -> bool {
         matches!(
             self,
@@ -330,11 +335,13 @@ fn decode_probe_text(bytes: &[u8]) -> Result<String, String> {
     // non-ASCII diagnostics; PowerShell's ASCII boolean results and modern UTF-8 also work here.
     if bytes.starts_with(&[0xff, 0xfe]) || bytes.contains(&0) {
         let bytes = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err("Truncated UTF-16 probe output".into());
         }
         let units = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units).map_err(|error| error.to_string())
@@ -437,11 +444,20 @@ fn blocker_with(
         return Ok(Some(Blocker::VirtualizationDisabled));
     }
 
+    /*
+     * Whether this account can approve an administrator prompt, not whether this process already
+     * runs elevated. Under UAC an administrator's apps run with a filtered token in which
+     * Administrators (S-1-5-32-544) is a deny-only group, so `IsInRole(Administrator)` answered
+     * false for every administrator who opened OpenBot normally, and they were all told to go and
+     * find one. The group is in the token's claims either way: as a group SID once elevated, as a
+     * deny-only SID before. A standard account has neither. Matched by SID, so it is the same in
+     * every language.
+     */
     let administrator = "Windows administrator rights (powershell)";
     let elevated = probe_bool(administrator, &probe_text(administrator, run("powershell", &[
         "-NoProfile", "-NonInteractive", "-Command",
         "$ErrorActionPreference = 'Stop'; \
-         ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+         [bool]([Security.Principal.WindowsIdentity]::GetCurrent().Claims | Where-Object { $_.Value -eq 'S-1-5-32-544' })",
     ]))?)?;
 
     let wsl_feature = "the WSL feature state (powershell)";
@@ -553,10 +569,721 @@ pub fn blocker() -> Result<Option<Blocker>, Problem> {
     Ok(None)
 }
 
+/**
+Whether WSL 2 can start a virtual machine here, asked of WSL itself.
+
+Every other check reads the same on a PC running Hyper-V and in a virtual machine whose host passes
+no virtualization through: a hypervisor is present and the firmware flag reads off. Measured in
+Windows 11 on ARM under VMware Fusion: every check passed, Docker Desktop was installed, and it
+then stopped on "Nested virtualization is not available" while OpenBot waited for it. So this
+starts WSL's own system distribution, which exists with no Linux distribution installed, and asks
+whether Hyper-V refused to create its VM.
+
+Only that refusal is a blocker. Any other failure (an older WSL without `--system`, say) is not
+evidence about virtualization, and is left for Docker to report.
+*/
+#[cfg(target_os = "windows")]
+pub fn nested_virtualization_blocker() -> Option<Blocker> {
+    let output = crate::quiet::command("wsl.exe")
+        .args(["--system", "--exec", "true"])
+        .output()
+        .ok()?;
+    let said = format!(
+        "{}\n{}",
+        decode_probe_text(&output.stdout).unwrap_or_default(),
+        decode_probe_text(&output.stderr).unwrap_or_default()
+    );
+    (!output.status.success() && hyper_v_refused(&said))
+        .then_some(Blocker::NestedVirtualizationUnavailable)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn nested_virtualization_blocker() -> Option<Blocker> {
+    None
+}
+
+/// WSL's words for "Hyper-V cannot create a virtual machine here": the HCS error, by name or code.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn hyper_v_refused(said: &str) -> bool {
+    said.contains("HCS_E_HYPERV_NOT_INSTALLED") || said.contains("0x80370102")
+}
+
+/// The machine's own architecture, in `std::env::consts::ARCH`'s words, for choosing what to
+/// download and run.
+///
+/// Not this program's: Windows on ARM runs an x64 OpenBot under emulation, where `ARCH` says
+/// `x86_64` on an ARM64 machine. Docker's x64 installer refuses that machine, and an x64 Bun or
+/// Compose would run emulated when a native one exists. Windows says what the machine is through
+/// `IsWow64Process2` (Windows 10 1709 and later); anything it cannot answer falls back to `ARCH`.
+pub fn machine_arch() -> &'static str {
+    #[cfg(target_os = "windows")]
+    if let Some(arch) = windows_machine_arch() {
+        return arch;
+    }
+    std::env::consts::ARCH
+}
+
+#[cfg(target_os = "windows")]
+fn windows_machine_arch() -> Option<&'static str> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn IsWow64Process2(
+            process: *mut std::ffi::c_void,
+            process_machine: *mut u16,
+            native_machine: *mut u16,
+        ) -> i32;
+    }
+    let (mut process, mut native) = (0u16, 0u16);
+    // SAFETY: the pseudo-handle for this process is always valid, and both out-pointers are to
+    // locals that outlive the call.
+    if unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) } == 0 {
+        return None;
+    }
+    machine_name(native)
+}
+
+/// `IMAGE_FILE_MACHINE_*` to `ARCH`'s names, for the two machines Windows 11 runs on.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn machine_name(machine: u16) -> Option<&'static str> {
+    match machine {
+        0xAA64 => Some("aarch64"),
+        0x8664 => Some("x86_64"),
+        _ => None,
+    }
+}
+
+/// What OpenBot runs to clear a blocker: a PowerShell script, behind one administrator prompt when
+/// it changes the machine, and whether Windows has to restart before the change is real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fix {
+    pub script: &'static str,
+    pub elevated: bool,
+    pub restart: bool,
+}
+
+/// Turn on WSL 2 and nothing else: no Linux distribution, which `wsl --install` would add and then
+/// open after the restart asking for a UNIX username nobody needs.
+///
+/// Both Windows features through DISM every time, because that works on every build and is a no-op
+/// for one already on; `wsl --install` alone can find WSL present and leave Virtual Machine
+/// Platform off. DISM exits 3010 for "done, restart needed", which is success here. Then the
+/// current WSL and its kernel, best effort: the inbox `wsl.exe` of older builds refuses
+/// `--no-distribution` (measured on Server 2022), and a kernel still missing after the restart is
+/// its own blocker, with its own fix.
+const ENABLE_WSL: &str = r#"$ErrorActionPreference = 'Continue'
+foreach ($feature in 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform') {
+  & dism.exe /online /enable-feature /featurename:$feature /all /norestart /quiet | Out-Null
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+    throw "dism.exe could not turn on $feature (exit $LASTEXITCODE)"
+  }
+}
+& wsl.exe --install --no-distribution | Out-Null
+exit 0"#;
+
+/// The WSL kernel, from GitHub where this WSL knows how, because the Store is often what a managed
+/// machine has switched off; the Store otherwise.
+const UPDATE_WSL: &str = r#"$ErrorActionPreference = 'Continue'
+& wsl.exe --update --web-download | Out-Null
+if ($LASTEXITCODE -eq 0) { exit 0 }
+& wsl.exe --update | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "wsl.exe --update failed (exit $LASTEXITCODE)" }
+exit 0"#;
+
+/// A per-account setting, so it runs as the person rather than as whoever approved a prompt.
+const WSL_VERSION_TWO: &str = r#"$ErrorActionPreference = 'Continue'
+& wsl.exe --set-default-version 2 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "wsl.exe --set-default-version 2 failed (exit $LASTEXITCODE)" }
+exit 0"#;
+
+impl Blocker {
+    /// How OpenBot clears this itself, or None when it cannot: firmware is not Windows's to change.
+    ///
+    /// A standard account gets the same fix as an administrator. Windows asks for an
+    /// administrator's password instead of a yes, and the features it turns on are the machine's,
+    /// so they are on for this account too.
+    pub fn fix(self) -> Option<Fix> {
+        match self {
+            Blocker::WslAbsent
+            | Blocker::VirtualMachinePlatformDisabled
+            | Blocker::NotAdministrator => Some(Fix {
+                script: ENABLE_WSL,
+                elevated: true,
+                restart: true,
+            }),
+            Blocker::WslNoKernel => Some(Fix {
+                script: UPDATE_WSL,
+                elevated: true,
+                restart: true,
+            }),
+            Blocker::WslOne => Some(Fix {
+                script: WSL_VERSION_TWO,
+                elevated: false,
+                restart: false,
+            }),
+            Blocker::VirtualizationDisabled | Blocker::NestedVirtualizationUnavailable => None,
+        }
+    }
+}
+
+/// The exit code that means the person said no to the administrator prompt: `ERROR_CANCELLED`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const DECLINED: i32 = 1223;
+
+/// The script as PowerShell's `-EncodedCommand` takes it: UTF-16LE, base64. Nothing in it is
+/// quoted twice, which is what passing a script through `Start-Process` otherwise comes to.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn encoded(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Run `script` elevated: Windows shows its prompt, the script runs hidden, and its error, if it
+/// has one, comes back through `log` because an elevated process cannot write to our pipes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn elevated_launcher(script: &str, log: &Path) -> String {
+    let log = log.display().to_string().replace('\'', "''");
+    let inner = format!(
+        "try {{\n{script}\n}} catch {{ $_ | Out-String | Set-Content -LiteralPath '{log}' -Encoding UTF8; exit 1 }}"
+    );
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+try {{
+  $process = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{}'
+  exit $process.ExitCode
+}} catch {{
+  $error_ = $_.Exception
+  while ($error_) {{ if ($error_.NativeErrorCode -eq {DECLINED}) {{ exit {DECLINED} }}; $error_ = $error_.InnerException }}
+  throw
+}}"#,
+        encoded(&inner)
+    )
+}
+
+/// What came of running a fix, before any restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fixed {
+    /// Done; Windows has to restart before it counts.
+    RestartNeeded,
+    /// Done, and nothing else needed.
+    Done,
+    /// The person said no to Windows' administrator prompt. Nothing changed; the window asks again.
+    Declined,
+}
+
+/// Turn the outcome of running a fix into what the screen says.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn fixed(
+    fix: Fix,
+    status: Option<i32>,
+    log: Option<String>,
+    stderr: &str,
+) -> Result<Fixed, Problem> {
+    match status {
+        Some(0) => Ok(if fix.restart {
+            Fixed::RestartNeeded
+        } else {
+            Fixed::Done
+        }),
+        // A decision, not a failure: the window says OpenBot needs it, and asks again.
+        Some(DECLINED) => Ok(Fixed::Declined),
+        status => Err(Problem::with(
+            "OpenBot could not set up Windows Subsystem for Linux. Try again, or run the commands \
+             yourself.",
+            log.filter(|log| !log.trim().is_empty())
+                .unwrap_or_else(|| format!("exit {status:?}: {}", stderr.trim())),
+        )),
+    }
+}
+
+/// Run a blocker's fix and say what came of it. `scratch` holds the elevated script's error log.
+#[cfg(target_os = "windows")]
+pub fn run_fix(fix: Fix, scratch: &Path) -> Result<Fixed, Problem> {
+    std::fs::create_dir_all(scratch).map_err(|error| {
+        Problem::with(
+            "OpenBot could not set up Windows Subsystem for Linux.",
+            error.to_string(),
+        )
+    })?;
+    let log = scratch.join("windows-fix-error.txt");
+    let _ = std::fs::remove_file(&log);
+    let script = if fix.elevated {
+        elevated_launcher(fix.script, &log)
+    } else {
+        fix.script.to_string()
+    };
+    let output = crate::quiet::command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+        ])
+        .arg(encoded(&script))
+        .output()
+        .map_err(|error| {
+            Problem::with(
+                "OpenBot could not set up Windows Subsystem for Linux.",
+                error.to_string(),
+            )
+        })?;
+    fixed(
+        fix,
+        output.status.code(),
+        std::fs::read_to_string(&log).ok(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_fix(_fix: Fix, _scratch: &Path) -> Result<Fixed, Problem> {
+    Err(Problem::plain(
+        "Only Windows needs Windows Subsystem for Linux.",
+    ))
+}
+
+/// Where a fix that needs a restart is remembered, with the boot it was made in.
+pub fn restart_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("windows-restart.json")
+}
+
+#[derive(Serialize, Deserialize)]
+struct AwaitingRestart {
+    boot: String,
+}
+
+/// Remember that Windows has to restart, against this boot.
+pub fn record_restart_needed(data_dir: &Path, boot: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(
+        restart_path(data_dir),
+        serde_json::to_string(&AwaitingRestart {
+            boot: boot.to_string(),
+        })
+        .unwrap_or_default(),
+    )
+}
+
+/// Whether a fix is still waiting for its restart: recorded in the boot that is running now.
+///
+/// Checked before the blocker is, because a feature switched on reads as on straight away while
+/// WSL cannot use it until Windows restarts; going on then would fail later, in Docker. A record
+/// from an earlier boot means the restart happened, so it is removed.
+pub fn restart_pending(data_dir: &Path, boot: &str) -> bool {
+    let path = restart_path(data_dir);
+    let Some(recorded) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<AwaitingRestart>(&text).ok())
+    else {
+        let _ = std::fs::remove_file(&path);
+        return false;
+    };
+    if recorded.boot == boot {
+        return true;
+    }
+    let _ = std::fs::remove_file(&path);
+    false
+}
+
+/// When Windows last started, to tell one boot from the next.
+#[cfg(target_os = "windows")]
+pub fn boot() -> Result<String, Problem> {
+    probe_text(
+        "when Windows last started (powershell)",
+        crate::quiet::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('yyyyMMddHHmmss')",
+            ])
+            .output(),
+    )
+    .map(|text| text.trim().to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn boot() -> Result<String, Problem> {
+    Ok(String::new())
+}
+
+/// Restart Windows now, with OpenBot set to open once when the person signs back in.
+#[cfg(target_os = "windows")]
+pub fn restart() -> Result<(), Problem> {
+    let failed = |detail: String| {
+        Problem::with(
+            "OpenBot could not restart Windows. Restart it from the Start menu.",
+            detail,
+        )
+    };
+    let program = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
+    // Best effort: without it the person opens OpenBot themselves, as the screen already says.
+    let _ = crate::quiet::command("reg.exe")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            "/v",
+            "OpenBot",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &format!("\"{}\"", program.display()),
+            "/f",
+        ])
+        .output();
+    let output = crate::quiet::command("shutdown.exe")
+        .args(["/r", "/t", "0"])
+        .output()
+        .map_err(|error| failed(error.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(failed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn restart() -> Result<(), Problem> {
+    Err(Problem::plain("Only Windows restarts from here."))
+}
+
+/// The Windows drive that holds a Podman machine's disk, and how much is free on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineDrive {
+    /// `C:`, or None when the disk's folder is not on a lettered drive.
+    pub drive: Option<String>,
+    pub free: u64,
+}
+
+/**
+Where a Podman machine on WSL keeps its disk, and the space free on that drive.
+
+The machine's disk is a sparse virtual disk of about a terabyte, so the space a container sees free
+inside it says nothing about the space left on Windows: a machine can show 941 GiB free on a drive
+with 30. Podman imports each machine as the WSL distribution `podman-<machine>`
+(`env.WithPodmanPrefix`), and WSL records the folder it holds the disk in as that distribution's
+`BasePath`. None off Windows, and when WSL has no such distribution.
+*/
+pub fn podman_machine_drive(machine: &str) -> Option<MachineDrive> {
+    #[cfg(target_os = "windows")]
+    {
+        machine_drive_in(LXSS, &podman_distribution(machine))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = machine;
+        None
+    }
+}
+
+/// The WSL distribution Podman makes for `machine`, as Podman names it (`env.WithPodmanPrefix`).
+pub fn podman_distribution(machine: &str) -> String {
+    if machine.starts_with("podman") {
+        machine.to_owned()
+    } else {
+        format!("podman-{machine}")
+    }
+}
+
+/// The drive a Windows path is on, `C:`, with or without the `\\?\` prefix WSL records it with.
+pub fn drive_of(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    match path.as_bytes() {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
+            Some(format!("{}:", letter.to_ascii_uppercase() as char))
+        }
+        _ => None,
+    }
+}
+
+/// Where WSL records each distribution it has, for the person signed in.
+#[cfg(target_os = "windows")]
+const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+
+/// WSL's note, under `LXSS`, that this person has had its welcome window: a DWORD, 1 once shown.
+#[cfg(target_os = "windows")]
+const WSL_WELCOME_SHOWN: &str = "OOBEComplete";
+
+/**
+Keep WSL's own "Welcome to Windows Subsystem for Linux" window from opening when Podman makes
+OpenBot's machine.
+
+WSL's service opens that window (`wslsettings.exe`, `wsl-settings://oobe`) when a person registers
+a distribution, unless `OOBEComplete` under their own `HKCU\...\Lxss` key is set or they already
+had another distribution (`LxssUserSessionImpl::_LaunchOOBEIfNeeded` in microsoft/WSL).
+`podman machine init` registers one through `wsl --import`, so on a computer that has never had a
+distribution the window opens in the middle of OpenBot's setup. Nothing on the command line stops
+it: `--import` turns off only the distribution's own first run, `wsl --install --no-launch` is about
+starting a distribution after installing one, and `.wslconfig` has no such key. Setting the value
+is what the WSL team gives as the way to stop the window (microsoft/WSL#13223), and Microsoft's
+WindowsDeveloperConfig sets it for the same reason.
+
+The value is the person's own, so it is written here, in their session, just before the machine is
+made. Not in the elevated `ENABLE_WSL`, which runs as whoever approved the prompt. Best effort: a
+value that cannot be written costs only the window.
+*/
+pub fn skip_wsl_welcome() {
+    #[cfg(target_os = "windows")]
+    if let Err(error) = skip_wsl_welcome_in(LXSS) {
+        log::warn!("[wsl] could not turn off WSL's welcome window: {error}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn skip_wsl_welcome_in(registry: &str) -> windows_registry::Result<()> {
+    windows_registry::CURRENT_USER
+        .create(registry)?
+        .set_u32(WSL_WELCOME_SHOWN, 1)
+}
+
+#[cfg(target_os = "windows")]
+fn machine_drive_in(registry: &str, distribution: &str) -> Option<MachineDrive> {
+    let folder = distribution_folder(registry, distribution)?;
+    let free = free_space(&folder)?;
+    Some(MachineDrive {
+        drive: drive_of(&folder),
+        free,
+    })
+}
+
+/// The `BasePath` WSL recorded for `distribution`, under `registry` in the person's own hive.
+#[cfg(target_os = "windows")]
+fn distribution_folder(registry: &str, distribution: &str) -> Option<String> {
+    let lxss = windows_registry::CURRENT_USER.open(registry).ok()?;
+    let ids: Vec<String> = lxss.keys().ok()?.collect();
+    ids.iter().find_map(|id| {
+        let entry = lxss.open(id).ok()?;
+        let name = entry.get_string("DistributionName").ok()?;
+        if !name.eq_ignore_ascii_case(distribution) {
+            return None;
+        }
+        entry.get_string("BasePath").ok()
+    })
+}
+
+/**
+Where Docker Desktop keeps its WSL disks, and the space free on that drive.
+
+Docker Desktop on WSL keeps its data on a sparse virtual disk of about a terabyte, so a container
+sees about a terabyte free whatever the drive under it has: Windows G showed 938.3 GiB free in a
+container with 15 GB free on C:, and setup took C: from 14.5 to 11.8 GB. The drive is found as Docker
+Desktop finds its disks (`docker_data_folder`). None off Windows.
+*/
+pub fn docker_data_drive() -> Option<MachineDrive> {
+    #[cfg(target_os = "windows")]
+    {
+        let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let read = |folder: Option<String>, file: &str| {
+            folder.and_then(|folder| {
+                std::fs::read_to_string(Path::new(&folder).join("Docker").join(file)).ok()
+            })
+        };
+        let folder = docker_data_folder(
+            read(env("APPDATA"), "settings-store.json").as_deref(),
+            read(env("APPDATA"), "settings.json").as_deref(),
+            env("LOCALAPPDATA").as_deref(),
+            env("SystemDrive").as_deref(),
+        )?;
+        // A folder Docker has not made yet is on the drive its path names.
+        let free = free_space(&folder)
+            .or_else(|| drive_of(&folder).and_then(|drive| free_space(&format!(r"{drive}\"))))?;
+        Some(MachineDrive {
+            drive: drive_of(&folder),
+            free,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/**
+The folder Docker Desktop keeps its WSL disks in (`disk\docker_data.vhdx`, `main\ext4.vhdx`), from
+the contents of its settings files under `%APPDATA%\Docker` and the person's folders.
+
+Settings > Resources > Advanced > Disk image location sets it: `CustomWslDistroDir` in
+`settings-store.json`, or `customWslDistroDir` in the `settings.json` of releases before that file.
+Otherwise it is `%LOCALAPPDATA%\Docker\wsl`, and without that, the system drive.
+*/
+pub fn docker_data_folder(
+    settings_store: Option<&str>,
+    settings: Option<&str>,
+    local_app_data: Option<&str>,
+    system_drive: Option<&str>,
+) -> Option<String> {
+    let chosen = |file: Option<&str>| {
+        let settings: serde_json::Value = serde_json::from_str(file?).ok()?;
+        ["CustomWslDistroDir", "customWslDistroDir"]
+            .iter()
+            .find_map(|key| settings.get(*key)?.as_str())
+            .map(str::trim)
+            .filter(|folder| !folder.is_empty())
+            .map(str::to_owned)
+    };
+    chosen(settings_store)
+        .or_else(|| chosen(settings))
+        .or_else(|| local_app_data.map(|folder| format!(r"{folder}\Docker\wsl")))
+        .or_else(|| system_drive.map(|drive| format!(r"{drive}\")))
+}
+
+/// The bytes free to this account on the volume that holds `folder`.
+#[cfg(target_os = "windows")]
+pub(crate) fn free_space(folder: &str) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let folder = folder.strip_prefix(r"\\?\").unwrap_or(folder);
+    let wide: Vec<u16> = std::ffi::OsStr::new(folder)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call, and `free` is a u64 it may
+    // write; the two totals are not asked for.
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut free),
+            None,
+            None,
+        )
+    }
+    .ok()?;
+    Some(free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::temp_root;
+
+    /// Docker Desktop's disks are where its Disk image location setting puts them, in either
+    /// settings file it has used, and otherwise in `%LOCALAPPDATA%\Docker\wsl`.
+    #[test]
+    fn docker_desktops_disks_are_found_where_its_settings_put_them() {
+        let local = r"C:\Users\Administrator\AppData\Local";
+        // Windows G: nothing set, so the default folder, on C:.
+        let store = r#"{"AutoStart":false,"DisplayedOnboarding":true,"EnableIntegrationWithDefaultWslDistro":false,"SettingsVersion":40}"#;
+        let folder = docker_data_folder(Some(store), None, Some(local), Some("C:")).unwrap();
+        assert_eq!(folder, r"C:\Users\Administrator\AppData\Local\Docker\wsl");
+        assert_eq!(drive_of(&folder).as_deref(), Some("C:"));
+        // Moved to another drive with Disk image location.
+        let moved =
+            r#"{"AutoStart":false,"CustomWslDistroDir":"D:\\DockerDesktop","SettingsVersion":40}"#;
+        let folder = docker_data_folder(Some(moved), None, Some(local), Some("C:")).unwrap();
+        assert_eq!(folder, r"D:\DockerDesktop");
+        assert_eq!(drive_of(&folder).as_deref(), Some("D:"));
+        // A release before settings-store.json, and an empty setting, which is no setting.
+        let older = r#"{"autoStart":false,"customWslDistroDir":"E:\\wsl","settingsVersion":30}"#;
+        assert_eq!(
+            docker_data_folder(None, Some(older), Some(local), Some("C:")).as_deref(),
+            Some(r"E:\wsl")
+        );
+        let empty = r#"{"CustomWslDistroDir":"  "}"#;
+        assert_eq!(
+            docker_data_folder(Some(empty), Some("not json"), Some(local), Some("C:")).as_deref(),
+            Some(r"C:\Users\Administrator\AppData\Local\Docker\wsl")
+        );
+        // No profile folder to go by: the system drive.
+        assert_eq!(
+            docker_data_folder(None, None, None, Some("C:")).as_deref(),
+            Some(r"C:\")
+        );
+        assert_eq!(docker_data_folder(None, None, None, None), None);
+    }
+
+    /// Podman names its machine's WSL distribution as `env.WithPodmanPrefix` does, and WSL records
+    /// its folder with the `\\?\` prefix or without.
+    #[test]
+    fn a_podman_machines_distribution_and_drive_are_named_as_podman_and_wsl_name_them() {
+        assert_eq!(podman_distribution("openbot"), "podman-openbot");
+        assert_eq!(
+            podman_distribution("podman-machine-default"),
+            "podman-machine-default"
+        );
+        for (path, drive) in [
+            (
+                r"\\?\C:\Users\me\.local\share\containers\podman\machine\wsl\wsldist\openbot",
+                Some("C:"),
+            ),
+            (r"d:\podman\wsldist\openbot", Some("D:")),
+            (r"\\server\share\wsldist\openbot", None),
+            ("", None),
+        ] {
+            assert_eq!(drive_of(path).as_deref(), drive, "{path}");
+        }
+    }
+
+    /// The machine's drive is read where WSL keeps it: a distribution's `BasePath` in the person's
+    /// own registry hive, here under a key of this test's own with the shape WSL writes, and the
+    /// free space of the real volume that folder is on.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_podman_machines_drive_is_read_from_the_folder_wsl_recorded() {
+        let registry = format!(r"Software\OpenBot\Tests\Lxss-{}", std::process::id());
+        let folder = temp_root("wsl-distribution");
+        std::fs::create_dir_all(&folder).unwrap();
+        let entry = |id: &str, name: &str, base: &str| {
+            let key = windows_registry::CURRENT_USER
+                .create(format!(r"{registry}\{id}"))
+                .unwrap();
+            key.set_string("DistributionName", name).unwrap();
+            key.set_string("BasePath", base).unwrap();
+            key.set_string("VhdFileName", "ext4.vhdx").unwrap();
+        };
+        entry(
+            "{0d4e1c9a-5f0b-4a57-9d3e-1a2b3c4d5e6f}",
+            "Ubuntu",
+            r"Z:\elsewhere",
+        );
+        entry(
+            "{7c1f2e3d-9a8b-4c5d-8e7f-6a5b4c3d2e1f}",
+            "podman-openbot",
+            &format!(r"\\?\{}", folder.display()),
+        );
+        let found = machine_drive_in(&registry, "podman-openbot");
+        let missing = machine_drive_in(&registry, "podman-other");
+        let _ = windows_registry::CURRENT_USER.remove_tree(&registry);
+        let found = found.expect("the machine's folder and its volume were read");
+        assert_eq!(found.drive, drive_of(&folder.display().to_string()));
+        assert!(found.free > 0, "{found:?}");
+        assert_eq!(missing, None);
+    }
+
+    /// WSL reads `OOBEComplete` as a DWORD under the person's own Lxss key, and opens its welcome
+    /// window while it is missing or 0 (`LXSS_REGISTRY_PATH`, `LXSS_OOBE_COMPLETE_NAME` in
+    /// microsoft/WSL's wslservice.idl). Written here under a key of this test's own, from missing
+    /// and from 0, in the person's real hive.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_wsl_welcome_window_is_marked_shown_where_wsl_reads_it() {
+        assert_eq!(LXSS, r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+        assert_eq!(WSL_WELCOME_SHOWN, "OOBEComplete");
+
+        let registry = format!(r"Software\OpenBot\Tests\LxssWelcome-{}", std::process::id());
+        let fresh = skip_wsl_welcome_in(&registry);
+        let after_fresh = windows_registry::CURRENT_USER
+            .open(&registry)
+            .and_then(|key| key.get_u32(WSL_WELCOME_SHOWN));
+        let reset = windows_registry::CURRENT_USER
+            .create(&registry)
+            .and_then(|key| key.set_u32(WSL_WELCOME_SHOWN, 0));
+        let again = skip_wsl_welcome_in(&registry);
+        let after_reset = windows_registry::CURRENT_USER
+            .open(&registry)
+            .and_then(|key| key.get_u32(WSL_WELCOME_SHOWN));
+        let _ = windows_registry::CURRENT_USER.remove_tree(&registry);
+
+        fresh.expect("the value was written to a key that did not exist");
+        assert_eq!(after_fresh.expect("the value reads back as a DWORD"), 1);
+        reset.expect("the test set the value back to 0");
+        again.expect("the value was written over 0");
+        assert_eq!(after_reset.expect("the value reads back as a DWORD"), 1);
+    }
 
     const PROBE_OUTPUTS: [&str; 6] = [
         "hypervisor=True\nfirmware=False\n",
@@ -574,7 +1301,7 @@ mod tests {
             assert_eq!(&args[..3], ["-NoProfile", "-NonInteractive", "-Command"]);
             match probe {
                 0 => assert!(args[3].contains("Get-CimInstance Win32_ComputerSystem")),
-                1 => assert!(args[3].contains("WindowsBuiltInRole]::Administrator")),
+                1 => assert!(args[3].contains("S-1-5-32-544")),
                 2 => assert_eq!(
                     args[3],
                     optional_feature_probe_command("Microsoft-Windows-Subsystem-Linux")
@@ -621,7 +1348,7 @@ mod tests {
                     ));
                 } else if command.contains("Win32_ComputerSystem") {
                     PROBE_OUTPUTS[0]
-                } else if command.contains("WindowsBuiltInRole]::Administrator") {
+                } else if command.contains("S-1-5-32-544") {
                     "False"
                 } else if command.contains("Win32_OptionalFeature") {
                     "1"
@@ -1524,6 +2251,140 @@ mod tests {
                 "{blocker:?} hides the restart"
             );
         }
+    }
+
+    #[test]
+    fn only_hyper_v_refusing_a_vm_is_missing_nested_virtualization() {
+        assert!(hyper_v_refused(
+            "Please enable the Virtual Machine Platform Windows feature and ensure virtualization \
+             is enabled in the BIOS.\nError code: \
+             Wsl/Service/CreateInstance/CreateVm/HCS/HCS_E_HYPERV_NOT_INSTALLED"
+        ));
+        assert!(hyper_v_refused(
+            "WslRegisterDistribution failed with error: 0x80370102"
+        ));
+        assert!(!hyper_v_refused("Invalid command line option: --system"));
+        assert!(!hyper_v_refused(""));
+        assert_eq!(Blocker::NestedVirtualizationUnavailable.fix(), None);
+        assert!(!Blocker::NestedVirtualizationUnavailable.ours_to_fix());
+    }
+
+    #[test]
+    fn the_machine_is_named_as_arch_names_it() {
+        assert_eq!(machine_name(0xAA64), Some("aarch64"));
+        assert_eq!(machine_name(0x8664), Some("x86_64"));
+        assert_eq!(
+            machine_name(0x014C),
+            None,
+            "32-bit x86 is not a machine OpenBot runs on"
+        );
+        if !cfg!(target_os = "windows") {
+            assert_eq!(machine_arch(), std::env::consts::ARCH);
+        }
+    }
+
+    #[test]
+    fn every_blocker_but_firmware_has_a_fix_and_only_the_account_setting_skips_the_prompt() {
+        for blocker in [
+            Blocker::WslAbsent,
+            Blocker::WslNoKernel,
+            Blocker::VirtualMachinePlatformDisabled,
+            Blocker::NotAdministrator,
+        ] {
+            let fix = blocker.fix().unwrap();
+            assert!(fix.elevated && fix.restart, "{blocker:?}");
+        }
+        let fix = Blocker::WslOne.fix().unwrap();
+        assert!(!fix.elevated && !fix.restart);
+        assert_eq!(Blocker::VirtualizationDisabled.fix(), None);
+    }
+
+    #[test]
+    fn enabling_wsl_turns_on_both_features_and_never_installs_a_distribution() {
+        assert!(ENABLE_WSL.contains("--install --no-distribution"));
+        assert!(!ENABLE_WSL.contains("wsl.exe --install\n"));
+        assert!(ENABLE_WSL.contains("Microsoft-Windows-Subsystem-Linux"));
+        assert!(ENABLE_WSL.contains("VirtualMachinePlatform"));
+        assert!(
+            ENABLE_WSL.contains("3010"),
+            "a restart-needed DISM exit is success"
+        );
+    }
+
+    #[test]
+    fn the_encoded_script_is_utf16le_base64() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded("exit 0"))
+            .unwrap();
+        assert_eq!(bytes, b"e\0x\0i\0t\0 \x000\0");
+    }
+
+    #[test]
+    fn the_elevated_launcher_asks_through_runas_and_reports_a_refusal() {
+        let launcher = elevated_launcher("exit 0", Path::new(r"C:\Users\o'brien\fix.txt"));
+        assert!(launcher.contains("-Verb RunAs"));
+        assert!(launcher.contains("-Wait -PassThru"));
+        assert!(launcher.contains("exit 1223"));
+        // The log path is inside the encoded inner script, quoted for PowerShell there.
+        let encoded_inner = launcher
+            .split("'-EncodedCommand','")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+        use base64::Engine;
+        let inner = base64::engine::general_purpose::STANDARD
+            .decode(encoded_inner)
+            .unwrap();
+        let inner: Vec<u16> = inner
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let inner = String::from_utf16(&inner).unwrap();
+        assert!(inner.contains(r"'C:\Users\o''brien\fix.txt'"), "{inner}");
+    }
+
+    #[test]
+    fn a_fix_says_restart_done_declined_or_failed_with_its_log() {
+        let enable = Blocker::WslAbsent.fix().unwrap();
+        let version = Blocker::WslOne.fix().unwrap();
+        assert_eq!(fixed(enable, Some(0), None, ""), Ok(Fixed::RestartNeeded));
+        assert_eq!(fixed(version, Some(0), None, ""), Ok(Fixed::Done));
+        // Saying no to the prompt is recoverable, not an error: the window asks again.
+        assert_eq!(fixed(enable, Some(DECLINED), None, ""), Ok(Fixed::Declined));
+        let failed = fixed(
+            enable,
+            Some(1),
+            Some("dism.exe could not turn on X".into()),
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(
+            failed.detail.as_deref(),
+            Some("dism.exe could not turn on X")
+        );
+        let failed = fixed(enable, Some(1), None, "boom").unwrap_err();
+        assert!(failed.detail.unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn a_restart_is_pending_only_within_the_boot_that_recorded_it() {
+        let dir = temp_root("winrestart");
+        assert!(!restart_pending(&dir, "20261026120000"));
+        record_restart_needed(&dir, "20261026120000").unwrap();
+        assert!(restart_pending(&dir, "20261026120000"));
+        assert!(
+            restart_pending(&dir, "20261026120000"),
+            "asking does not clear it"
+        );
+        assert!(
+            !restart_pending(&dir, "20261026130500"),
+            "a new boot is the restart"
+        );
+        assert!(!restart_path(&dir).exists(), "and the record is gone");
+        std::fs::write(restart_path(&dir), "{ not json").unwrap();
+        assert!(!restart_pending(&dir, "20261026130500"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

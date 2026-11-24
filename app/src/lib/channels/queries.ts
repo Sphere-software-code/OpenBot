@@ -66,8 +66,16 @@ export type ChannelWork =
 
 /** A channel plus what the roster renders about it. */
 export type ChannelSummary = AgentChannel & {
-  /** A few words about the conversation, or null. The roster falls back to `name`. */
+  /**
+   * What the conversation is called, or null: the name its owner gave it, else a few words the
+   * server wrote about it. The roster falls back to `opening`, then `name`.
+   */
   summary: string | null;
+  /**
+   * The person's first words in the conversation, as one plain line, or null. What it is called
+   * until `summary` names it. Absent from a server that predates it, which reads as null.
+   */
+  opening?: string | null;
   lastMessage: string | null;
   lastMessageAgentId: string | null;
   /** ISO-8601. Ordering falls back to this, so a channel just created sorts to the top. */
@@ -77,6 +85,11 @@ export type ChannelSummary = AgentChannel & {
   /** ISO-8601 when this member last had the channel open, or null for never. The caller's, only. */
   lastReadAt: string | null;
   /**
+   * Whether this member started the conversation and so may rename it. The server's answer, which
+   * it enforces too. Absent from a server that predates renaming, which reads as no.
+   */
+  canRename?: boolean;
+  /**
    * Whether a turn is running in this channel right now.
    *
    * Mostly socket-only and transient: a person's own run is announced and never stored, so a
@@ -85,6 +98,11 @@ export type ChannelSummary = AgentChannel & {
    * hop, a relay — sets it, which is how the roster shows work the browser never streamed.
    */
   busy?: boolean;
+  /**
+   * Whether this is a task's own conversation, which holds one piece of work started from a
+   * check-in. Absent from a server that predates tasks, which reads as not one.
+   */
+  task?: boolean;
 };
 
 export const channelKeys = {

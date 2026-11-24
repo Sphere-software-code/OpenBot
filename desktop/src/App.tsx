@@ -1,58 +1,85 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Ask } from "./Ask";
-import { StartFresh } from "./StartFresh";
+import { CheckForUpdates } from "./CheckForUpdates";
+import { CopilotKitAccount } from "./CopilotKitAccount";
 import {
-  DEFAULT_HARNESS,
-  type HarnessChoice,
-  HarnessPicker,
-} from "./HarnessPicker";
+  EarlyDownloadsLine,
+  earlyDownload,
+  useEarlyDownloads,
+} from "./EarlyDownloads";
+import { DEFAULT_HARNESS, type HarnessChoice } from "./harness";
 import { isHttpEndpointUrl } from "./http-endpoint-url";
-import { OrganizationSignIn } from "./OrganizationSignIn";
-import { asProblem, Failure, type Problem } from "./Problem";
+import {
+  LocalIntelligence,
+  type LocalStartable,
+  LocalStatus,
+  type StartOutcome,
+  useLocalSequence,
+} from "./LocalIntelligence";
+import {
+  intelligenceStopProblem,
+  offerLocalIntelligence,
+  splitStopFailure,
+} from "./localEvalCli";
+import { asProblem, Failure, InlineFailure, type Problem } from "./Problem";
 import {
   type HeldConfiguration,
   type ModelChoice,
   ProviderPicker,
   recordedModel,
 } from "./ProviderPicker";
+import { Sections } from "./Sections";
+import { StartFresh } from "./StartFresh";
+import { PausePodman, PodmanGoAhead } from "./PodmanGoAhead";
+import {
+  engineNow,
+  goAheadNow,
+  handOffNow,
+  pauseOfferNow,
+  BehindSlot,
+  INSTALL_BLURB,
+  installingBehind,
+  type Progress,
+  plainInstallSteps,
+  SetupProgress,
+  StatusLine,
+  trayPlace,
+} from "./SetupProgress";
+import { ShuttingDown, useQuitStatus } from "./ShuttingDown";
 import {
   harnessChoiceEvent,
   modelChoiceEvent,
   recordSetupEvent,
   type SetupStep,
 } from "./telemetry";
+import { UsageDataChoice } from "./UsageDataChoice";
 import { Welcome } from "./Welcome";
-
-type EngineStatus = {
-  engine: "docker" | "podman" | null;
-  responding: boolean;
-  engine_socket: string | null;
-  detail: string;
-};
-
-type Blocker =
-  | "wsl-absent"
-  | "wsl-one"
-  | "virtual-machine-platform-disabled"
-  | "virtualization-disabled"
-  | "not-administrator";
-
-type Progress = {
-  step: string;
-  ok: boolean;
-  detail: string;
-  running?: boolean;
-  downloadBytes?: number;
-};
+import { type Blocker, WindowsBlocker, WindowsRestart } from "./WindowsBlocker";
 
 type AlreadyConfigured = {
   values: Record<string, string>;
   saved: NonNullable<HeldConfiguration["saved"]>;
+  /** Reported only for an installation with a local Intelligence stack recorded. */
   launch?: { harness: HarnessChoice | null } | null;
   installation?: { harness: HarnessChoice | null } | null;
   autoStart?: boolean;
+  /** The local evaluation's checkpoint, when this installation has one. */
+  localEval?: {
+    stack: string;
+    ownership: "created" | "shared";
+    phase: string;
+    /** OpenBot holds the key `local connect` gave it for this stack. */
+    connected?: boolean;
+  };
+};
+
+/** This installation is not on this app's own release, so Start upgrades it first. */
+type ReleaseMove = { from: string; to: string };
+type ReleaseOutcome = ReleaseMove & {
+  moved: boolean;
+  /** The upgrade did not happen and the previous version started again. */
+  notice?: Problem | null;
 };
 
 function installationKeyFor(root: string, harness: HarnessChoice | null) {
@@ -63,31 +90,42 @@ function installationKeyFor(root: string, harness: HarnessChoice | null) {
   ]);
 }
 
-const MANAGED_INTELLIGENCE_API_URL = "https://api.intelligence.copilotkit.ai";
-const MANAGED_INTELLIGENCE_GATEWAY_WS_URL =
-  "wss://realtime.intelligence.copilotkit.ai";
-
 /**
- * What the last screen offers to ask, mirroring `ask::SUGGESTED`.
- *
- * Two copies of one sentence, and a test in `ask.rs` pins what it has to contain. The window needs
- * it before it calls anything, and the Rust side needs it for the case where somebody clears the
- * field, so neither can be the only one that has it.
+ * This window in front of whatever is there, for a step that is the person's next. The native side
+ * activates the app, not only the window: see `bring_to_front` in main.rs. A window that could not
+ * come forward is still where it was, so a failure here changes nothing.
  */
-const SUGGESTED_QUESTION = "What is 17 times 23?";
+function comeForward(why: string) {
+  invoke("bring_setup_to_front", { why }).catch(() => {});
+}
+
+/*
+ * The window keeps the size and the place it opened with. It used to grow to fit a taller step and
+ * move up to stay on screen: on Windows it grew 14 px when the sign-in card appeared, then jumped
+ * 54 px up and 139 px taller on "Connect your AI". A step taller than the window scrolls inside its
+ * card instead (`main > .sheet` in styles.css).
+ */
+/** The restart screen's words when setup found that only a Windows restart lets it carry on. */
+const SETUP_NEEDS_RESTART =
+  "Windows needs to restart to finish setting up the software OpenBot runs on. OpenBot opens again after you sign back in.";
 
 export function App() {
-  const [engine, setEngine] = useState<EngineStatus | null>(null);
+  return <Setup />;
+}
+
+function Setup() {
   const [blocker, setBlocker] = useState<Blocker | null>(null);
+  // A Windows fix made earlier that only counts once Windows has restarted, and it has not.
+  const [restartPending, setRestartPending] = useState(false);
+  // Said on the restart screen when setup, not a Windows feature, is what needs the restart.
+  const [restartLede, setRestartLede] = useState<string | undefined>();
   const [blockerFailure, setBlockerFailure] = useState<Problem | null>(null);
   const [instruction, setInstruction] = useState("");
   const [root, setRoot] = useState("");
-  const [reuseIntelligence, setReuseIntelligence] = useState(false);
-  const [apiKey, setApiKey] = useState("");
-  const [organizationAuthorityUrl, setOrganizationAuthorityUrl] = useState<
-    string | null
-  >(null);
-  const [refreshOrganization, setRefreshOrganization] = useState(false);
+  const [localStack, setLocalStack] = useState<string | null>(null);
+  const [localConnected, setLocalConnected] = useState(false);
+  // A relaunch found a connected stack it may start.
+  const [localAutoStart, setLocalAutoStart] = useState(false);
   /*
    * Which Bot and which model, as two separate answers.
    *
@@ -99,153 +137,36 @@ export function App() {
     id: DEFAULT_HARNESS,
   });
   const [model, setModel] = useState<ModelChoice | null>(null);
+  /*
+   * The model as of the latest choice, without waiting for a render.
+   *
+   * Local Intelligence starts OpenBot from its own sequence, a tick after the go-ahead. A choice
+   * made by a click has rendered by then; one made from an effect (a sign-in that finished and moved
+   * on by itself) may not have, and Start ran with the model from before it: null.
+   */
+  const chosenModel = useRef(model);
+  // Follows every other change to the model, once committed; a choice sets it at once (below).
+  useEffect(() => {
+    chosenModel.current = model;
+  }, [model]);
   /** Model credentials a previous run already wrote, so the provider screen arrives filled in. */
   const [alreadyHeld, setAlreadyHeld] = useState<HeldConfiguration>({});
-  const [projects, setProjects] = useState<
-    { id: string; name: string }[] | null
-  >(null);
-  const [projectName, setProjectName] = useState("");
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [signingIn, setSigningIn] = useState(false);
-  const [intelligenceSignInKind, setIntelligenceSignInKind] = useState<
-    "managed" | "self-hosted"
-  >("managed");
-  const [selfHostedActive, setSelfHostedActive] = useState(false);
-  const selfHostedAttempt = useRef(0);
-  const selfHostedActiveRef = useRef(false);
-  const cancelSelfHostedSignIn = useCallback(async () => {
-    if (!selfHostedActiveRef.current) return;
-    selfHostedActiveRef.current = false;
-    selfHostedAttempt.current += 1;
-    setSelfHostedActive(false);
-    setSigningIn(false);
-    setProjects(null);
-    try {
-      await invoke("cancel_self_hosted_intelligence_sign_in");
-    } catch (error) {
-      setFailure(asProblem(error));
-    }
-  }, []);
-
-  async function signInToSelfHostedIntelligence() {
-    await cancelSelfHostedSignIn();
-    const attempt = ++selfHostedAttempt.current;
-    selfHostedActiveRef.current = true;
-    setSelfHostedActive(true);
-    setIntelligenceSignInKind("self-hosted");
-    setSigningIn(true);
-    setFailure(null);
-    setProjects(null);
-    setApiKey("");
-    setReuseIntelligence(false);
-    try {
-      const available = await invoke<{ id: string; name: string }[]>(
-        "begin_self_hosted_intelligence_sign_in",
-        { root, apiUrl },
-      );
-      if (selfHostedAttempt.current === attempt) setProjects(available);
-    } catch (error) {
-      if (selfHostedAttempt.current === attempt) {
-        setFailure(asProblem(error));
-        selfHostedActiveRef.current = false;
-        setSelfHostedActive(false);
-      }
-    } finally {
-      if (selfHostedAttempt.current === attempt) setSigningIn(false);
-    }
-  }
-
-  /*
-   * The address the browser was sent to, kept so the screen can show it.
-   *
-   * Both plan sign-ins already do this, for the reason written next to them: an open that silently
-   * did nothing, or a machine with no registered browser, leaves somebody watching a spinner with
-   * no idea where they are meant to go. This one threw the address away, so that case had no way
-   * out at all.
-   */
-  const [signInUrl, setSignInUrl] = useState<string | null>(null);
-
-  async function signInToCopilotKit() {
-    await cancelSelfHostedSignIn();
-    setIntelligenceSignInKind("managed");
-    setSigningIn(true);
-    setFailure(null);
-    setSignInUrl(null);
-    try {
-      setSignInUrl(await invoke<string>("begin_intelligence_sign_in"));
-      setProjects(
-        await invoke<{ id: string; name: string }[]>(
-          "finish_intelligence_sign_in",
-        ),
-      );
-    } catch (error) {
-      setFailure(asProblem(error));
-    } finally {
-      setSigningIn(false);
-      setSignInUrl(null);
-    }
-  }
-
-  async function pickProject(id: string) {
-    setSigningIn(true);
-    setFailure(null);
-    const selfHosted = intelligenceSignInKind === "self-hosted";
-    const attempt = selfHostedAttempt.current;
-    try {
-      const key = await invoke<string>(
-        selfHosted
-          ? "finish_self_hosted_intelligence_sign_in"
-          : "intelligence_key_for",
-        selfHosted ? { root, project: id } : { project: id },
-      );
-      if (selfHosted && selfHostedAttempt.current !== attempt) return;
-      setApiKey(key);
-      setProjects(null);
-    } catch (error) {
-      if (!selfHosted || selfHostedAttempt.current === attempt) {
-        setFailure(asProblem(error));
-        if (selfHosted) setProjects(null);
-      }
-    } finally {
-      if (!selfHosted || selfHostedAttempt.current === attempt) {
-        setSigningIn(false);
-        if (selfHosted) {
-          selfHostedActiveRef.current = false;
-          setSelfHostedActive(false);
-        }
-      }
-    }
-  }
-  async function createProject() {
-    const name = projectName.trim();
-    if (!name || signingIn) return;
-    setSigningIn(true);
-    setCreatingProject(true);
-    setFailure(null);
-    try {
-      const project = await invoke<{ id: string; name: string }>(
-        "create_intelligence_project",
-        { name },
-      );
-      setProjects((current) => [...(current ?? []), project]);
-      setProjectName("");
-      await pickProject(project.id);
-    } catch (error) {
-      setFailure(asProblem(error));
-    } finally {
-      setSigningIn(false);
-      setCreatingProject(false);
-    }
-  }
-
+  // Running-screen actions that wait on the native side, said while they do.
+  const [stopping, setStopping] = useState(false);
+  const [showing, setShowing] = useState(false);
+  // Start could not move the deployment to this app's release, and started the one it had.
+  const [releaseNotice, setReleaseNotice] = useState<Problem | null>(null);
+  // The back end is ready on the release it had, and its update did not finish.
+  const [backEndNotice, setBackEndNotice] = useState<string | null>(null);
   const [step, setStep] = useState<SetupStep>("welcome");
-  const [apiUrl, setApiUrl] = useState(MANAGED_INTELLIGENCE_API_URL);
-  const [wsUrl, setWsUrl] = useState(MANAGED_INTELLIGENCE_GATEWAY_WS_URL);
   const [steps, setSteps] = useState<Progress[]>([]);
+  // When the install now running began: its row on the other screens counts from here.
+  const [installSince, setInstallSince] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
-  const [resuming, setResuming] = useState(false);
   const [checkingResume, setCheckingResume] = useState(true);
   const savedLaunch = useRef<string | null>(null);
+  // An interrupted run needs an explicit Start.
+  const interruptedAtLaunch = useRef(false);
   const [refreshIntelligence, setRefreshIntelligence] = useState(false);
   const [preparation, setPreparation] = useState<{
     key: string;
@@ -254,16 +175,39 @@ export function App() {
   const installationKey = installationKeyFor(root, harness);
   const installationReady =
     preparation?.key === installationKey && preparation.status === "complete";
+  /*
+   * A first run sets Intelligence up alongside the OpenBot install, not after it: from the moment
+   * the install reports the container engine ready (Intelligence runs on the same Docker, and the
+   * install is what starts or installs it), or at once when the install is already done. Queued by
+   * the CopilotKit account step, which runs first.
+   */
+  const intelligenceQueued = useRef(false);
+  /** Setup's Try again on the account step, which asks that step's own check again too. */
+  const [setupRetries, setSetupRetries] = useState(0);
+  const engineReady = steps.some(
+    (row) => row.step === "engine" && row.ok && !row.running,
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs when the engine or install changes.
+  useEffect(() => {
+    if (!intelligenceQueued.current) return;
+    if (!engineReady && !installationReady) return;
+    intelligenceQueued.current = false;
+    local.prepare();
+  }, [engineReady, installationReady]);
   const returningToInstallation = savedLaunch.current === installationKey;
   const [running, setRunning] = useState(false);
   const visibleSetupStep =
-    checkingResume ||
-    resuming ||
-    blockerFailure ||
-    blocker ||
-    (running && step !== "ask")
-      ? null
-      : step;
+    checkingResume || blockerFailure || blocker || running ? null : step;
+  /*
+   * The first screen starts the big downloads, without a click: the person opened OpenBot's setup
+   * to install it. The native side downloads only what this computer's install will need, once per
+   * run of the app (`early_downloads.rs`).
+   */
+  const onFirstScreen = visibleSetupStep === "welcome";
+  useEffect(() => {
+    if (!onFirstScreen || !root.trim()) return;
+    invoke("start_early_downloads", { root: root.trim() }).catch(() => {});
+  }, [onFirstScreen, root]);
   const lastViewedStep = useRef<SetupStep | null>(null);
   useEffect(() => {
     if (visibleSetupStep === lastViewedStep.current) return;
@@ -272,7 +216,6 @@ export function App() {
       recordSetupEvent({ kind: "step_viewed", step: visibleSetupStep });
     }
   }, [visibleSetupStep]);
-  const configuredRunRef = useRef(0);
   /*
    * A failure, in both registers.
    *
@@ -293,9 +236,21 @@ export function App() {
       setRefreshIntelligence(true);
       setStep("connect");
     }
-    if (problem.connection === "organization") setRefreshOrganization(true);
+    // Start was refused until Install runs again: an earlier app's deployment this app cannot
+    // start. Install does that by itself, as the person would otherwise be told to.
+    if (problem.connection === "installation") setReinstall(true);
+    // Only a Windows restart fixes this one: the restart screen, not a Try again that can't work.
+    if (problem.restart_windows) {
+      setRestartLede(SETUP_NEEDS_RESTART);
+      setRestartPending(true);
+    }
   }, []);
-  const displayedFailure = failure ?? recoveryFailure;
+  const [reinstall, setReinstall] = useState(false);
+  // A local Intelligence stack OpenBot could not stop. Shown, but it never holds a start.
+  const [intelligenceNotice, setIntelligenceNotice] = useState<Problem | null>(
+    null,
+  );
+  const displayedFailure = failure ?? recoveryFailure ?? intelligenceNotice;
   // An older shell offered only the database. The list is exactly what a reset may remove.
   const leftoverVolumes = displayedFailure?.leftover_reset?.length
     ? displayedFailure.leftover_reset
@@ -303,88 +258,80 @@ export function App() {
       ? [displayedFailure.database_reset]
       : [];
   const leftoverContainers = displayedFailure?.leftover_containers ?? [];
-  const credentialContext = useRef([
+  // Held here, above the screens, so changing screens never cancels it.
+  const local = useLocalSequence({
     root,
-    model,
-    apiKey,
-    apiUrl,
-    wsUrl,
-    harness,
-    step,
-    reuseIntelligence,
-  ]);
+    stack: localStack,
+    connected: localConnected,
+    onStart: (startable) => start(chosenModel.current, startable),
+    onRecorded: (stack, connected) => {
+      setLocalStack(stack);
+      if (connected) setLocalConnected(true);
+    },
+  });
+  // The engine's wake found that only a Windows restart fixes OpenBot's machine: the restart
+  // screen, not a Retry that can't work.
   useEffect(() => {
-    const next = [
-      root,
-      model,
-      apiKey,
-      apiUrl,
-      wsUrl,
-      harness,
-      step,
-      reuseIntelligence,
-    ];
+    if (local.problem?.restart_windows) {
+      setRestartLede(SETUP_NEEDS_RESTART);
+      setRestartPending(true);
+    }
+  }, [local.problem]);
+  /*
+   * Whether this Start updates OpenBot itself, asked once the back end is waited on, so the Start
+   * journey counts the update from the start rather than learning of it when it begins: on Windows
+   * D the time left said "About a minute", then "About 2", then "About 3". Start uses this answer.
+   */
+  const releaseDueAsked = useRef<{
+    root: string;
+    answer: Promise<ReleaseMove | null>;
+  } | null>(null);
+  const [releaseDue, setReleaseDue] = useState(false);
+  useEffect(() => {
+    const at = root.trim();
+    if (!local.running || local.at !== "wait" || !at) return;
+    if (releaseDueAsked.current?.root === at) return;
+    const answer = invoke<ReleaseMove | null>("upgrade_due", {
+      root: at,
+    }).catch(() => null);
+    releaseDueAsked.current = { root: at, answer };
+    void answer.then((due) => setReleaseDue(Boolean(due)));
+  }, [local.running, local.at, root]);
+  // A recorded stack: the OpenBot app's page may offer its dashboard (intelligence_bridge.rs).
+  const intelligenceOffered = localStack !== null;
+  // What the shell was last told. Starts hidden, so nothing is said before a stack is recorded.
+  const offeredToMenus = useRef({ root: "", offered: false });
+  useEffect(() => {
+    const last = offeredToMenus.current;
+    if (last.offered === intelligenceOffered && last.root === root) return;
+    if (!last.offered && !intelligenceOffered) return;
+    offeredToMenus.current = { root, offered: intelligenceOffered };
+    offerLocalIntelligence(root, intelligenceOffered).catch(() => {});
+  }, [root, intelligenceOffered]);
+  // Stop OpenBot was chosen in this window: nothing local starts again on its own.
+  const stoppedByChoice = useRef(false);
+  const credentialContext = useRef([root, model, harness, step]);
+  useEffect(() => {
+    const next = [root, model, harness, step];
     if (
       next.some((value, index) => value !== credentialContext.current[index])
     ) {
       credentialContext.current = next;
       setFailure(null);
     }
-  }, [root, model, apiKey, apiUrl, wsUrl, harness, step, reuseIntelligence]);
-
-  const clearRootScopedSavedState = useCallback(() => {
-    void cancelSelfHostedSignIn();
-    setIntelligenceSignInKind("managed");
-    savedLaunch.current = null;
-    setRefreshIntelligence(false);
-    setRefreshOrganization(false);
-    setOrganizationAuthorityUrl(null);
-    setApiKey("");
-    setReuseIntelligence(false);
-    setApiUrl(MANAGED_INTELLIGENCE_API_URL);
-    setWsUrl(MANAGED_INTELLIGENCE_GATEWAY_WS_URL);
-    setAlreadyHeld({});
-  }, [cancelSelfHostedSignIn]);
-
-  const loadConfiguredRoot = useCallback(
-    async (nextRoot: string) => {
-      const trimmedRoot = nextRoot.trim();
-      const run = configuredRunRef.current + 1;
-      configuredRunRef.current = run;
-      clearRootScopedSavedState();
-      if (!trimmedRoot) return;
-      try {
-        const configured = await invoke<AlreadyConfigured>(
-          "already_configured",
-          { root: trimmedRoot },
-        );
-        if (configuredRunRef.current !== run) return;
-        const { values, saved } = configured;
-        if (values.INTELLIGENCE_API_KEY) setApiKey(values.INTELLIGENCE_API_KEY);
-        if (values.INTELLIGENCE_API_URL) setApiUrl(values.INTELLIGENCE_API_URL);
-        if (values.INTELLIGENCE_GATEWAY_WS_URL)
-          setWsUrl(values.INTELLIGENCE_GATEWAY_WS_URL);
-        setAlreadyHeld({ ...values, saved });
-        setOrganizationAuthorityUrl(
-          values.OPENBOT_ORGANIZATION_AUTH_URL ?? null,
-        );
-        return configured;
-      } catch {
-        if (configuredRunRef.current === run) {
-          setAlreadyHeld({});
-        }
-      }
-    },
-    [clearRootScopedSavedState],
-  );
+  }, [root, model, harness, step]);
 
   useEffect(() => {
     let active = true;
-    invoke<EngineStatus>("detect_engine")
-      .then(setEngine)
-      .catch(() => undefined);
-    const windowsReady = invoke<Blocker | null>("windows_blocker")
-      .then(async (found) => {
+    // A restart still owed comes first: a feature switched on reads as on before it runs.
+    const windowsReady = invoke<boolean>("windows_restart_pending")
+      .catch(() => false)
+      .then(async (pending) => {
+        if (pending) {
+          setRestartPending(true);
+          return false;
+        }
+        const found = await invoke<Blocker | null>("windows_blocker");
         setBlocker(found);
         if (found) {
           setInstruction(
@@ -399,10 +346,19 @@ export function App() {
         setBlockerFailure(asProblem(error));
         return false;
       });
+    // Read once and kept apart from `last_failure`, which would hold auto-start.
+    invoke<Problem | null>("last_local_eval_stop_failure")
+      .then((found) => {
+        if (active && found) setIntelligenceNotice(found);
+      })
+      .catch(() => {});
     // A supervisor that stopped retrying must stay stopped when it returns to this window.
     const interruptedRun = invoke<Problem | null>("last_failure")
       .then((found) => {
-        if (found) setRecoveryFailure(found);
+        if (found) {
+          interruptedAtLaunch.current = true;
+          setRecoveryFailure(found);
+        }
         return found;
       })
       .catch(() => null);
@@ -423,22 +379,48 @@ export function App() {
          * a dotfile in a text editor — the exact thing this product exists not to require. Their own
          * file, read back to them on their own machine.
          */
-        const configured = await loadConfiguredRoot(found);
+        const configured = await invoke<AlreadyConfigured>(
+          "already_configured",
+          { root: found.trim() },
+        ).catch(() => null);
         if (!active) return;
-        const installed = configured?.launch ?? configured?.installation;
-        const resumedModel = configured
-          ? recordedModel({
-              ...configured.values,
-              saved: configured.saved,
-            })
-          : null;
+        if (configured) {
+          setAlreadyHeld({ ...configured.values, saved: configured.saved });
+        }
+        /*
+         * Setup resumes part-way only for an installation with a local Intelligence stack recorded.
+         * Anything else, including an installation an earlier app connected to a hosted
+         * Intelligence, starts at the first screen. Its finished install is kept, so Install does
+         * not run again for the same Bot, and nothing it saved is removed.
+         */
+        if (configured?.localEval) {
+          setLocalStack(configured.localEval.stack);
+          setLocalConnected(configured.localEval.connected === true);
+        }
+        const installed = configured?.localEval
+          ? (configured.launch ?? configured.installation)
+          : configured?.installation;
+        const resumedModel =
+          configured?.localEval && installed
+            ? recordedModel({ ...configured.values, saved: configured.saved })
+            : null;
+        /*
+         * Settings' Change on the AI model row stopped OpenBot to come here: open at the AI screen,
+         * as this window's own Change AI connection does. Asked every load, and answered once.
+         */
+        const changeAiConnection = await invoke<boolean>(
+          "take_ai_connection_change",
+        ).catch(() => false);
+        if (!active) return;
         if (installed) {
           const key = installationKeyFor(found, installed.harness);
           setHarness(installed.harness);
-          setModel(resumedModel);
           setPreparation({ key, status: "complete" });
-          if (configured?.launch) savedLaunch.current = key;
-          setStep(resumedModel ? "connect" : "model");
+          if (configured?.localEval) {
+            setModel(resumedModel);
+            if (configured.launch) savedLaunch.current = key;
+            setStep(resumedModel && !changeAiConnection ? "connect" : "model");
+          }
         }
         if (interrupted?.connection) {
           recoverFromStart(interrupted);
@@ -456,47 +438,20 @@ export function App() {
           setRunning(true);
           return;
         }
-        if (!active || !canResume || !configured?.launch || !resumedModel)
+        if (
+          !active ||
+          !canResume ||
+          !configured?.launch ||
+          !configured.localEval ||
+          !resumedModel
+        )
           return;
-        const resumedHarness = configured.launch.harness;
         // An interrupted run needs an explicit Start, with its saved setup still available.
-        if (interrupted || configured.autoStart === false) return;
-        setBusy(true);
-        setResuming(true);
-        try {
-          // Only a successful previous setup supplies launch intent. Reopening uses its saved
-          // connections and already installed assets; the native start still validates both.
-          await invoke("start_stack", {
-            root: found,
-            apiKey: "",
-            apiUrl:
-              configured.values.INTELLIGENCE_API_URL ||
-              MANAGED_INTELLIGENCE_API_URL,
-            gatewayWsUrl:
-              configured.values.INTELLIGENCE_GATEWAY_WS_URL ||
-              MANAGED_INTELLIGENCE_GATEWAY_WS_URL,
-            model: resumedModel,
-            harness: resumedHarness,
-            ...(configured.values.OPENBOT_ORGANIZATION_AUTH_URL
-              ? {
-                  organizationAuthUrl:
-                    configured.values.OPENBOT_ORGANIZATION_AUTH_URL,
-                }
-              : {}),
-          });
-          if (!active) return;
-          setSteps((current) => settleProgress(current));
-          setRunning(true);
-          setRecoveryFailure(null);
-          await invoke("show_openbot");
-        } catch (error) {
-          if (active) recoverFromStart(error);
-        } finally {
-          if (active) {
-            setBusy(false);
-            setResuming(false);
-          }
-        }
+        // Nor one asked to change the AI connection: the new choice is what starts it.
+        if (interrupted || configured.autoStart === false || changeAiConnection)
+          return;
+        // Intelligence must report ready and licensed first, which only its screen asks.
+        if (configured.localEval.connected) setLocalAutoStart(true);
       })
       .catch((error) => {
         if (active) recoverFromStart(error);
@@ -521,12 +476,16 @@ export function App() {
       active = false;
       stop.then((unlisten) => unlisten());
     };
-  }, [loadConfiguredRoot, recoverFromStart]);
+  }, [recoverFromStart]);
 
-  async function install() {
-    if (busy || !root.trim()) return;
+  /** True when the installation completed. */
+  async function install(nextHarness = harness): Promise<boolean> {
+    if (busy || !root.trim()) return false;
+    const installationKey = installationKeyFor(root, nextHarness);
     setBusy(true);
     setFailure(null);
+    setRecoveryFailure(null);
+    setInstallSince(Date.now());
     setSteps([
       {
         step: "engine",
@@ -537,33 +496,137 @@ export function App() {
     ]);
     setPreparation({ key: installationKey, status: "preparing" });
     try {
-      await invoke("prepare_installation", { root: root.trim(), harness });
+      await invoke("prepare_installation", {
+        root: root.trim(),
+        harness: nextHarness,
+      });
       setSteps((current) => settleProgress(current));
       setPreparation({ key: installationKey, status: "complete" });
+      return true;
     } catch (error) {
       const problem = asProblem(error);
       setSteps((current) => settleProgress(current, problem));
       setPreparation({ key: installationKey, status: "failed" });
       setFailure(problem);
+      // Only a Windows restart fixes this one: the restart screen, not a Try again that can't work.
+      if (problem.restart_windows) {
+        setRestartLede(SETUP_NEEDS_RESTART);
+        setRestartPending(true);
+      }
+      // The failure is the person's to act on, wherever they went while it installed.
+      comeForward("the installation failed");
+      return false;
     } finally {
       setBusy(false);
     }
   }
 
-  async function start(nextModel = model) {
+  /*
+   * Setup installs on the first screen's click, with the default Bot in the default folder: one
+   * installation per computer. It needs no CopilotKit account, so it runs while the person signs
+   * in; only Intelligence waits for the agreement. Once it completes, Intelligence sets up behind
+   * the AI provider screen rather than after it. An installation already complete for the default
+   * Bot is not installed again.
+   */
+  const localInstall = useRef<Promise<boolean> | null>(null);
+  /** `again`: what was recorded as installed is not what this app starts, so install anyway. */
+  function beginLocalInstall(again = false): Promise<boolean> {
+    if (localInstall.current) return localInstall.current;
+    const choice = { id: DEFAULT_HARNESS };
+    setHarness(choice);
+    if (
+      !again &&
+      preparation?.key === installationKeyFor(root, choice) &&
+      preparation.status === "complete"
+    ) {
+      return Promise.resolve(true);
+    }
+    const started = install(choice).then((ok) => {
+      // A failed install is started again by the next Install, not remembered.
+      if (!ok) localInstall.current = null;
+      return ok;
+    });
+    localInstall.current = started;
+    return started;
+  }
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs once per refused Start.
+  useEffect(() => {
+    // Once the refused Start has let go: Install will not begin while the window is busy.
+    if (!reinstall || busy) return;
+    setReinstall(false);
+    // What was recorded as installed is not what this app starts, so it is installed again.
+    localInstall.current = null;
+    setPreparation(null);
+    void installLocally(true);
+  }, [reinstall, busy]);
+
+  /*
+   * Start carries on by itself after an install Start asked for, and has not started since. A Start
+   * refused again then is said, rather than installing and starting round in a loop. The ref is for
+   * the Start's own answer; the state is what starts it, through the same go-ahead as auto-start,
+   * so the two never both start it.
+   */
+  const startedAfterReinstall = useRef(false);
+  const [resumingStart, setResumingStart] = useState(false);
+
+  /**
+   * Shows the install until it completes, then the AI provider screen.
+   *
+   * `again` is the install a refused Start asked for. Nothing about the AI connection changed, so
+   * one already saved is not asked for again: Start carries on with it. A saved connection that no
+   * longer works is refused at Start, which sends the person to the AI screen for it.
+   */
+  async function installLocally(again = false) {
+    setStep("install");
+    if (!(await beginLocalInstall(again))) return;
+    // The person was waiting on the install, and what comes next is theirs: the AI screen, or
+    // Start carrying on. In front, wherever they went while it installed.
+    comeForward("the installation is complete");
+    setSteps([]);
+    if (
+      again &&
+      !startedAfterReinstall.current &&
+      modelCanStart(chosenModel.current)
+    ) {
+      startedAfterReinstall.current = true;
+      setResumingStart(true);
+      setStep("connect");
+      return;
+    }
+    setStep("model");
+  }
+
+  /**
+   * Starts OpenBot against a ready Intelligence.
+   *
+   * `started` only when OpenBot started. `deferred` when it has to be installed first: the window
+   * goes to the install, and Start is asked for again after it. `failed` for anything else.
+   */
+  async function start(
+    nextModel = model,
+    intelligence: LocalStartable | null = null,
+  ): Promise<StartOutcome> {
     if (!installationReady) {
       setStep("install");
-      return;
+      return "deferred";
+    }
+    // OpenBot starts only from a stack its CLI reports ready and licensed.
+    if (!intelligence) {
+      setStep("connect");
+      return "deferred";
     }
     setBusy(true);
     setFailure(null);
+    setReleaseNotice(null);
+    setBackEndNotice(null);
     setSteps([]);
     try {
-      await invoke("start_stack", {
+      const startWith = {
         root: root.trim(),
-        apiUrl,
-        gatewayWsUrl: wsUrl,
-        apiKey,
+        // The key `local connect` gave OpenBot is in the vault; Start takes it from there.
+        apiUrl: intelligence.apiUrl,
+        gatewayWsUrl: intelligence.gatewayWsUrl,
         // The whole answer from the model screen, so the Rust side decides which keys that
         // implies. Sending a bare key here is what made `ANTHROPIC_API_KEY` and a plan token
         // expressible at the same time.
@@ -571,43 +634,62 @@ export function App() {
         // By id only. The image, the port and how it is dialled are facts about the harness, and
         // the window carrying them would be a second list to keep in step with the catalogue.
         harness,
-        ...(organizationAuthorityUrl !== null
-          ? { organizationAuthUrl: organizationAuthorityUrl }
-          : {}),
-      });
+      };
+      // The installation runs this app's own release: one that does not is upgraded as part of
+      // this Start. An upgrade that fails is undone and the version it had starts instead.
+      const asked =
+        releaseDueAsked.current?.root === root.trim()
+          ? releaseDueAsked.current.answer
+          : null;
+      // Asked afresh by the next Start.
+      releaseDueAsked.current = null;
+      const due = await (asked ??
+        invoke<ReleaseMove | null>("upgrade_due", {
+          root: root.trim(),
+        }).catch(() => null));
+      let outcome: ReleaseOutcome | null = null;
+      if (due) {
+        outcome = await invoke<ReleaseOutcome>("upgrade_and_start", startWith);
+      } else {
+        await invoke("start_stack", startWith);
+      }
       setSteps((current) => settleProgress(current));
       setRunning(true);
       setRecoveryFailure(null);
-      // Refreshing credentials does not turn an existing installation into a first run.
-      if (
-        savedLaunch.current === installationKey ||
-        organizationAuthorityUrl?.trim()
-      ) {
-        savedLaunch.current = installationKey;
-        setStep("connect");
-        setRefreshIntelligence(false);
-        await invoke("show_openbot");
-        return;
+      startedAfterReinstall.current = false;
+      // The handover, on a first run as on a return: the window becomes OpenBot the moment the
+      // stack is up. Recorded first, so a later Start of this installation reads as a return.
+      savedLaunch.current = installationKey;
+      setStep("connect");
+      setRefreshIntelligence(false);
+      // An upgrade that did not happen is said on the running screen first; Show OpenBot hands over.
+      // So is a back end that runs the release it had because its own update did not finish.
+      if (outcome?.notice || intelligence.notice) {
+        // The notice says what the rows would: it is the one thing on the screen.
+        setSteps([]);
+        setReleaseNotice(outcome?.notice ?? null);
+        setBackEndNotice(intelligence.notice ?? null);
+        return "started";
       }
-      /*
-       * One screen short of the handover, on purpose.
-       *
-       * The window used to become OpenBot here, the moment the stack was up. But up is not the
-       * same as working: a refused key or a lapsed plan gives a stack that starts clean and a Bot
-       * that cannot answer, and handing over at this point means somebody discovers that inside
-       * the product with no idea which of their answers caused it. So the last screen asks a
-       * question, and the handover waits for an answer to come back.
-       */
-      setStep("ask");
+      await invoke("show_openbot");
+      return "started";
     } catch (error) {
       recoverFromStart(error);
+      // Refused until OpenBot is installed again, which the window now does by itself and then
+      // starts. Only once: refused again straight after that install, it is a failure.
+      return asProblem(error).connection === "installation" &&
+        !startedAfterReinstall.current
+        ? "deferred"
+        : "failed";
     } finally {
       setBusy(false);
-      invoke<EngineStatus>("detect_engine")
-        .then(setEngine)
-        .catch(() => undefined);
+      // A Start carried on after its install has run, whatever it answered.
+      setResumingStart(false);
     }
   }
+
+  // OpenBot's own updates. The installation follows the app: Start upgrades it to the app's release.
+  const appUpdates = <CheckForUpdates />;
 
   /** The leftovers go first, then Start carries on: starting fresh is one choice, not two. */
   async function startFresh(volumes: string[], containers: string[]) {
@@ -629,164 +711,184 @@ export function App() {
     setFailure(null);
     setRecoveryFailure(null);
     setSteps([]);
-    await start();
+    // Start again from the step that stopped, with the stack's addresses it already has.
+    local.retry();
   }
 
-  function modelCanStart() {
-    if (!model) return false;
-    if (!model.saved) return true;
-    if (model.provider === "google" || model.provider === "xai") {
-      return model.login === "oauth" && Boolean(model.model?.trim());
+  /** The model chosen can start OpenBot: a saved one must be complete enough to use. */
+  function modelCanStart(choice = model) {
+    if (!choice) return false;
+    if (!choice.saved) return true;
+    if (choice.provider === "google" || choice.provider === "xai") {
+      return choice.login === "oauth" && Boolean(choice.model?.trim());
     }
-    if (model.provider === "openai-compatible") {
+    if (choice.provider === "openai-compatible") {
       return (
-        model.login === "endpoint" &&
-        isHttpEndpointUrl(model.baseUrl ?? "") &&
-        Boolean(model.model?.trim())
+        choice.login === "endpoint" &&
+        isHttpEndpointUrl(choice.baseUrl ?? "") &&
+        Boolean(choice.model?.trim())
       );
     }
-    if (model.provider !== "openai" && model.provider !== "anthropic") {
+    if (choice.provider !== "openai" && choice.provider !== "anthropic") {
       return false;
     }
-    return model.login === "plan" || model.login === "api-key";
+    return choice.login === "plan" || choice.login === "api-key";
+  }
+
+  /** True when OpenBot stopped, even if the local Intelligence stack it started did not. */
+  async function stopStack(): Promise<boolean> {
+    try {
+      await invoke("stop_stack", { root });
+      setIntelligenceNotice(null);
+      return true;
+    } catch (error) {
+      const stopped = splitStopFailure(error);
+      if (stopped.openBot === null && stopped.intelligence !== null) {
+        setIntelligenceNotice(intelligenceStopProblem(stopped.intelligence));
+        return true;
+      }
+      setFailure(asProblem(error));
+      return false;
+    }
   }
 
   async function stop() {
     setBusy(true);
+    setStopping(true);
+    // Stopped by choice: nothing starts again on its own in this session.
+    setLocalAutoStart(false);
+    stoppedByChoice.current = true;
     try {
-      await invoke("stop_stack", { root });
-      setRunning(false);
-      setRecoveryFailure(null);
-      setStep("connect");
-      setRefreshIntelligence(false);
-    } catch (error) {
-      setFailure(asProblem(error));
+      if (await stopStack()) {
+        local.reset();
+        setRunning(false);
+        setRecoveryFailure(null);
+        setStep("connect");
+        setRefreshIntelligence(false);
+      }
     } finally {
       setBusy(false);
+      setStopping(false);
     }
   }
 
-  async function changeModelAfterAskFailure() {
-    setBusy(true);
-    setFailure(null);
+  async function showOpenBot() {
+    setShowing(true);
     try {
-      await invoke("stop_stack", { root });
-      setRunning(false);
-      setRecoveryFailure(null);
-      setStep("model");
+      await invoke("show_openbot");
     } catch (error) {
-      setFailure(asProblem(error));
+      recoverFromStart(error);
     } finally {
-      setBusy(false);
+      setShowing(false);
     }
   }
+
+  /*
+   * Starts local Intelligence without a click: a recorded stack on a first run that was not
+   * interrupted, or a connected one on relaunch with auto-start on. Never after Stop OpenBot. And a
+   * Start that waited for the install it asked for, which is carrying on, not starting anew.
+   */
+  const localAuto =
+    !checkingResume &&
+    !running &&
+    step === "connect" &&
+    modelCanStart() &&
+    (resumingStart ||
+      (!stoppedByChoice.current &&
+        (returningToInstallation
+          ? !refreshIntelligence && localAutoStart
+          : !interruptedAtLaunch.current)));
+  // biome-ignore lint/correctness/useExhaustiveDependencies: when it turns on, or a Start resumes.
+  useEffect(() => {
+    if (localAuto) local.start();
+  }, [localAuto, resumingStart]);
+
+  // The person closed macOS's password prompt: whichever screen they are on says so, with Try
+  // again, while Install asks again by itself. See `install::GoAhead`.
+  const goAhead = goAheadNow(steps);
+  // On a Mac whose own Podman OpenBot can't use: the offer to pause it while OpenBot runs, on
+  // whichever screen the person is on, with the button that says yes. See `own_machine`.
+  const pauseOffer = pauseOfferNow(steps);
+  const pauseCard = pauseOffer && (
+    <PausePodman key={pauseOffer} offer={pauseOffer} />
+  );
+
+  /*
+   * What is installing behind a screen that asks the person for something else, as one row: the
+   * account step and the AI step. It says what OpenBot is doing, how far along it is and for how
+   * long, so the screen never looks stuck while minutes of install go on behind it.
+   */
+  // The downloads the first screen started, which the background row shows while they run.
+  const earlyDownloads = useEarlyDownloads();
+  const behind = (said: { waitingFor?: string; done?: string }) =>
+    installingBehind({
+      steps,
+      installing: preparation?.status === "preparing",
+      installed: installationReady,
+      since: installSince,
+      backEnd: local,
+      early: earlyDownload(earlyDownloads),
+      ...said,
+    });
+
+  // Quit outranks every screen: the app is closing, whatever was on it.
+  const quitting = useQuitStatus(false);
+  if (quitting) return <ShuttingDown status={quitting} />;
 
   // Nothing else on this screen can be done until the machine allows it, so nothing else is shown.
   if (blockerFailure) {
     return (
       <main>
-        <h1>OpenBot could not check Windows setup</h1>
-        <Failure problem={blockerFailure} />
-      </main>
-    );
-  }
-
-  if (blocker) {
-    return (
-      <main>
-        <h1>OpenBot needs one thing first</h1>
-        <div className="blocker">
-          <h2>{titleFor(blocker)}</h2>
-          <p>{instruction}</p>
+        <div className="sheet">
+          <h1>OpenBot could not check Windows setup</h1>
+          <Failure problem={blockerFailure} />
         </div>
       </main>
     );
   }
 
-  if (resuming || checkingResume) {
+  if (restartPending) return <WindowsRestart lede={restartLede} />;
+
+  if (blocker) {
     return (
-      <main>
-        <h1>{resuming ? "Starting OpenBot" : "Opening OpenBot"}</h1>
-        <p role="status">
-          {resuming
-            ? "Opening your saved setup…"
-            : "Checking your saved setup…"}
-        </p>
-        <SetupProgress steps={steps} />
-      </main>
+      <WindowsBlocker
+        blocker={blocker}
+        instruction={instruction}
+        onRestartNeeded={() => setRestartPending(true)}
+      />
     );
   }
 
-  if (refreshOrganization) {
+  if (checkingResume) {
     return (
       <main>
-        <OrganizationSignIn
-          root={root}
-          authorityUrl={organizationAuthorityUrl ?? ""}
-          onBack={() => {
-            setRefreshOrganization(false);
-            setRefreshIntelligence(true);
-            setRunning(false);
-          }}
-          onSignedIn={async () => {
-            try {
-              await invoke("show_openbot");
-              setRefreshOrganization(false);
-              setRecoveryFailure(null);
-              setRunning(true);
-            } catch (error) {
-              recoverFromStart(error);
-            }
-          }}
-        />
-        {displayedFailure && <Failure problem={displayedFailure} />}
+        <div className="sheet connection-sheet">
+          <h1>Getting OpenBot ready</h1>
+          <p className="lede" role="status">
+            Checking your saved setup…
+          </p>
+          <SetupProgress steps={steps} />
+        </div>
       </main>
     );
   }
 
   /*
-   * Install local software before showing either sign-in. A completed installation is retained
-   * while somebody changes or retries their connection; changing its folder or Bot invalidates it.
-   *
    * Skipped entirely when a stack is already up: somebody returning to a running OpenBot is not
-   * setting one up, and asking them to pick a Bot again would be the wizard asking twice.
+   * setting one up.
    */
   if (!running && step === "welcome") {
     return (
       <main>
-        <Welcome onStart={() => setStep("harness")} />
-        {displayedFailure && <Failure problem={displayedFailure} />}
-      </main>
-    );
-  }
-
-  if (!running && step === "harness") {
-    return (
-      <main>
-        <HarnessPicker
-          chosen={harness}
-          onChoose={(choice) => {
-            if (
-              choice.id !== harness?.id ||
-              choice.agentUrl !== harness?.agentUrl
-            ) {
-              setPreparation(null);
-              setSteps([]);
-            }
-            setHarness(choice);
+        <Welcome
+          onInstall={() => {
+            // The default Bot, recorded as a choice of it would be.
+            recordSetupEvent(harnessChoiceEvent(DEFAULT_HARNESS));
+            // The account is the first screen; OpenBot installs behind it meanwhile.
+            setStep("account");
+            void beginLocalInstall();
           }}
-          onContinue={() => {
-            recordSetupEvent(
-              harnessChoiceEvent(harness?.id ?? DEFAULT_HARNESS),
-            );
-            setHarness((choice) =>
-              choice?.id === "byo-url"
-                ? { ...choice, agentUrl: choice.agentUrl?.trim() }
-                : choice,
-            );
-            setStep("install");
-          }}
-          onBack={() => setStep("welcome")}
+          failure={displayedFailure && <Failure problem={displayedFailure} />}
         />
       </main>
     );
@@ -796,108 +898,134 @@ export function App() {
     return (
       <main>
         <div className="sheet">
-          <p className="steps-of">Step 2 of 4</p>
+          <Sections at="Install" />
           <h1>
-            {installationReady ? "Installation complete" : "Install OpenBot"}
+            {installationReady ? "Installation complete" : "Installing OpenBot"}
           </h1>
           <p className="lede">
             {installationReady
-              ? "OpenBot’s local software is ready. Next, connect your AI and CopilotKit accounts."
-              : "Install the software OpenBot needs on this computer. This can take a few minutes. You’ll sign in after installation finishes."}
+              ? "OpenBot’s local software is ready. Next, connect your AI."
+              : INSTALL_BLURB}
           </p>
-          {!installationReady && engine?.responding && (
-            <p className="footnote">
-              Using {engine.engine === "docker" ? "Docker" : "Podman"} for local
-              services.
-            </p>
+          {/* Intelligence sets itself up alongside, once the install has Docker answering. Its
+              download is the list's third step, once the second is done. */}
+          <SetupProgress
+            steps={plainInstallSteps(
+              steps,
+              busy,
+              installSince,
+              !local.stopped && local.running ? local.download : null,
+            )}
+          />
+          {/* The person closed macOS's password prompt: said, with Try again. */}
+          {goAhead && <PodmanGoAhead asking={goAhead} />}
+          {pauseCard}
+          <LocalStatus sequence={local} download={false} />
+          {/* The first screen's downloads, until a row of Install's own shows the one it waits on. */}
+          {!steps.some((row) => row.running && row.downloads) && (
+            <EarlyDownloadsLine />
           )}
-          <div className="field">
-            <label htmlFor="root">Where OpenBot lives</label>
-            <input
-              id="root"
-              disabled={busy}
-              value={root}
-              onChange={(event) => {
-                configuredRunRef.current += 1;
-                setRoot(event.target.value);
-                setModel(null);
-                setPreparation(null);
-                setSteps([]);
-                clearRootScopedSavedState();
-              }}
-              onBlur={(event) => loadConfiguredRoot(event.target.value)}
-              spellCheck={false}
-            />
-          </div>
-          <SetupProgress steps={steps} />
           {displayedFailure && <Failure problem={displayedFailure} />}
-          {busy && <p role="status">Installing local software…</p>}
-          {installationReady && (
-            <details>
-              <summary>Installation options</summary>
-              <button type="button" className="quiet" onClick={install}>
-                Repair installation
-              </button>
-            </details>
-          )}
-          <div className="row">
-            <button
-              type="button"
-              className="quiet"
-              disabled={busy}
-              onClick={() => setStep("harness")}
-            >
-              Back
-            </button>
-            {installationReady ? (
+          {!busy && (
+            <div className="row">
               <button
                 type="button"
-                onClick={() => {
-                  setSteps([]);
-                  setStep("model");
-                }}
+                className="quiet"
+                onClick={() => setStep("welcome")}
               >
-                Continue to sign in
+                Back
               </button>
-            ) : (
-              <button
-                type="button"
-                disabled={busy || !root.trim()}
-                onClick={install}
-              >
-                {busy
-                  ? "Installing…"
-                  : preparation?.status === "failed"
+              {installationReady ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSteps([]);
+                    setStep("model");
+                  }}
+                >
+                  Continue to sign in
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={!root.trim()}
+                  onClick={() => installLocally()}
+                >
+                  {preparation?.status === "failed"
                     ? "Retry installation"
                     : "Install OpenBot"}
-              </button>
-            )}
-          </div>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </main>
     );
   }
 
   /*
-   * Shown while the stack is running, which every other screen is skipped for. This is the one
-   * screen that needs a running stack: it is the proof, and there is nothing to ask before there
-   * is something to ask.
+   * A first run signs in to CopilotKit and accepts the evaluation agreement as a step of its own,
+   * before anything licensed is set up. Intelligence then sets itself up behind the AI provider
+   * screen, with the version accepted here.
    */
-  if (step === "ask") {
+  if (!running && step === "account") {
     return (
       <main>
-        <Ask
-          suggestion={SUGGESTED_QUESTION}
-          onAsk={(question) =>
-            invoke<string>("ask_the_bot", { root, question })
+        <CopilotKitAccount
+          root={root.trim()}
+          // Install runs behind this step. When it opens Docker Desktop, this step says so, and
+          // while the account check waits on the engine, it says what Install is doing about it.
+          handOff={handOffNow(steps)}
+          engine={engineNow(steps)}
+          // Once signed in, the step explains the password prompt Install waits to raise.
+          goAhead={goAhead}
+          // The engine answering and new enough: until then an engine refusal waits for Install.
+          engineSettled={engineReady || installationReady}
+          engineUpdating={steps.some(
+            (row) => row.step === "engine" && row.running && row.updating,
+          )}
+          retried={setupRetries}
+          // The offer to pause the person's own Podman, said on this step while it waits.
+          pauseOffer={pauseOffer}
+          // No slot once the install has failed: its failure is in the card, and nothing will
+          // come into the slot until the person starts it again.
+          // The step says what the rest of the install waits on: it knows whether the person is
+          // signed in.
+          behind={
+            preparation?.status === "failed"
+              ? undefined
+              : (waitingFor) => behind({ waitingFor })
           }
-          onOpen={() => {
-            savedLaunch.current = installationKey;
-            invoke("show_openbot").catch((error) => recoverFromStart(error));
+          onDone={(acceptedVersion) => {
+            if (acceptedVersion) local.acceptTerms(acceptedVersion);
+            // Intelligence sets itself up once the install has Docker answering; see above. The
+            // install may have got there during sign-in, and that change has already been seen.
+            if (engineReady || installationReady) local.prepare();
+            else intelligenceQueued.current = true;
+            if (installationReady) {
+              setSteps([]);
+              setStep("model");
+            } else void installLocally();
           }}
-          onBack={changeModelAfterAskFailure}
+          failure={
+            displayedFailure && (
+              <Failure
+                problem={displayedFailure}
+                // The install behind this step failed: Try again runs it again, its check of the
+                // software OpenBot runs on and any update or restart included. Nothing else on this
+                // step would, and the account check waits on that software meanwhile.
+                onRetry={
+                  failure && preparation?.status === "failed"
+                    ? () => {
+                        setSetupRetries((count) => count + 1);
+                        void beginLocalInstall();
+                      }
+                    : undefined
+                }
+              />
+            )
+          }
         />
-        {displayedFailure && <Failure problem={displayedFailure} />}
       </main>
     );
   }
@@ -911,79 +1039,231 @@ export function App() {
           chosen={model}
           returning={returningToInstallation}
           busy={busy}
+          status={
+            returningToInstallation ? (
+              <LocalStatus sequence={local} />
+            ) : (
+              <BehindSlot>
+                <BehindRow
+                  row={behind({
+                    done: "OpenBot starts as soon as you connect your AI.",
+                  })}
+                />
+                <LocalStatus sequence={local} download={false} />
+              </BehindSlot>
+            )
+          }
+          onInstallRequired={(problem, choice) => {
+            // The record is from an earlier run. Install again, keeping the provider chosen.
+            localInstall.current = null;
+            setPreparation(null);
+            setSteps([]);
+            setModel(choice);
+            setRecoveryFailure(problem);
+            setStep("install");
+          }}
           onChoose={(choice) => {
             recordSetupEvent(modelChoiceEvent(choice));
+            chosenModel.current = choice;
             setModel(choice);
-            if (returningToInstallation) void start(choice);
-            else setStep("connect");
-          }}
-          onBack={() => {
+            // The go-ahead: OpenBot starts once Intelligence is ready, wherever it has got to.
             setSteps([]);
-            setStep(returningToInstallation ? "connect" : "install");
+            setStep("connect");
+            local.start();
+            // A Start the previous model was refused at stopped there: try it again with this one.
+            if (local.stopped && local.at === "start") local.retry();
+          }}
+          // A first run has nothing behind this screen to go back to.
+          onBack={
+            returningToInstallation
+              ? () => {
+                  setSteps([]);
+                  setStep("connect");
+                }
+              : undefined
+          }
+          failure={displayedFailure && <Failure problem={displayedFailure} />}
+          // A failure from the provider tried before is not about the one chosen now.
+          onProviderChange={() => {
+            setFailure(null);
+            setRecoveryFailure(null);
           }}
         />
-        {displayedFailure && <Failure problem={displayedFailure} />}
       </main>
     );
   }
 
+  const localStarting = local.running;
+  // Start is moving the deployment to this app's release: said while it runs, which can be minutes.
+  const updating = busy
+    ? [...steps]
+        .reverse()
+        .find(
+          (row) =>
+            (row.step === "release" || row.step === "update-images") &&
+            row.running,
+        )
+    : undefined;
+  // One row while it updates, with its download's bar once there is one: "Installing OpenBot" sat
+  // unchanged for minutes while the update's software downloaded. Not while the Start journey
+  // shows, whose one bar counts the update too (`StartJourney`).
+  const updatingLine = updating && !(local.running && !local.stopped) && (
+    <SetupProgress
+      label="Update progress"
+      steps={[
+        {
+          step: "Updating OpenBot",
+          ok: true,
+          running: true,
+          detail: updating.detail,
+          unpacking: "Unpacking the update",
+          downloads: steps.find((row) => row.step === "images" && row.running)
+            ?.downloads,
+        },
+      ]}
+    />
+  );
+  // Docker Desktop opened, or the engine machine started, before the back end starts, as after a
+  // restart: said under the rows.
+  const handOff = engineNow(steps);
+
   if (!running && returningToInstallation && !refreshIntelligence) {
     return (
       <main>
-        <h1>OpenBot is stopped</h1>
-        <p className="lede">
-          Your installation and saved connections are ready to reopen.
-        </p>
-        <SetupProgress steps={steps} />
-        {displayedFailure && <Failure problem={displayedFailure} />}
-        <button
-          type="button"
-          disabled={busy || !installationReady || !modelCanStart()}
-          onClick={() => start()}
-        >
-          {busy ? "Starting…" : "Start OpenBot"}
-        </button>
-        <button
-          type="button"
-          className="quiet"
-          disabled={busy}
-          onClick={() => setStep("model")}
-        >
-          Change AI connection
-        </button>
-        <button
-          type="button"
-          className="quiet"
-          disabled={busy}
-          onClick={() => setRefreshIntelligence(true)}
-        >
-          Change CopilotKit connection
-        </button>
-        {displayedFailure && (
-          <button
-            type="button"
-            className="quiet"
-            disabled={busy}
-            onClick={install}
-          >
-            Repair installation
-          </button>
-        )}
-        <details>
-          <summary>Installation options</summary>
-          <button
-            type="button"
-            className="quiet"
-            disabled={busy}
-            onClick={() => {
-              setPreparation(null);
-              setSteps([]);
-              setStep("install");
-            }}
-          >
-            Change installation
-          </button>
-        </details>
+        <div className="sheet connection-sheet">
+          <h1>{localStarting ? "Starting OpenBot" : "OpenBot is stopped"}</h1>
+          <p className="lede">
+            {localStarting
+              ? // No time of its own: the card under it says how long is left, from how long each
+                // part takes. "This usually takes a minute or two" sat over "About 3 minutes left"
+                // on Windows G, and the start took four.
+                "OpenBot is getting ready and opens by itself."
+              : "Your installation and saved connections are ready to reopen."}
+          </p>
+          <LocalIntelligence
+            sequence={local}
+            offerStart
+            handOff={handOff}
+            open={steps}
+            releaseDue={releaseDue}
+          />
+          {goAhead && <PodmanGoAhead asking={goAhead} />}
+          {pauseCard}
+          {updatingLine}
+          {displayedFailure && <Failure problem={displayedFailure} />}
+          {/* While a local step runs, its Cancel is the only control. */}
+          {!localStarting && (
+            <>
+              <div className="row">
+                <button
+                  type="button"
+                  className="quiet"
+                  disabled={busy}
+                  onClick={() => setStep("model")}
+                >
+                  Change AI connection
+                </button>
+                {displayedFailure && (
+                  <button
+                    type="button"
+                    className="quiet"
+                    disabled={busy}
+                    onClick={() => install()}
+                  >
+                    Repair installation
+                  </button>
+                )}
+              </div>
+              {appUpdates}
+              <details>
+                <summary>Installation options</summary>
+                <button
+                  type="button"
+                  className="quiet"
+                  disabled={busy}
+                  onClick={() => {
+                    setPreparation(null);
+                    setSteps([]);
+                    setStep("install");
+                  }}
+                >
+                  Change installation
+                </button>
+              </details>
+            </>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+  /*
+   * The Start step: Intelligence's rows, and OpenBot starts by itself once the CLI reports it ready
+   * and valid. While a CLI call runs, Cancel is the only control; leaving is offered only once
+   * nothing runs.
+   */
+  if (!running) {
+    return (
+      <main>
+        <div className="sheet connection-sheet">
+          {!returningToInstallation && <Sections at="Start" />}
+          {/* Not "Getting ready" over a "Getting OpenBot ready" row: Windows F read them as one. */}
+          <h1>Finishing setup</h1>
+          <p className="lede">
+            {leftoverVolumes.length > 0
+              ? "OpenBot starts once you choose what happens to the data a previous installation left."
+              : "OpenBot is setting up on this computer and starts by itself when it’s ready. This can take a few minutes."}
+          </p>
+          <LocalIntelligence
+            sequence={local}
+            offerStart
+            handOff={handOff}
+            open={steps}
+            releaseDue={releaseDue}
+            // A choice for the person, not a failure: the step waits on it, with no Retry.
+            waitingOn={
+              leftoverVolumes.length > 0
+                ? "Choose below what happens to the previous installation’s data."
+                : null
+            }
+          />
+          {/* In the card under its rows, as every other choice the step waits on. On Windows F it
+              sat above the card's own header and pushed "Finishing setup" down 300 px. */}
+          {leftoverVolumes.length > 0 && (
+            <StartFresh
+              key={`${root}:${leftoverVolumes.join(",")}:${leftoverContainers.join(",")}`}
+              busy={busy}
+              containers={leftoverContainers}
+              database={Boolean(displayedFailure?.database_reset)}
+              volumes={leftoverVolumes}
+              onStartFresh={startFresh}
+            />
+          )}
+          {goAhead && <PodmanGoAhead asking={goAhead} />}
+          {pauseCard}
+          {updatingLine}
+          {/* Leftover data is a choice, offered above, not a failure to report here. */}
+          {displayedFailure && leftoverVolumes.length === 0 && (
+            <Failure problem={displayedFailure} />
+          )}
+          {!local.running && !busy && (
+            <div className="row">
+              <button
+                type="button"
+                className="quiet"
+                onClick={() =>
+                  returningToInstallation
+                    ? setRefreshIntelligence(false)
+                    : setStep("model")
+                }
+              >
+                Back
+              </button>
+            </div>
+          )}
+          {/* The last thing setup asks, at the foot of its last screen: whether to share usage data. */}
+          {!returningToInstallation && <UsageDataChoice />}
+        </div>
       </main>
     );
   }
@@ -994,377 +1274,68 @@ export function App() {
         {/* A failure outranks `running`. The supervisor gives up on a process and sends the window
           back here, and a heading that still says everything is running while the box underneath
           names the process that stopped is a screen arguing with itself. */}
-        {!running && leftoverVolumes.length > 0 && (
-          <StartFresh
-            key={`${root}:${leftoverVolumes.join(",")}:${leftoverContainers.join(",")}`}
-            busy={busy}
-            containers={leftoverContainers}
-            database={Boolean(displayedFailure?.database_reset)}
-            volumes={leftoverVolumes}
-            onStartFresh={startFresh}
-          />
+        <h1>{displayedFailure ? "OpenBot stopped" : "OpenBot is running"}</h1>
+        {/* The back end runs the release it had: information, said where the lede goes. Nothing
+          failed, so it is not drawn as a failure and offers no help. */}
+        {!displayedFailure && backEndNotice && (
+          <p className="lede" role="status">
+            {backEndNotice}
+          </p>
         )}
-
-        {!running && !returningToInstallation && (
-          <p className="steps-of">Step 4 of 4</p>
+        {!displayedFailure && !releaseNotice && !backEndNotice && (
+          <p className="lede">
+            OpenBot is open in this window. You can also show it or stop it from
+            its icon in {trayPlace()}.
+          </p>
         )}
-        <h1>
-          {running && !displayedFailure
-            ? "OpenBot is running"
-            : returningToInstallation
-              ? "Refresh your CopilotKit connection"
-              : "Connect to CopilotKit"}
-        </h1>
-        <p className="lede">
-          {running && !displayedFailure
-            ? "The stack is up. OpenBot is in this window; the menu bar has it too, and stops it."
-            : returningToInstallation
-              ? "Update this connection to reopen your existing OpenBot."
-              : "Local installation is complete. Connect CopilotKit, then start OpenBot."}
-        </p>
-
-        {!running && (
-          <fieldset className="connection-form" disabled={busy}>
-            {/*
-            Sign in on the main path; paste behind the disclosure.
-
-            This screen used to ask for a key whose only source was two terminal commands, which is
-            the one thing the audience rule forbids. Somebody on managed CopilotKit now signs in and
-            OpenBot creates the key for the project they pick. Somebody running their own
-            Intelligence has a key this sign-in knows nothing about, so the field moves down there
-            with the addresses it belongs with.
-          */}
-            {apiKey && !signingIn && !projects ? (
-              <>
-                <p className="lede">
-                  {intelligenceSignInKind === "self-hosted"
-                    ? "Connected to Intelligence."
-                    : "Connected to CopilotKit."}
-                </p>
-                {returningToInstallation && (
-                  <button
-                    type="button"
-                    className="quiet"
-                    onClick={signInToCopilotKit}
-                  >
-                    Sign in to CopilotKit again
-                  </button>
-                )}
-              </>
-            ) : (alreadyHeld.saved?.intelligenceApiKey || reuseIntelligence) &&
-              !signingIn &&
-              !projects ? (
-              <>
-                <p className="lede">
-                  A saved CopilotKit connection will be checked when you start.
-                </p>
-                <button
-                  type="button"
-                  className="quiet"
-                  onClick={signInToCopilotKit}
-                >
-                  Sign in to CopilotKit again
-                </button>
-              </>
-            ) : signInUrl ? (
-              <>
-                <p className="lede">
-                  Finish signing in to CopilotKit in your browser. If it did not
-                  open, this is the address:
-                </p>
-                {/* Selectable text, not a link: the browser has already been asked to open it, and
-                  what is needed here is something a person can copy. */}
-                <p className="footnote" style={{ userSelect: "text" }}>
-                  {signInUrl}
-                </p>
-                <p className="footnote">Waiting for you to approve it…</p>
-              </>
-            ) : projects ? (
-              <>
-                <p className="lede">Which project should OpenBot use?</p>
-                <fieldset className="picker">
-                  <legend className="sr-only">Project</legend>
-                  {projects.map((project) => (
-                    <button
-                      type="button"
-                      key={project.id}
-                      className="tile project-choice"
-                      disabled={signingIn}
-                      onClick={() => pickProject(project.id)}
-                    >
-                      <span className="tile-name">{project.name}</span>
-                    </button>
-                  ))}
-                </fieldset>
-                {projects.length === 0 && (
-                  <>
-                    <p className="footnote">
-                      {intelligenceSignInKind === "self-hosted"
-                        ? "That account has no available projects. Ask your Intelligence administrator for access, or sign in with a different account."
-                        : "That account has no projects yet. Create one below, or sign in with a different account."}
-                    </p>
-                    <button
-                      type="button"
-                      className="quiet"
-                      disabled={signingIn}
-                      onClick={
-                        intelligenceSignInKind === "self-hosted"
-                          ? signInToSelfHostedIntelligence
-                          : signInToCopilotKit
-                      }
-                    >
-                      {signingIn
-                        ? "Waiting for your browser…"
-                        : "Sign in again"}
-                    </button>
-                  </>
-                )}
-                {intelligenceSignInKind === "managed" && (
-                  <form
-                    className="new-project-form"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void createProject();
-                    }}
-                  >
-                    <div className="field">
-                      <label htmlFor="new-project-name">New project name</label>
-                      <input
-                        id="new-project-name"
-                        value={projectName}
-                        onChange={(event) => setProjectName(event.target.value)}
-                        disabled={signingIn}
-                        autoComplete="off"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      className={projects.length > 0 ? "quiet" : undefined}
-                      disabled={signingIn || !projectName.trim()}
-                    >
-                      {creatingProject ? "Creating project…" : "Create project"}
-                    </button>
-                  </form>
-                )}
-              </>
-            ) : (
-              <>
-                <p className="lede">
-                  OpenBot keeps your conversations in CopilotKit. Sign in and it
-                  sets the rest up for you.
-                </p>
-                <div className="row connection-actions">
-                  <button
-                    type="button"
-                    disabled={signingIn}
-                    onClick={signInToCopilotKit}
-                  >
-                    {signingIn
-                      ? "Waiting for your browser…"
-                      : "Sign in to CopilotKit"}
-                  </button>
-                  {!apiKey &&
-                    !reuseIntelligence &&
-                    alreadyHeld.saved?.intelligenceApiKey == null &&
-                    !signingIn && (
-                      <button
-                        type="button"
-                        className="quiet"
-                        onClick={() => setReuseIntelligence(true)}
-                      >
-                        Use a saved connection
-                      </button>
-                    )}
-                </div>
-              </>
-            )}
-            {/*
-            This used to be headed "Self-hosted Intelligence" over two fields pre-filled with the
-            MANAGED service's addresses, which says the opposite of what it does: somebody opening
-            it to check where their data goes read "self-hosted" and saw CopilotKit's own hosts.
-            The heading now describes the action, and the note says what the defaults are.
-          */}
-            <details>
-              <summary>Point at your own Intelligence server</summary>
-              <p className="footnote" style={{ margin: "0.6rem 0 0.75rem" }}>
-                Enter your Intelligence server’s addresses, then sign in to
-                choose a project. OpenBot creates its Learning container for
-                you. Sign-in requires Chrome or Microsoft Edge. You can also use
-                an existing project key.
-              </p>
-              <div className="field">
-                <label htmlFor="key">Project key</label>
-                <input
-                  id="key"
-                  disabled={selfHostedActive}
-                  type="password"
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                  placeholder="the key from your own Intelligence"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="field" style={{ marginTop: "0.75rem" }}>
-                <label htmlFor="api">API URL</label>
-                <input
-                  id="api"
-                  disabled={selfHostedActive}
-                  value={apiUrl}
-                  onChange={(event) => setApiUrl(event.target.value)}
-                  spellCheck={false}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="ws">Gateway WebSocket URL</label>
-                <input
-                  id="ws"
-                  value={wsUrl}
-                  onChange={(event) => setWsUrl(event.target.value)}
-                  spellCheck={false}
-                />
-              </div>
-              <div className="row connection-actions">
-                <button
-                  type="button"
-                  disabled={signingIn || selfHostedActive || !apiUrl.trim()}
-                  onClick={signInToSelfHostedIntelligence}
-                >
-                  Sign in to Intelligence
-                </button>
-                {selfHostedActive && (
-                  <button
-                    type="button"
-                    className="quiet"
-                    onClick={cancelSelfHostedSignIn}
-                  >
-                    Cancel Intelligence sign-in
-                  </button>
-                )}
-              </div>
-              {selfHostedActive && signingIn && !projects && (
-                <p className="footnote" role="status">
-                  Finish signing in in the Intelligence browser window…
-                </p>
-              )}
-            </details>
-            <details>
-              <summary>Sign in through your organization</summary>
-              <p className="footnote">
-                Enter your organization’s OpenBot address to use its sign-in and
-                access rules.
-              </p>
-              <div className="field">
-                <label htmlFor="organization-authority">
-                  Organization OpenBot URL
-                </label>
-                <input
-                  id="organization-authority"
-                  value={organizationAuthorityUrl ?? ""}
-                  onChange={(event) =>
-                    setOrganizationAuthorityUrl(event.target.value)
-                  }
-                  placeholder="https://openbot.your-company.com"
-                  spellCheck={false}
-                />
-              </div>
-            </details>
-          </fieldset>
+        {/* Start went back to the version this installation had. Said before handing over. */}
+        {!displayedFailure && releaseNotice && (
+          <InlineFailure problem={releaseNotice} />
         )}
-
-        <SetupProgress steps={steps} />
-
-        {/* Leftover data is a choice, offered above, not a failure to report here. */}
-        {displayedFailure && leftoverVolumes.length === 0 && (
-          <Failure problem={displayedFailure} />
-        )}
-
-        {!running && !returningToInstallation && (
-          <details>
-            <summary>Installation options</summary>
-            <button
-              type="button"
-              className="quiet"
-              disabled={busy || signingIn}
-              onClick={() => {
-                setPreparation(null);
-                setSteps([]);
-                setStep("install");
-              }}
-            >
-              Change installation
-            </button>
-          </details>
-        )}
+        {/* The start's rows only when something failed, to show where. Once OpenBot runs they are
+          all done, and they flashed for the moment before it opened with the native side's own
+          words ("settings written, credentials stored"). */}
+        {displayedFailure && <SetupProgress steps={steps} />}
+        {displayedFailure && <Failure problem={displayedFailure} />}
+        {stopping && <StatusLine>Stopping OpenBot…</StatusLine>}
+        {showing && <StatusLine>Loading OpenBot…</StatusLine>}
         <div className="row">
-          {!running && (
-            <button
-              type="button"
-              className="quiet"
-              disabled={busy || signingIn}
-              onClick={() =>
-                returningToInstallation
-                  ? setRefreshIntelligence(false)
-                  : setStep("model")
-              }
-            >
-              Back
-            </button>
-          )}
-          {running ? (
-            <>
-              <button
-                type="button"
-                /*
-                 * The refusal is shown, not swallowed.
-                 *
-                 * `show_openbot` answers with "OpenBot is not answering on port 3010 yet, so there
-                 * is nothing to show" when the app host process is not up, and this button dropped
-                 * it on the floor. Clicking it then did nothing at all, on a screen headed "OpenBot
-                 * is running", which is the worst of both: a true sentence was available and the
-                 * window threw it away. The Ask screen's copy of this call always showed it.
-                 */
-                onClick={() =>
-                  invoke("show_openbot").catch((error) =>
-                    recoverFromStart(error),
-                  )
-                }
-              >
-                Show OpenBot
-              </button>
-              <button
-                type="button"
-                className="quiet"
-                onClick={stop}
-                disabled={busy}
-              >
-                Stop OpenBot
-              </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              onClick={() => start()}
-              // The model is answered by its own screen now, so what is checked here is that it was
-              // answered at all, not that some field on this screen is non-empty.
-              disabled={
-                busy ||
-                signingIn ||
-                !installationReady ||
-                (apiKey.trim() === "" &&
-                  !alreadyHeld.saved?.intelligenceApiKey &&
-                  !reuseIntelligence) ||
-                !modelCanStart() ||
-                root.trim() === ""
-              }
-            >
-              {busy ? "Working…" : "Start OpenBot"}
-            </button>
-          )}
+          <button
+            type="button"
+            /*
+             * The refusal is shown, not swallowed.
+             *
+             * `show_openbot` answers with "OpenBot is not answering on port 3010 yet, so there is
+             * nothing to show" when the app host process is not up, and this button dropped it on
+             * the floor. Clicking it then did nothing at all, on a screen headed "OpenBot is
+             * running", which is the worst of both: a true sentence was available and the window
+             * threw it away.
+             */
+            onClick={showOpenBot}
+            disabled={busy || showing}
+          >
+            Show OpenBot
+          </button>
+          <button
+            type="button"
+            className="quiet"
+            onClick={stop}
+            disabled={busy || showing}
+          >
+            Stop OpenBot
+          </button>
         </div>
+        {/* Under the buttons, as on the stopped screen. A disclosure draws a rule above itself, and
+          first in the card it opened the card on a line with nothing above it. */}
+        {returningToInstallation && appUpdates}
       </div>
     </main>
   );
+}
+
+/** The background install's row, when there is one. */
+function BehindRow({ row }: { row: Progress | null }) {
+  return row && <SetupProgress steps={[row]} label="Background install" />;
 }
 
 function settleProgress(steps: Progress[], problem?: Problem): Progress[] {
@@ -1378,116 +1349,4 @@ function settleProgress(steps: Progress[], problem?: Problem): Progress[] {
         }
       : step,
   );
-}
-
-function SetupProgress({ steps }: { steps: Progress[] }) {
-  if (steps.length === 0) return null;
-  return (
-    <ol className="steps" aria-label="Setup progress" aria-live="polite">
-      {steps.map((step) => (
-        <SetupProgressRow key={step.step} step={step} />
-      ))}
-    </ol>
-  );
-}
-
-function SetupProgressRow({ step }: { step: Progress }) {
-  const [elapsed, setElapsed] = useState(0);
-  const running = step.running ?? false;
-  useEffect(() => {
-    if (!running) return;
-    const started = Date.now();
-    setElapsed(0);
-    const timer = setInterval(
-      () => setElapsed(Math.floor((Date.now() - started) / 1000)),
-      1000,
-    );
-    return () => clearInterval(timer);
-  }, [running]);
-  return (
-    <li className="step" aria-label={label(step.step)}>
-      <span
-        className={`mark ${running ? "active" : step.ok ? "good" : "bad"}`}
-        aria-hidden="true"
-      >
-        {running ? <span className="step-spinner" /> : step.ok ? "✓" : "✗"}
-      </span>
-      <span className="step-label">{label(step.step)}</span>
-      <span className="step-status">
-        {running ? "In progress" : step.ok ? "Complete" : "Failed"}
-        {running && (
-          <span className="step-elapsed" aria-hidden="true" aria-live="off">
-            {" · "}
-            {elapsed < 60
-              ? `${elapsed}s`
-              : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`}{" "}
-            elapsed
-          </span>
-        )}
-      </span>
-      <span className="detail">
-        {step.detail}
-        {step.downloadBytes != null &&
-          ` ${formatDownloadBytes(step.downloadBytes)} downloaded.`}
-      </span>
-    </li>
-  );
-}
-
-function formatDownloadBytes(bytes: number): string {
-  if (bytes < 1000) return `${bytes} B`;
-  const units = ["kB", "MB", "GB", "TB"];
-  const power = Math.min(Math.floor(Math.log10(bytes) / 3), units.length);
-  return `${(bytes / 1000 ** power).toFixed(1)} ${units[power - 1]}`;
-}
-
-function titleFor(blocker: Blocker): string {
-  switch (blocker) {
-    case "wsl-absent":
-      return "Windows Subsystem for Linux is not installed";
-    case "wsl-one":
-      return "Windows Subsystem for Linux is at version 1";
-    case "virtual-machine-platform-disabled":
-      return "Virtual Machine Platform is switched off";
-    case "virtualization-disabled":
-      return "Virtualization is off in this machine's firmware";
-    case "not-administrator":
-      return "This account cannot install Windows components";
-  }
-}
-
-function label(step: string): string {
-  switch (step) {
-    case "engine":
-    case "install-engine":
-      return "Container engine";
-    case "create-machine":
-      return "Engine machine";
-    case "start-machine":
-      return "Starting the machine";
-    case "health-gate":
-      return "Engine answering";
-    case "deployment":
-      return "Deployment";
-    case "env":
-      return "Settings";
-    case "ports":
-      return "Ports";
-    case "dependencies":
-      return "Dependencies";
-    case "recorder":
-      return "Recorder";
-    case "images":
-      return "Local software";
-    case "installation":
-      return "Installation";
-    case "answering":
-      return "Answering";
-    case "services":
-      return "Containers";
-    case "migrate":
-      return "Database";
-    default:
-      return step;
-  }
 }

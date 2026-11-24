@@ -48,6 +48,12 @@ const FIELD_SCHEME_NAMES = [
   "BASIC",
   "BEARER_TOKEN",
   "BASIC_WITH_JWT",
+  /*
+   * A client-credentials grant, typed like the rest: the person (an administrator, for a shared
+   * account) types the fields the connection asks for, a store subdomain, and the client itself is
+   * the deployment's (`deployment-clients.ts`). Offered only when that client is held.
+   */
+  "S2S_OAUTH2",
 ] as const;
 
 export type FieldScheme = (typeof FIELD_SCHEME_NAMES)[number];
@@ -496,8 +502,11 @@ export type ConnectedAppBroker = {
    * provider would mean finding every such comparison by hand. A property on the seam makes the
    * answer one value per broker and makes a new broker declare it or fail to type-check.
    *
-   * TRUE for Composio, whose connection rows and grants live in this deployment's own tables. That
-   * is the behaviour it always had, made explicit here rather than changed.
+   * TRUE for both brokers. Composio's connection rows have always lived in this deployment's own
+   * tables. Arcade's did too, once a consent came back through the verifier, but its broker used to
+   * declare `false` and its calls went out with no row behind them; it now records and requires the
+   * row exactly as Composio does, so Bot calls, pages and offboarding all read one kind of record. A broker that declared `false` would still be gated as the comment at
+   * `connectionTokenFor` sets out.
    */
   grantIsLocal: boolean;
   /**
@@ -694,12 +703,43 @@ export type ConnectedAppBroker = {
      * for it and drops it without throwing: handing an action to a broker that cannot use it is
      * not an error, and a caller need not know which kind of broker it holds to call this.
      *
+     * ABSENT, IT IS A CONSENT FOR THE WHOLE APP, which is what Connect asks for on every broker. A
+     * vendor that grants per action, as Arcade does, then asks for everything the app's actions
+     * need in one consent; see `authorize` in `./arcade-adapter`.
+     *
      * `returnUrl` ABOVE STAYS REQUIRED ON THE SEAM EVEN SO. An adapter whose vendor answers with
      * its own return leg may ignore it, but the seam does not relax for that: the next adapter
      * that needs it must not find the field optional because the last one did not.
      */
     action?: string;
+    /**
+     * This person already has an account at the app and is adding another one beside it.
+     *
+     * Composio's SDK refuses a second link for a person who already holds an account unless it is
+     * told more than one is wanted (`allowMultiple`), and that refusal is what lets Connect adopt an
+     * account the vendor holds and this deployment lost track of. So the flag is set only where the
+     * person's connection row stands and they asked for another account. Ignored by a broker that
+     * files a second account under a user id of its own (Arcade): the caller hands that broker a
+     * different `account` instead.
+     */
+    another?: boolean;
   }): Promise<{ redirectUrl: string; authorizationId: string | null }>;
+  /**
+   * Every live account this person holds at the app, as the vendor lists them, oldest first.
+   *
+   * What the app's page lists by name and what a Bot's call can be pointed at. `accountId` is the
+   * vendor's id for the account where it tells a person's accounts apart by one (Composio's
+   * connected account id), and null where an account is named by its user id alone (Arcade).
+   * `identity` is what the vendor says the account is — an email address, a login — and is never
+   * read out of a token.
+   *
+   * OPTIONAL, because a broker that cannot list accounts one by one still connects one: without it
+   * the app's page shows the single connection and a call names no account, as before.
+   */
+  accountsOf?(request: {
+    account: AccountRef;
+    toolkit: string;
+  }): Promise<BrokerAccount[]>;
   /** Whether this account is currently attached to this app at the vendor. */
   isConnected(request: {
     account: AccountRef;
@@ -751,6 +791,17 @@ export type ConnectedAppBroker = {
     toolkit: string;
     authScheme: FieldScheme;
   }): Promise<BrokerField[]>;
+  /**
+   * The provider's own page for making the key this app asks for, where the broker publishes one.
+   *
+   * Optional because only a broker with a typed-key flow has anything to say: Arcade has no
+   * per-person fields at all. Null where the broker published no link, which is most apps; the
+   * connect route then falls back to the map in `./key-guides`.
+   */
+  connectionGuideUrl?(request: {
+    toolkit: string;
+    authScheme: FieldScheme;
+  }): Promise<string | null>;
   /**
    * Connect this person with the secret they typed, answering the account it made.
    *
@@ -834,6 +885,13 @@ export type ConnectedAppBroker = {
   }): Promise<string | null>;
 };
 
+/** One live account a person holds at an app; see {@link ConnectedAppBroker.accountsOf}. */
+export type BrokerAccount = {
+  accountId: string | null;
+  identity: string | null;
+  connectedAt: string | null;
+};
+
 /**
  * @deprecated Kept for one release while callers move to {@link ConnectedAppBroker}.
  */
@@ -899,11 +957,11 @@ export class BrokerUnconfiguredError extends BrokerRefusalError {
    * vocabulary spec D11 keeps off their screen, so theirs names neither.
    */
   constructor(provider: BrokerProvider, reader: "operator" | "person") {
-    const { vendor, envVar } = BROKERED_PROFILE[provider];
+    const { envVar } = BROKERED_PROFILE[provider];
     super(
       reader === "person"
         ? "Connecting apps isn't set up yet, so nothing was asked. Ask an admin to set it up."
-        : `${vendor} is not configured for this deployment, so nothing was asked. Set ${envVar} to make the brokered apps available; until it is set there is nothing to connect, nothing to grant and no ${vendor} tool for a Bot to call, and the admin Plugins page shows one row under More apps that goes nowhere.`,
+        : `Connecting apps isn't set up on this deployment, so nothing was asked. Set ${envVar} to make these apps available. Until it is set there is nothing to connect, nothing to grant and no tool from these apps for a Bot to call.`,
     );
     this.name = "BrokerUnconfiguredError";
   }

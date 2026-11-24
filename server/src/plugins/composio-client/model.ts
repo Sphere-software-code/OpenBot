@@ -1,4 +1,5 @@
 import type { BrokerApp, FieldScheme } from "../broker";
+import type { DeploymentClient } from "../deployment-clients";
 import type { ComposioResult } from "../composio";
 import type {
   AccountRow,
@@ -288,9 +289,9 @@ export type ComposioVendor = {
        * THE UNION, BECAUSE THE MANAGED TYPE IS RIGHT FOR ONE KIND OF APP AND WAS SENT FOR ALL OF
        * THEM. A self-registering app has no Composio-owned OAuth client behind it and a key app
        * has no consent screen to send anybody to, so both are created as custom configs — carrying
-       * the scheme, and never a credential, which is per-connection rather than per-config. The
-       * managed shape has no field to name a scheme with, which is why this is a union of two
-       * shapes rather than one shape with an optional field.
+       * the scheme, and never a PERSON's credential, which is per-connection rather than
+       * per-config. The managed shape has no field to name a scheme with, which is why this is a
+       * union of two shapes rather than one shape with an optional field.
        */
       options:
         | { type: "use_composio_managed_auth"; name: string }
@@ -311,8 +312,12 @@ export type ComposioVendor = {
              * vendor's package with no request made at all. The empty record is what carries
              * nothing THROUGH that check, and the type says so rather than leaving the next reader
              * to discover it from a failed enable.
+             *
+             * THE ONE CONFIG THAT DOES CARRY A SECRET IS A SERVER-TO-SERVER GRANT'S, and the secret
+             * is the deployment's own OAuth client rather than anybody's account: Composio exchanges
+             * it for the token at connect time (`deployment-clients.ts`).
              */
-            credentials: Record<string, never>;
+            credentials: Record<string, never> | DeploymentClient;
           },
     ): Promise<{ id?: unknown } | null>;
     /**
@@ -460,7 +465,7 @@ export type ComposioVendor = {
     link(
       userId: string,
       authConfigId: string,
-      options: { callbackUrl: string },
+      options: { callbackUrl: string; allowMultiple?: boolean },
     ): Promise<{ redirectUrl?: unknown }>;
     /**
      * Create one person's account from the secret they typed, WITHOUT a consent screen anywhere.
@@ -659,6 +664,30 @@ export const REVOCABLE: VendorAccountStatus[] = [
  * exists for.
  */
 export const DIRECTORY_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * The toolkits Composio publishes about ITSELF, which are left out of the directory entirely.
+ *
+ * Composio's catalogue lists its own tooling beside the apps it connects: "Composio" (its meta
+ * tools), "Composio Search" and "Browser Tool". None of them is an app a person works in, and each
+ * puts the connector provider's name in front of a person browsing for apps, which is the one word
+ * these screens are written not to say. Verified against the live catalogue, which publishes the
+ * three under exactly these slugs, each as a no-auth toolkit.
+ *
+ * DROPPED WHERE THE DIRECTORY IS READ, so every caller agrees: the admin picker and its search, the
+ * enable route's check (a hand-composed request for one is refused as not listed), and the chat's
+ * connect suggestions, which name an app nobody enabled out of this same directory. An app already
+ * enabled is untouched: its row, its grants and its calls never read the directory, so it stays
+ * in that deployment's enabled apps and keeps working until an administrator removes it.
+ *
+ * Slugs, never names: the slug is the only identifier Composio keeps stable. Exa and every other
+ * search or browser app stay, because they are third-party apps rather than Composio's own.
+ */
+export const VENDOR_OWN_TOOLKITS: ReadonlySet<string> = new Set([
+  "composio",
+  "composio_search",
+  "browser_tool",
+]);
 
 /**
  * The held catalogue as a copy nobody else holds, which is what makes handing it out safe.

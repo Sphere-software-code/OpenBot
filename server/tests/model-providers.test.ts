@@ -10,6 +10,8 @@ import { encryptSecret, resolveModelApiKey } from "../src/credentials";
 import {
   anthropicMessagesUrl,
   createModelCompleter,
+  ModelNotConfiguredError,
+  routingModelFor,
 } from "../src/routing/model";
 import { validateTenantPackage } from "../src/tenant-package";
 
@@ -101,13 +103,13 @@ describe("deployment API-key provider selection", () => {
         BOT_MODEL: " claude-sonnet-4-5 ",
         OPENAI_BASE_URL: "",
       }),
-    ).toEqual(anthropicModel);
+    ).toEqual({ ...anthropicModel, pinned: true });
     expect(
       runtimeModelForEnvironment(packageModel, {
         BOT_PROVIDER: "anthropic",
         BOT_MODEL: "",
       }),
-    ).toEqual(anthropicModel);
+    ).toEqual({ provider: "anthropic", defaultModel: "claude-sonnet-5-5" });
   });
 
   test("an unset choice preserves the package while an empty desktop provider selects OpenAI", () => {
@@ -120,18 +122,23 @@ describe("deployment API-key provider selection", () => {
         BOT_MODEL: "",
       }),
     ).toEqual(packageModel);
+    // A model named on its own is the operator's, on OpenAI's own API too.
     expect(
       runtimeModelForEnvironment(packageModel, {
-        BOT_MODEL: "unselected-model",
+        BOT_MODEL: "named-model",
       }),
-    ).toEqual(packageModel);
+    ).toEqual({ ...packageModel, defaultModel: "named-model", pinned: true });
     expect(
       runtimeModelForEnvironment(packageModel, {
         BOT_PROVIDER: "openai",
         BOT_MODEL: "local-model",
         OPENAI_BASE_URL: "http://localhost:11434/v1",
       }),
-    ).toEqual({ provider: "openai", defaultModel: "local-model" });
+    ).toEqual({
+      provider: "openai",
+      defaultModel: "local-model",
+      pinned: true,
+    });
   });
 
   test("credentials stay provider-scoped and a rotated stored key is read on the next call", async () => {
@@ -520,3 +527,223 @@ test("cancelling an Anthropic selector closes its in-flight HTTP request", async
     await server.stop(true);
   }
 }, 5000);
+
+describe("the router's fast model", () => {
+  test("defaults to a small model per provider, and to nothing behind a gateway", () => {
+    expect(routingModelFor(anthropicModel, {})).toBe("claude-haiku-5-5");
+    expect(routingModelFor(packageModel, {})).toBe("gpt-6-luna");
+    expect(
+      routingModelFor(packageModel, { OPENAI_BASE_URL: "https://gw/v1" }),
+    ).toBeUndefined();
+    expect(
+      routingModelFor(anthropicModel, { ANTHROPIC_BASE_URL: "https://gw" }),
+    ).toBeUndefined();
+    // A gateway for the other provider says nothing about this one.
+    expect(
+      routingModelFor(anthropicModel, { OPENAI_BASE_URL: "https://gw/v1" }),
+    ).toBe("claude-haiku-5-5");
+  });
+
+  test("ROUTER_MODEL wins everywhere, a gateway included; blank is unset", () => {
+    expect(
+      routingModelFor(packageModel, {
+        ROUTER_MODEL: " gw/small ",
+        OPENAI_BASE_URL: "https://gw/v1",
+      }),
+    ).toBe("gw/small");
+    expect(routingModelFor(packageModel, { ROUTER_MODEL: "  " })).toBe(
+      "gpt-6-luna",
+    );
+  });
+
+  test("asks the fast model first and the deployment's model only when it is refused", async () => {
+    const asked: string[] = [];
+    let refuse = false;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        const body = (await request.json()) as { model: string };
+        asked.push(body.model);
+        if (refuse && body.model === "gpt-6-luna")
+          return Response.json({ error: "no access" }, { status: 404 });
+        return Response.json({
+          choices: [{ message: { content: `{"from":"${body.model}"}` } }],
+        });
+      },
+    });
+    try {
+      process.env.OPENAI_BASE_URL = `${server.url.origin}/v1`;
+      const complete = createModelCompleter({
+        model: packageModel,
+        resolveApiKey: async () => "synthetic-key",
+        fastModel: "gpt-6-luna",
+      });
+      expect(await complete("Pick one.")).toBe('{"from":"gpt-6-luna"}');
+      expect(asked).toEqual(["gpt-6-luna"]);
+
+      asked.length = 0;
+      refuse = true;
+      expect(await complete("Pick one.")).toBe('{"from":"gpt-5.6-terra"}');
+      expect(asked).toEqual(["gpt-6-luna", "gpt-5.6-terra"]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a fast model given as a function is asked for on every call, so the allowlist applies at once", async () => {
+    const asked: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        const { model } = (await request.json()) as { model: string };
+        asked.push(model);
+        return Response.json({
+          choices: [{ message: { content: `{"from":"${model}"}` } }],
+        });
+      },
+    });
+    try {
+      process.env.OPENAI_BASE_URL = `${server.url.origin}/v1`;
+      let allowed = true;
+      const complete = createModelCompleter({
+        model: packageModel,
+        resolveApiKey: async () => "synthetic-key",
+        fastModel: () => (allowed ? "gpt-6-luna" : undefined),
+      });
+      await complete("Pick one.");
+      allowed = false;
+      await complete("Pick one.");
+      expect(asked).toEqual(["gpt-6-luna", packageModel.defaultModel]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a fast model that is the deployment's own is asked once", async () => {
+    const asked: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        asked.push(((await request.json()) as { model: string }).model);
+        return Response.json({ error: "down" }, { status: 500 });
+      },
+    });
+    try {
+      process.env.OPENAI_BASE_URL = `${server.url.origin}/v1`;
+      const complete = createModelCompleter({
+        model: packageModel,
+        resolveApiKey: async () => "synthetic-key",
+        fastModel: packageModel.defaultModel,
+      });
+      await expect(complete("Pick one.")).rejects.toThrow(
+        "router model answered 500",
+      );
+      expect(asked).toEqual([packageModel.defaultModel]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+});
+
+describe("an answer held to a schema", () => {
+  const schema = {
+    name: "boundary_rule",
+    schema: {
+      type: "object",
+      properties: { rule: { type: "string" } },
+      required: ["rule"],
+      additionalProperties: false,
+    },
+  };
+
+  test("Anthropic is asked through output_config.format, with the caller's output cap", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return Response.json({
+          content: [{ type: "text", text: '{"rule":"true"}' }],
+        });
+      },
+    });
+    try {
+      process.env.ANTHROPIC_BASE_URL = server.url.origin;
+      const complete = createModelCompleter({
+        model: anthropicModel,
+        resolveApiKey: async () => "synthetic-key",
+        maxTokens: 16_000,
+      });
+      expect(await complete("Write it.", undefined, { schema })).toBe(
+        '{"rule":"true"}',
+      );
+      expect(bodies[0]).toMatchObject({
+        max_tokens: 16_000,
+        output_config: {
+          format: { type: "json_schema", schema: schema.schema },
+        },
+      });
+      expect(bodies[0]).not.toHaveProperty("response_format");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a model that refuses the schema with a 400 is asked once more without it", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        const body = (await request.json()) as Record<string, unknown>;
+        bodies.push(body);
+        const format = (body.response_format as { type?: string }).type;
+        return format === "json_schema"
+          ? Response.json(
+              { error: { message: "response_format json_schema unsupported" } },
+              { status: 400 },
+            )
+          : Response.json({
+              choices: [{ message: { content: '{"rule":"true"}' } }],
+            });
+      },
+    });
+    try {
+      process.env.OPENAI_BASE_URL = `${server.url.origin}/v1`;
+      const complete = createModelCompleter({
+        model: packageModel,
+        resolveApiKey: async () => "synthetic-key",
+      });
+      expect(await complete("Write it.", undefined, { schema })).toBe(
+        '{"rule":"true"}',
+      );
+      expect(bodies.map((body) => body.response_format)).toEqual([
+        {
+          type: "json_schema",
+          json_schema: {
+            name: "boundary_rule",
+            schema: schema.schema,
+            strict: true,
+          },
+        },
+        { type: "json_object" },
+      ]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("no key and no plan is its own error, so a caller can say a model is needed", async () => {
+    const complete = createModelCompleter({
+      model: packageModel,
+      resolveApiKey: async () => null,
+    });
+    await expect(complete("Write it.")).rejects.toBeInstanceOf(
+      ModelNotConfiguredError,
+    );
+  });
+});

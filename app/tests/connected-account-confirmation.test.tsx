@@ -290,11 +290,9 @@ test("the sibling list is not drawn once there is no account for a Disconnect to
   const view = renderScreen();
   /*
    * WAITED ON AS A RENDER SIGNAL AND NOT AS THE SUBJECT: this case is about the sibling list and
-   * the read behind it. It used to wait on "Connect", which this deployment no longer draws —
-   * Arcade authorizes per action, so the row withholds a whole-app Connect that could only reach
-   * the adapter's refusal. The row's disconnected state is what is being waited for either way.
+   * the read behind it. The row's disconnected state, and its Connect, are what is waited for.
    */
-  await view.findByText("Approved per action");
+  await view.findByRole("button", { name: "Connect" });
   expect(view.container.textContent).not.toContain("googledocs");
   expect(siblingReads.length).toBe(0);
 });
@@ -315,18 +313,24 @@ for (const connected of [true, false]) {
       if (connected && configured) await view.findByText(/googledocs/);
       const rendered = everythingRendered(view);
       expect(rendered).not.toMatch(/composio/i);
-      if (!configured) expect(rendered).toContain("ARCADE_API_KEY");
+      // A person's own page names neither the broker nor the variable an admin sets.
+      if (!configured) {
+        expect(rendered).toContain("Ask an admin to set it up.");
+        expect(rendered).not.toContain("ARCADE_API_KEY");
+      }
     });
   }
 }
 
-test("where a screen does name the broker, the vocabulary names the active one", () => {
-  expect(brokeredDisconnectNote("arcade")).toBe(
-    "Disconnecting also ends the account at Arcade.",
-  );
-  expect(brokeredDisconnectNote("composio")).toBe(
-    "Disconnecting also ends the account at Composio.",
-  );
+test("no screen names the broker, and only an admin is told the variable to set", () => {
+  for (const provider of ["arcade", "composio"] as const) {
+    expect(brokeredDisconnectNote(provider)).toBe(
+      "Disconnecting also removes OpenBot's access to your account.",
+    );
+    expect(brokeredKeyMissing(provider, "team", "person")).toBe(
+      "Connecting apps isn't set up yet, so this account can't be connected or disconnected here. Ask an admin to set it up.",
+    );
+  }
   expect(brokeredKeyMissing("arcade")).toBe(
     "Set ARCADE_API_KEY on this deployment. Until then, this account can't be connected or disconnected here. The app stays turned on, and its tool grants still stand.",
   );
@@ -348,6 +352,13 @@ for (const provider of ["composio", "arcade"] as const) {
   });
 }
 
+test("a connected Arcade page offers Reconnect, where a Bot's card sends somebody to finish it", async () => {
+  install({ provider: "arcade", connected: true });
+  const view = renderScreen();
+  await view.findByRole("button", { name: "Reconnect" });
+  expect(view.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+});
+
 test("a connected Composio page renders its sentences verbatim", async () => {
   install({ provider: "composio", connected: true });
   const view = renderScreen();
@@ -366,12 +377,19 @@ test("a disconnected Composio page renders its sentences verbatim", async () => 
   expect(text).toContain(DISCONNECTED);
 });
 
-test("a disconnected Arcade page points at the action list, not at a Connect it does not draw", async () => {
+test("a disconnected Arcade page offers Connect for the whole app, and the action list too", async () => {
+  /*
+   * ARCADE'S APPS CONNECT AS COMPOSIO'S DO. The page used to draw "Approved per action" in place of
+   * Connect, because Arcade's adapter refused a consent with no action on it; Connect now asks
+   * Arcade for everything the app's actions need. The action list underneath stays, for somebody
+   * who wants to approve less.
+   */
   install({ provider: "arcade", connected: false });
   const view = renderScreen();
-  await view.findByText("Approved per action");
+  await view.findByRole("button", { name: "Connect" });
+  expect(view.queryByText("Approved per action")).toBeNull();
   expect(view.container.textContent).toContain(
-    "No Bot can use this as you. Authorize the actions you want below.",
+    "No Bot can use this as you. Connecting takes you to Gmail to approve access. You can also authorize only the actions you want below.",
   );
 });
 

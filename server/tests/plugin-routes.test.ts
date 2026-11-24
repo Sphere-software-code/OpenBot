@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createApp } from "../src/app";
 import { DEV_ACTOR } from "../src/auth/dev-actor";
 import { loadConfig } from "../src/config";
+import { setEdition } from "../src/edition";
 import { ServerRowAmbiguousError } from "../src/plugins/access";
 import {
   type BrokerApp,
@@ -10,6 +11,8 @@ import {
   BrokerRefusalError,
   schemeKind,
 } from "../src/plugins/broker";
+import { catalogueEntry, summaryFor } from "../src/plugins/catalogue";
+import { EVERY_BOT_ASKS_REFUSAL } from "../src/plugins/personal-defaults";
 import type { AccountRef } from "../src/plugins/shared-accounts";
 import {
   CatalogueEntryUnknownError,
@@ -139,7 +142,10 @@ function serverRecord(row: { id: string; url: string }): ServerRecord {
     skippedTools: [],
     authScheme: null,
     accountMode: null,
+    entraScope: null,
     sharedVendorConnected: false,
+    sharedOnly: false,
+    ownCredential: false,
     ownerGrants: "admin",
     ownerGrantsChosen: null,
     tools: [],
@@ -453,6 +459,71 @@ function grantsApp(
   return { calls, app };
 }
 
+/*
+ * The catalogue's summaries are a page's header and a Connections row's line. Written for a team
+ * ("Pages and databases of whoever is asking", "this deployment's Exa API key"), they read wrong to
+ * the personal edition's one person, so that edition is served its own.
+ */
+describe("what the Plugins page says each app is", () => {
+  async function summaries(): Promise<Record<string, string>> {
+    const app = createApp(
+      loadConfig(testEnvironment()),
+      {
+        handler: () => new Response(null, { status: 204 }),
+        api: { getSession: async () => ({ user: ADMIN }) },
+      } as never,
+      { rolesForUser: async () => ["admin"] },
+      ...UP_TO_PLUGIN_STORE,
+      pluginStore({ listServers: async () => [], listSkills: async () => [] }),
+    );
+    const response = await app.request("http://openbot.test/api/plugins");
+    const body = (await response.json()) as {
+      catalogue: { key: string; summary: string }[];
+    };
+    return Object.fromEntries(
+      body.catalogue.map((entry) => [entry.key, entry.summary]),
+    );
+  }
+
+  /** What an added Notion's row says it is, as `listServers` serves it. */
+  function notionRowSummary(): string {
+    const entry = catalogueEntry("notion");
+    if (!entry) throw new Error("Notion is not in the catalogue.");
+    return summaryFor(entry);
+  }
+
+  test("the personal edition is spoken to as you, and names no deployment", async () => {
+    setEdition("personal");
+    try {
+      const said = await summaries();
+      expect(said.notion).toBe("Your pages and databases.");
+      expect(said["google-drive"]).toBe("Files in your Drive.");
+      expect(said["exa-authenticated"]).toBe(
+        "Public-web search and page reading using your Exa API key.",
+      );
+      expect(said.routines).toBe(
+        "Standing instructions your Bots run on a schedule.",
+      );
+      expect(JSON.stringify(said)).not.toMatch(/whoever|deployment|admin/i);
+      // An app page's header reads the same words off the added server's row.
+      expect(notionRowSummary()).toBe("Your pages and databases.");
+    } finally {
+      setEdition("team");
+    }
+  });
+
+  test("the team edition keeps its words", async () => {
+    const said = await summaries();
+    expect(said.notion).toBe("Pages and databases of whoever is asking.");
+    expect(said["firecrawl-authenticated"]).toBe(
+      "Public-web search and page scraping using this deployment's Firecrawl API key.",
+    );
+    expect(notionRowSummary()).toBe(
+      "Pages and databases of whoever is asking.",
+    );
+  });
+});
+
 describe("granting one Bot to another", () => {
   test("an administrator can grant it", async () => {
     const { calls, app } = grantsApp();
@@ -509,6 +580,26 @@ describe("granting one Bot to another", () => {
         by: ADMIN.email,
       },
     ]);
+  });
+
+  /*
+   * In the personal edition every Bot can ask every other (see `botsReachableFrom`), so removing a
+   * row would answer ok and change nothing. Refused in a sentence instead, as an app is.
+   */
+  test("but not in the personal edition, where every Bot can ask every other", async () => {
+    const { calls, app } = grantsApp();
+    setEdition("personal");
+    try {
+      const response = await app.request(
+        "http://openbot.test/api/plugins/grants?kind=bot&ref=knowledge&agentId=assistant",
+        { method: "DELETE" },
+      );
+      expect(response.status).toBe(403);
+      expect((await response.json()).error).toBe(EVERY_BOT_ASKS_REFUSAL);
+      expect(calls).toEqual([]);
+    } finally {
+      setEdition("team");
+    }
   });
 
   /*
@@ -1295,7 +1386,8 @@ describe("the Composio directory", () => {
 
       expect(response.status).toBe(502);
       const refusal = ((await response.json()) as { error: string }).error;
-      expect(refusal).toContain("Composio said nothing about why");
+      expect(refusal).toContain("no reason was given");
+      expect(refusal).not.toContain("Composio");
       // Never the thrown object's own text: on this path it is as likely to be a stack frame as a
       // sentence, and it is the console line that carries it to an operator.
       expect(refusal).not.toContain("Cannot read properties");
@@ -1527,6 +1619,8 @@ const DEV_ACTOR_ACCOUNT: AccountRef = {
  */
 const RETURN_URL = "http://localhost:3001/connections/composio-linear";
 const ADMIN_RETURN_URL = "http://localhost:3001/admin/plugins/composio-linear";
+const DESKTOP_RETURN_URL =
+  "http://localhost:3001/desktop-return?app=composio-linear";
 
 /**
  * A failure in the shape `vendorSentence` reaches into, with the vendor's sentence at the bottom.
@@ -1617,6 +1711,7 @@ function brokeredApp(
     account: AccountRef;
     toolkit: string;
     returnUrl: string;
+    another?: boolean;
   }> = [];
   const queried: Array<{ toolkit: string; account: AccountRef }> = [];
   const confirmed: Array<{ toolkit: string; account: AccountRef; by: string }> =
@@ -1909,6 +2004,7 @@ function brokeredApp(
               account: AccountRef;
               toolkit: string;
               returnUrl: string;
+              another?: boolean;
             }) => {
               // Recorded BEFORE the throw, so a test about a failing broker can still say the
               // address it was asked with was this deployment's own.
@@ -2146,29 +2242,31 @@ describe("connecting a brokered app", () => {
     expect(authorized).toEqual([]);
   });
 
-  test("a second connection is refused with the step to take", async () => {
+  test("a second connection asks for another account rather than refusing", async () => {
+    /*
+     * A PERSON MAY HOLD SEVERAL ACCOUNTS AT ONE APP. A press over a standing connection used to be
+     * a 409 telling them to disconnect first, which left anybody with a work and a personal account
+     * able to give their Bots only one. The link is minted for the same person, and says another
+     * account is wanted so the vendor adds one beside the one that stands.
+     */
     const { authorized, connect } = brokeredApp({
       connectedAt: "2026-02-02T00:00:00.000Z",
     });
 
     const response = await connect({});
 
-    expect(response.status).toBe(409);
-    const refusal = (await response.json()).error as string;
-    // Naming the remedy rather than only refusing: the person has an account attached already, and
-    // the only way to a new link is through disconnecting the one they have.
-    expect(refusal.toLowerCase()).toContain("disconnect");
-    /*
-     * THE APP'S TITLE, AND NOT THE ROW'S ID. "Linear" is the name of the thing this person
-     * connected; `composio-linear` is how this deployment keys a table, which they have never seen
-     * and cannot act on. The second assertion is not the first one twice: a sentence that named the
-     * app and then quoted the row id beside it would satisfy one and fail the other.
-     */
-    expect(refusal).toContain("Linear");
-    expect(refusal).not.toContain("composio-linear");
-    // And nothing was minted, which is the half that matters: a link handed out here would attach
-    // a second account behind a row that already says connected.
-    expect(authorized).toEqual([]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      authorizationUrl: AUTHORIZATION_URL,
+    });
+    expect(authorized).toEqual([
+      {
+        account: ADMIN_ACCOUNT,
+        toolkit: "linear",
+        returnUrl: RETURN_URL,
+        another: true,
+      },
+    ]);
   });
 
   test("a deployment with no broker is told which setting to set", async () => {
@@ -2202,7 +2300,9 @@ describe("connecting a brokered app", () => {
       {
         returnUrl: "https://evil.test/harvest",
         referer: "https://evil.test",
-        origin: "https://evil.test",
+        // The request's own origin, which is the only Origin a request that reaches the route can
+        // carry, and is not this deployment's address either.
+        origin: "http://openbot.test",
         "x-forwarded-host": "evil.test",
       },
     );
@@ -2211,6 +2311,14 @@ describe("connecting a brokered app", () => {
     expect(authorized).toEqual([
       { account: ADMIN_ACCOUNT, toolkit: "linear", returnUrl: RETURN_URL },
     ]);
+
+    // The same request carrying another site's Origin does not reach the route at all: a page on
+    // another website changes nothing here (request-trust.ts), so no link is minted for it.
+    const fromAnotherSite = await connect({}, "", {
+      origin: "https://evil.test",
+    });
+    expect(fromAnotherSite.status).toBe(403);
+    expect(authorized).toHaveLength(1);
   });
 
   test("an administrator who started on the app's own page is sent back to it", async () => {
@@ -2230,6 +2338,28 @@ describe("connecting a brokered app", () => {
         toolkit: "linear",
         returnUrl: ADMIN_RETURN_URL,
       },
+    ]);
+  });
+
+  test("a sign-in started in OpenBot Desktop comes back to the page that hands the person back to it", async () => {
+    /*
+     * The Desktop window opens the sign-in in the person's browser, so Composio's redirect lands
+     * there. Sent to the account's page, the person was left on OpenBot in a browser tab. The page
+     * this names confirms the account and brings the window forward. Still a page of this OpenBot,
+     * on its own origin: `from` names where the press was made, never where to go.
+     */
+    const { authorized, connect } = brokeredApp();
+
+    await connect({}, "?returnTo=settings&from=desktop");
+    await connect({}, "?from=https%3A%2F%2Fevil.test");
+
+    expect(authorized).toEqual([
+      {
+        account: ADMIN_ACCOUNT,
+        toolkit: "linear",
+        returnUrl: DESKTOP_RETURN_URL,
+      },
+      { account: ADMIN_ACCOUNT, toolkit: "linear", returnUrl: RETURN_URL },
     ]);
   });
 
@@ -2315,6 +2445,40 @@ describe("connecting a brokered app", () => {
     expect(refusal).toContain("Linear");
     expect(refusal).not.toContain("socket hang up");
   });
+
+  test("a refusal written for the operator never tells the person who the broker is", async () => {
+    /*
+     * A person connects their apps through OpenBot and is never told which company sits behind
+     * it. The broker layer's own refusals were written for an operator who can open that company's
+     * dashboard, so they name it. Passed through as they were, the person pressing Connect read
+     * "Composio would not mint a connect link" and a remedy in a dashboard they cannot open. They
+     * get the route's own sentence instead, with the same status, and the operator's sentence goes
+     * to the log.
+     */
+    const operatorSentence =
+      "Composio would not mint a connect link for linear. Nobody was sent to a consent screen. Read this app's authorization config in Composio's own dashboard.";
+    const { connect } = brokeredApp(null, AUTHORIZATION_URL, {
+      authorizeThrows: new BrokerRefusalError(operatorSentence),
+    });
+    const said: string[] = [];
+    const realError = console.error;
+    console.error = (...args: unknown[]) => {
+      said.push(args.map(String).join(" "));
+    };
+
+    try {
+      const response = await connect({});
+
+      expect(response.status).toBe(503);
+      const refusal = (await response.json()).error as string;
+      expect(refusal).toBe(
+        "Couldn't start connecting Linear. Try again, or ask an admin if it keeps happening.",
+      );
+    } finally {
+      console.error = realError;
+    }
+    expect(said.some((line) => line.includes(operatorSentence))).toBe(true);
+  });
 });
 
 /**
@@ -2343,9 +2507,18 @@ describe("connecting an app whose secret a person types", () => {
     const response = await connectFields();
 
     expect(response.status).toBe(200);
-    // The vendor's own list, passed through rather than restated: `help` is written for the person
-    // filling the box in, and nothing here is in a position to improve on it.
-    expect(await response.json()).toEqual({ fields: PUBLISHED });
+    /*
+     * The vendor's own list under the vendor's own names, with the one generic label ("Base URL")
+     * said in the person's words, and a guide saying where the key comes from. Firecrawl is in
+     * the maintained map, so the link is Firecrawl's own API keys page.
+     */
+    expect(await response.json()).toEqual({
+      fields: [PUBLISHED[0], { ...PUBLISHED[1], label: "Web address" }],
+      guide: {
+        steps: "Sign in to Firecrawl and copy your key from the API Keys page.",
+        url: "https://www.firecrawl.dev/app/api-keys",
+      },
+    });
     /*
      * ASKED WITH THE SCHEME RECORDED ON THE ROW, never one derived again here. A form drawn for
      * `BASIC` in front of a config created for `API_KEY` asks for boxes the person's app does not
@@ -2512,7 +2685,7 @@ describe("connecting an app whose secret a person types", () => {
       published: [],
     });
 
-    expect(await (await connectFields()).json()).toEqual({ fields: [] });
+    expect((await (await connectFields()).json()).fields).toEqual([]);
 
     const response = await connectFields({ values: {} });
 
@@ -2682,12 +2855,10 @@ describe("connecting an app whose secret a person types", () => {
     });
   });
 
-  test("an account already connected is refused before the form is drawn", async () => {
+  test("an account already connected still gets the form, to add another key", async () => {
     /*
-     * THE ONE-ACCOUNT GUARD STILL RUNS FIRST, which is the ordering both branches were put after on
-     * purpose. Drawing the form for somebody who already has an account attached invites them to
-     * type a key that would be refused after they had entered it, and asking Composio what the app
-     * wants is a call made on behalf of a request that is going to be refused anyway.
+     * A SECOND KEY IS A SECOND ACCOUNT, as a second consent is. The form is drawn for somebody who
+     * already has an account at the app, so they can connect another one beside it.
      */
     const { asked, submitted, connectFields } = brokeredApp({
       connectedAt: "2026-02-02T00:00:00.000Z",
@@ -2695,13 +2866,8 @@ describe("connecting an app whose secret a person types", () => {
 
     const response = await connectFields();
 
-    expect(response.status).toBe(409);
-    const refusal = (await response.json()).error as string;
-    expect(refusal.toLowerCase()).toContain("disconnect");
-    // The app's name rather than the row's id, as on the consent half above.
-    expect(refusal).toContain("Firecrawl");
-    expect(refusal).not.toContain("composio-firecrawl");
-    expect(asked).toEqual([]);
+    expect(response.status).toBe(200);
+    expect(asked).toEqual([{ toolkit: "firecrawl", authScheme: "API_KEY" }]);
     expect(submitted).toEqual([]);
   });
 
@@ -2815,6 +2981,30 @@ describe("connecting an app whose secret a person types", () => {
 
     expect(response.status).toBe(400);
     expect((await response.json()).error).toContain("401 unauthorized");
+  });
+
+  test("a refused key whose sentence names the broker is said in the route's own words", async () => {
+    // The same promise as the consent press: what a person reads about their own key never names
+    // the company OpenBot connects through.
+    const { connectFields } = brokeredApp(null, AUTHORIZATION_URL, {
+      storeThrows: new PluginRefusedError(
+        "What you entered for firecrawl did not work, and Composio would not take the account back either.",
+        null,
+      ),
+    });
+    const realError = console.error;
+    console.error = () => {};
+
+    try {
+      const response = await connectFields({ values: { api_key: "wrong" } });
+
+      expect(response.status).toBe(400);
+      const refusal = (await response.json()).error as string;
+      expect(refusal).not.toContain("Composio");
+      expect(refusal).toStartWith("Couldn't connect");
+    } finally {
+      console.error = realError;
+    }
   });
 });
 

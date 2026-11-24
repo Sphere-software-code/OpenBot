@@ -1,5 +1,9 @@
 import type { LauncherState } from "@openbot/shared/openbot-browser";
-import { IconMicrophone, IconMicrophoneOff } from "@tabler/icons-react";
+import {
+  IconInfoCircle,
+  IconMicrophone,
+  IconMicrophoneOff,
+} from "@tabler/icons-react";
 import { useId } from "react";
 import {
   Item,
@@ -10,92 +14,55 @@ import {
   ItemTitle,
 } from "@/components/ui/item";
 import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { NarrationProblem } from "@/lib/browser/narration";
+import { cn } from "@/lib/utils";
 import type { NarrationChoice } from "./narration-choice";
+import { useMicrophone } from "./use-microphone";
 import type { NarrationControls } from "./use-narration";
 
-const GOES_ON = "Recording still works.";
+/**
+ * All narration ever says (David): it is on and capturing the voice, or it is off. Capturing is said only while a
+ * recording runs and narration hears the person; on with nothing to capture yet (before Record, or while it starts),
+ * it says only that it is on.
+ */
+export const NARRATION_CAPTURING =
+  "Narration is on. We're capturing your voice.";
+export const NARRATION_ON = "Narration is on.";
+export const NARRATION_OFF = "Narration is off.";
+/** What narration is for, beside its switch in Record's popover. */
+export const NARRATION_EXPLAINED =
+  "Talk out loud while you do the task to explain your thinking. What you say becomes part of what your Bots learn.";
+/** Said wherever narration is, on a computer with no microphone: before a recording too, so nobody narrates to nothing. */
+export const NARRATION_NO_MICROPHONE = "No microphone found. Narration is off.";
 
-function languageName(language: string): string {
-  try {
-    return (
-      new Intl.DisplayNames(["en"], { type: "language" }).of(language) ??
-      language
-    );
-  } catch {
-    return language;
-  }
-}
-
-/** What the person is told when narration did not reach the Recorder: the server's own sentence for why, when it said
- * one, since that is what they can act on. */
-function lostNarrationSentence(error: string | null): string {
-  return error
-    ? `Some of what you said didn't reach the Recorder. ${error}`
-    : `Some of what you said didn't reach the Recorder. ${GOES_ON}`;
-}
-
-/** Why narration is off, and what the person can do about it, in one or two short sentences. */
+/** Narration that cannot hear the person is simply off. */
 export function narrationProblemSentence(
-  problem: NarrationProblem,
-  language: string,
+  _problem: NarrationProblem,
+  _language: string,
 ): string {
-  switch (problem) {
-    case "unsupported":
-      return `Narration isn't available in this browser, so what you say isn't recorded. ${GOES_ON}`;
-    case "on-device":
-      return `This browser can't turn speech into text on your computer, and OpenBot sends your voice nowhere else, so narration is off. ${GOES_ON}`;
-    case "speech-pack":
-      return `Your browser has to download its ${languageName(language)} speech recognition to your computer first. Turn narration on to download it. ${GOES_ON}`;
-    case "not-allowed":
-      return `OpenBot can't use your microphone, so narration is off. Allow the microphone for this site, then turn narration on again. ${GOES_ON}`;
-    case "no-microphone":
-      return `No microphone was found, or another app is using it. ${GOES_ON}`;
-    case "service":
-      return `This browser's speech recognition is off or unavailable, so narration is off. ${GOES_ON}`;
-    case "language":
-      return `This browser can't turn ${languageName(language)} speech into text on your computer, so narration is off. ${GOES_ON}`;
-    case "network":
-      return "Can't reach this browser's speech service. Narration tries again in a moment.";
-  }
+  return NARRATION_OFF;
 }
 
 /** What the person is told while their browser downloads the narration's language: narration starts by itself. */
-export function downloadingSentence(language: string): string {
-  return `Your browser is downloading its ${languageName(language)} speech recognition to your computer. Narration starts when it's ready.`;
+export function downloadingSentence(_language: string): string {
+  return NARRATION_OFF;
 }
 
-/** What the Desktop narration row says, from the Recorder's own report of whether it hears the person. */
+/** What the Desktop narration row says while a recording runs, from the Recorder's own report of whether it hears the person. */
 function nativeNarrationSentence(voice: LauncherState["voice"]): string {
-  switch (voice) {
-    case "listening":
-      return "Listening. Say what you're doing as you go.";
-    case "muted":
-      return "Muted in the Recorder, so what you say isn't recorded. Turn it on again from the Recorder's button in your browser's toolbar.";
-    case "unavailable":
-      return `The Recorder can't hear your microphone, so what you say isn't recorded. The Recorder's button in your browser's toolbar says why. ${GOES_ON}`;
-    // Nothing is being recorded yet, or the Recorder has not said.
-    default:
-      return "On. The Recorder hears your microphone while you record, so say what you're doing as you go.";
-  }
-}
-
-/** The narration row on OpenBot Desktop while nothing records: the person's choice, which the next Record passes on. */
-function narrationChoiceSentence(
-  narration: Exclude<NarrationChoice["narration"], undefined>,
-) {
-  switch (narration) {
-    case "on":
-      return "On. The Recorder in your browser listens to your microphone while you record, and turns your speech into text on your computer.";
-    case "off":
-      return "Off. The Recorder doesn't open your microphone.";
-    case null:
-      return "Not chosen yet. Record asks before your first recording, and the microphone stays closed until you say yes.";
-  }
+  if (voice === "listening") return NARRATION_CAPTURING;
+  return voice === "muted" || voice === "unavailable"
+    ? NARRATION_OFF
+    : NARRATION_ON;
 }
 
 /**
- * The narration row on OpenBot Desktop. While nothing records it is the person's choice, a switch that takes effect at
+ * The narration row for a window on the person's desktop. While nothing records it is the person's choice, a switch that takes effect at
  * once: the next Record tells the Recorder in their browser whether to open the microphone. While a recording runs, the
  * Recorder hears the microphone itself, so the row says what it reports, read every second with the rest of the
  * browser's state, so a microphone that is muted or cannot be heard shows here while the person records.
@@ -110,8 +77,10 @@ export function NativeNarrationRow({
   /** A recording is running (or starting, or stopping). */
   recording: boolean;
 }) {
+  // No microphone on this computer: off, and said, while the person's choice stays as they made it.
+  const noMicrophone = useMicrophone() === false;
   if (!recording) {
-    const on = choice.narration === "on";
+    const on = choice.narration === "on" && !noMicrophone;
     // Not known yet (the preferences still loading, or unreadable): nothing said, and nothing to switch.
     const known = choice.narration !== undefined;
     return (
@@ -121,17 +90,19 @@ export function NativeNarrationRow({
         </ItemMedia>
         <ItemContent>
           <ItemTitle>Narration</ItemTitle>
-          {choice.narration !== undefined ? (
-            <ItemDescription className="line-clamp-none">
-              {narrationChoiceSentence(choice.narration)}
-            </ItemDescription>
-          ) : null}
+          <ItemDescription className="line-clamp-none">
+            {noMicrophone
+              ? NARRATION_NO_MICROPHONE
+              : on
+                ? NARRATION_ON
+                : NARRATION_OFF}
+          </ItemDescription>
         </ItemContent>
         <ItemActions>
           <Switch
             aria-label="Narration"
             checked={on}
-            disabled={!known}
+            disabled={!known || noMicrophone}
             onCheckedChange={choice.choose}
           />
         </ItemActions>
@@ -156,6 +127,8 @@ export function NativeNarrationRow({
               />
               {nativeNarrationSentence(voice)}
             </span>
+          ) : noMicrophone ? (
+            NARRATION_NO_MICROPHONE
           ) : (
             nativeNarrationSentence(voice)
           )}
@@ -166,7 +139,8 @@ export function NativeNarrationRow({
 }
 
 /**
- * Narration on and off, for the bar above a browser shown in the page. A switch, because it takes effect at once:
+ * Narration on and off, for a browser shown in the page: in Record's popover, and in the toolbar while a recording
+ * runs. A switch, because it takes effect at once:
  * off stops listening after the phrase being said, on listens again (and tries again after a failure). It is the
  * person's choice, so `onChange` keeps it as well. It shows the state narration is in, so a narration that failed reads
  * off, as the notice under the bar says; while a recording runs and the page hears the person, it says Listening beside
@@ -189,7 +163,11 @@ export function NarrationSwitch({
   const listening = recording && narration.status?.state === "listening";
   const Icon = on ? IconMicrophone : IconMicrophoneOff;
   return (
-    <span className="flex shrink-0 items-center gap-2 text-sm">
+    // `data-slot` lets Record's popover lay it out as a row of its own, the switch at the row's end.
+    <span
+      className="flex shrink-0 items-center gap-2 text-sm"
+      data-slot="narration-switch"
+    >
       {listening ? (
         <span
           className="inline-flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400"
@@ -207,11 +185,36 @@ export function NarrationSwitch({
       <label htmlFor={id} id={labelId} className="text-muted-foreground">
         Narration
       </label>
+      {/*
+        What narration is for, on hover or focus, where the choice is made (Record's popover). Not while recording:
+        the choice is made by then, and the bar has no room. A button of type "button": in Record's form any other
+        would submit it and start the recording.
+      */}
+      {recording ? null : (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                aria-label="About narration"
+                className="-ml-1 flex size-5 items-center justify-center rounded-full text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                type="button"
+              />
+            }
+          >
+            <IconInfoCircle aria-hidden="true" className="size-4" />
+          </TooltipTrigger>
+          <TooltipContent className="max-w-60" side="top">
+            {NARRATION_EXPLAINED}
+          </TooltipContent>
+        </Tooltip>
+      )}
       {/* Named by the label's id as well: the switch is a span with role="switch", which `htmlFor` cannot name. */}
       <Switch
         aria-labelledby={labelId}
+        className="ml-auto"
         id={id}
         checked={on}
+        disabled={narration.noMicrophone}
         onCheckedChange={onChange}
       />
     </span>
@@ -226,15 +229,21 @@ export function NarrationSwitch({
 export function NarrationNotice({
   narration,
   language,
+  className,
 }: {
   narration: NarrationControls;
   language: string;
+  /** Where it is drawn as the browser window's status bar rather than a row under its bar. */
+  className?: string;
 }) {
   const sentence = narrationNoticeSentence(narration, language);
   if (!sentence) return null;
   return (
     <p
-      className="border-b border-border bg-muted/40 px-3 py-2 text-muted-foreground text-sm"
+      className={cn(
+        "border-b border-border bg-muted/40 px-3 py-2 text-muted-foreground text-sm",
+        className,
+      )}
       role="status"
     >
       {sentence}
@@ -243,23 +252,25 @@ export function NarrationNotice({
 }
 
 /**
- * What the person needs to know about narration, or null when it is simply on or off as they set it. `lost` is whether
- * to say that some of it did not reach the Recorder.
+ * Narration is off when the browser cannot hear the person, or they turned it off. It is capturing only while it hears
+ * them, which is only while a recording runs (`useNarration` has no status otherwise); else it is simply on.
  */
 function narrationNoticeSentence(
   narration: NarrationControls,
-  language: string,
-  lost = true,
+  _language: string,
 ): string | null {
-  return !narration.supported
-    ? narrationProblemSentence("unsupported", language)
-    : narration.status?.state === "failed"
-      ? narrationProblemSentence(narration.status.problem, language)
-      : narration.status?.state === "downloading"
-        ? downloadingSentence(language)
-        : lost && narration.lost
-          ? lostNarrationSentence(narration.lost.error)
-          : null;
+  if (narration.supported && narration.noMicrophone)
+    return NARRATION_NO_MICROPHONE;
+  if (
+    !narration.supported ||
+    !narration.on ||
+    narration.status?.state === "failed" ||
+    narration.status?.state === "downloading"
+  )
+    return NARRATION_OFF;
+  return narration.status?.state === "listening"
+    ? NARRATION_CAPTURING
+    : NARRATION_ON;
 }
 
 /**
@@ -268,8 +279,7 @@ function narrationNoticeSentence(
  * always says what narration does, so a person deciding whether to talk knows before Record whether it is heard, and
  * how; and while the page hears them it says Listening, so an open microphone is never something to guess at.
  *
- * `choice` is the person's preference (`useNarrationChoice`), null until they answered the question Record asks first.
- * `onChange` keeps a new one, as the bar's switch does.
+ * `onChange` keeps the person's new choice, as the bar's switch does.
  *
  * `recording` is whether the person's recording is running. Narration that did not reach the Recorder is news only
  * then: a phrase cut off as the wheel went back was refused because the recording had already ended, which the
@@ -277,30 +287,22 @@ function narrationNoticeSentence(
  */
 export function NarrationRow({
   narration,
-  choice,
   language,
   recording,
   onChange,
 }: {
   narration: NarrationControls;
-  choice: NarrationChoice["narration"];
   language: string;
   recording: boolean;
   onChange: (on: boolean) => void;
 }) {
   const labelId = useId();
-  const notice = narrationNoticeSentence(narration, language, recording);
+  const notice = narrationNoticeSentence(narration, language);
   const listening =
     !notice && recording && narration.status?.state === "listening";
   const sentence =
     notice ??
-    (listening
-      ? "Listening. Say what you're doing as you go."
-      : narration.on
-        ? "On. OpenBot hears your microphone while you record and turns your speech into text on your computer, so say what you're doing as you go."
-        : choice === null
-          ? "Not chosen yet. Record asks before your first recording, and the microphone stays closed until you say yes."
-          : "Off. What you say isn't recorded.");
+    (narration.supported && narration.on ? NARRATION_ON : NARRATION_OFF);
   return (
     <Item size="sm">
       <ItemMedia variant="icon">
@@ -332,6 +334,7 @@ export function NarrationRow({
           <Switch
             aria-labelledby={labelId}
             checked={narration.on}
+            disabled={narration.noMicrophone}
             onCheckedChange={onChange}
           />
         </ItemActions>

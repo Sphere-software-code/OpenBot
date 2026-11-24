@@ -17,13 +17,14 @@ import {
   Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
-import { cleanup, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AbstractAvatar } from "@/components/agents/abstract-avatar";
 import { appConfig } from "@/lib/generated/application-config";
-import { NAVIGATION, navigationFor } from "@/lib/navigation";
+import { isNavigationLink, NAVIGATION, navigationFor } from "@/lib/navigation";
 import { queryClient } from "@/query-client";
 import { opendots } from "@/skins/opendots";
+import { DEFAULT_SKIN, setSkin } from "@/skins/store";
 import type { AgentProfileStore } from "../../server/src/agents/profile-store";
 import type { AgentProfile } from "../../server/src/agents/profile-types";
 import { createAgentRoutes } from "../../server/src/agents/routes";
@@ -125,6 +126,7 @@ let actor: Actor = person;
 let bots: AgentProfile[] = [];
 let channels: ReturnType<typeof channel>[] = [];
 let agentsFail = false;
+let edition: "team" | "personal" = "team";
 const paused = new Set<string>();
 
 let originalFetch: typeof fetch;
@@ -163,6 +165,10 @@ async function serve(path: string, init?: RequestInit): Promise<Response> {
       user: { ...actor, name: "Dana Reyes", onboarding: null },
     });
   }
+  if (url.pathname === "/api/capabilities") {
+    // A team deployment unless a test says otherwise, where people sign in, so Sign out is offered.
+    return Response.json({ localEvaluation: false, edition });
+  }
   if (url.pathname === "/api/channels") {
     return Response.json({ channels, nextCursor: null });
   }
@@ -183,7 +189,7 @@ async function serve(path: string, init?: RequestInit): Promise<Response> {
     return Response.json({ memories: [] });
   }
   if (url.pathname === "/api/bots/attention") {
-    return Response.json({ bots: [] });
+    return Response.json({ bots: [], lastPingId: null });
   }
   const lifecycle = url.pathname.match(
     /^\/api\/bots\/([^/]+)\/(lifecycle|pause|resume)$/,
@@ -217,9 +223,12 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  // The frame is OpenDots, so the avatars inside it wear OpenDots too.
+  act(() => setSkin("opendots"));
   requests.length = 0;
   actor = person;
   agentsFail = false;
+  edition = "team";
   paused.clear();
   bots = [
     profile("ada", "Ada"),
@@ -234,6 +243,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  act(() => setSkin(DEFAULT_SKIN));
   // The app's one client, as the mutations invalidate it; each test starts from an empty cache.
   queryClient.clear();
 });
@@ -437,7 +447,10 @@ describe("OpenDots frame", () => {
     async (_who, signedIn) => {
       actor = signedIn;
       const { view } = draw("/");
-      const expected = navigationFor(signedIn.role);
+      // Routines is OpenDots' own rail button, to its own screen, so the list's entry is left out.
+      const expected = navigationFor(signedIn.role)
+        .filter(isNavigationLink)
+        .filter((item) => item.id !== "routines");
       const rail = await view.findByRole("navigation", {
         name: "Workspace navigation",
       });
@@ -464,7 +477,9 @@ describe("OpenDots frame", () => {
       const railDestinations = within(rail)
         .getAllByRole("link")
         .map((link) => link.getAttribute("href"))
-        .filter((href) => NAVIGATION.some((item) => item.to === href));
+        .filter((href) =>
+          NAVIGATION.filter(isNavigationLink).some((item) => item.to === href),
+        );
       expect(railDestinations).toEqual(expected.map((item) => item.to));
       const sidebar = view.getByRole("complementary", { name: "Sidebar" });
       for (const item of expected) {
@@ -584,9 +599,58 @@ describe("OpenDots screens", () => {
         <Screen />
       </QueryClientProvider>,
     );
-    expect(view.getByRole("heading", { name: "Memories" })).toBeTruthy();
+    expect(await view.findByRole("heading", { name: "Memories" })).toBeTruthy();
     expect(await view.findByText("No memories yet")).toBeTruthy();
     expect(view.getByRole("button", { name: /Remember a fact/ })).toBeTruthy();
+  });
+});
+
+/** The personal edition has no memory: OpenBot Desktop's local Intelligence isn't licensed for it. */
+describe("OpenDots in the personal edition", () => {
+  test("has no Memories row", async () => {
+    edition = "personal";
+    const { view } = draw("/");
+    const workspace = await view.findByRole("navigation", {
+      name: "Workspace",
+    });
+    await within(workspace).findByText("Routines");
+    await waitFor(() =>
+      expect(within(workspace).queryByText("Memories")).toBeNull(),
+    );
+    expect(hrefs(view.container)).not.toContain("/s/memories");
+    expect(requests.some((request) => request.path === "/api/memory")).toBe(
+      false,
+    );
+  });
+
+  test("sends the Memories screen home", async () => {
+    edition = "personal";
+    const Screen = opendots.screens?.memories;
+    if (!Screen) throw new Error("OpenDots has no memories screen");
+    const root = createRootRoute({ component: Outlet });
+    const router = createRouter({
+      history: createMemoryHistory({ initialEntries: ["/s/memories"] }),
+      routeTree: root.addChildren([
+        createRoute({
+          getParentRoute: () => root,
+          path: "/",
+          component: () => <p>OpenBot home</p>,
+        }),
+        createRoute({
+          getParentRoute: () => root,
+          path: "/s/memories",
+          component: () => <Screen />,
+        }),
+      ]),
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    expect(await view.findByText("OpenBot home")).toBeTruthy();
+    expect(router.state.location.pathname).toBe("/");
+    expect(view.queryByRole("heading", { name: "Memories" })).toBeNull();
   });
 });
 
@@ -604,7 +668,10 @@ describe("OpenDots skin wears the deployment's brand", () => {
     await view.findByRole("navigation", { name: "Your Bots" });
     await view.findByRole("heading", { name: "Ada" });
     const productName = appConfig.brand.productName;
-    expect(view.getByTestId("opendots-wordmark").textContent).toBe(productName);
+    // The name as a brand mark: OpenBot's wordmark carries the trademark sign, as on open.bot.
+    expect(view.getByTestId("opendots-wordmark").textContent).toBe(
+      `${productName}™`,
+    );
     expect(
       view.getAllByRole("link", { name: `${productName} home` }).length,
     ).toBe(2);

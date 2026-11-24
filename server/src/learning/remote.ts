@@ -9,6 +9,7 @@ import {
   type RunFinishedEvent,
   type ToolCall,
 } from "@ag-ui/client";
+import { RUN_ENDED_EARLY } from "@openbot/toolkit/headless-tools";
 import { map, Observable, type Subscription } from "rxjs";
 import type { AcquireLearnedSkills, LearnedSkillInvocation } from "./runtime";
 
@@ -18,6 +19,9 @@ const RESERVED_TOOLS = new Set([
   "copilotkit_load_skill",
   "copilotkit_read_skill_file",
 ]);
+
+/** The tools this middleware adds to a run, at most: what a run's tool budget leaves room for. */
+export const LEARNED_SKILL_TOOL_COUNT = RESERVED_TOOLS.size;
 const MAX_SKILL_STEPS = 10;
 
 /**
@@ -165,8 +169,7 @@ export class RemoteLearnedSkillsMiddleware extends Middleware {
               });
           });
           if (subscriber.closed || failed) return;
-          if (!terminal)
-            throw new Error("Remote agent ended without a terminal event.");
+          if (!terminal) throw new Error(RUN_ENDED_EARLY);
           const answered = new Set(
             messages.flatMap((message) =>
               message.role === "tool" ? [message.toolCallId] : [],

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
 import { createCredentialStore } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
@@ -90,16 +90,56 @@ const settingInput = {
   intervalMinutes: 60,
 };
 
-test("settings are owner scoped, one per Bot, and bounded in frequency", async () => {
+test("a Bot watches several things, each once, and an offer accepted again turns it back on", async () => {
+  const brief = {
+    ...settingInput,
+    agentId: secondBot,
+    subject: "Launch brief in Notion",
+    sourceLink: "https://www.notion.so/launch-brief",
+    intervalMinutes: 1440,
+  };
+  const inbox = {
+    ...settingInput,
+    agentId: secondBot,
+    subject: "Your Gmail inbox",
+    intervalMinutes: 1440,
+  };
+  const first = await proactive.create(owner, brief, `${prefix}-b1`);
+  const second = await proactive.create(owner, inbox, `${prefix}-b2`);
+  expect(second.id).not.toBe(first.id);
+  expect(first).toMatchObject({
+    subject: "Launch brief in Notion",
+    sourceLink: "https://www.notion.so/launch-brief",
+  });
+  await proactive.update(owner, first.id, { enabled: false });
+  const again = await proactive.create(
+    owner,
+    { ...brief, subject: "The launch brief", intervalMinutes: 240 },
+    `${prefix}-b3`,
+  );
+  expect(again).toMatchObject({
+    id: first.id,
+    enabled: true,
+    intervalMinutes: 240,
+  });
+  const mine = (await proactive.list(owner)).filter(
+    (row) => row.agentId === secondBot,
+  );
+  expect(mine).toHaveLength(2);
+  for (const row of mine) await proactive.remove(owner, row.id);
+});
+
+test("settings are owner scoped, one per thing a Bot watches, and bounded in frequency", async () => {
   const setting = await proactive.create(owner, settingInput, `${prefix}-t`);
   expect(setting).toMatchObject({
     enabled: true,
     intervalMinutes: 60,
     lastStatus: "idle",
   });
-  await expect(
-    proactive.create(owner, settingInput, `${prefix}-t2`),
-  ).rejects.toBeInstanceOf(ProactiveRefusedError);
+  // The same thing again is the same check-in, not a second one.
+  expect((await proactive.create(owner, settingInput, `${prefix}-t2`)).id).toBe(
+    setting.id,
+  );
   await expect(
     proactive.create(
       owner,
@@ -176,6 +216,53 @@ test("a due setting is claimed once and its next run moves forward by its interv
   await proactive.update(owner, setting.id, { enabled: true });
 });
 
+test("a next check-in is counted on this server's clock, which the sweep decides on, even with the database's clock ahead", async () => {
+  // A database whose `now()` reads a minute ahead of this server: this connection finds a stand-in
+  // `now()` before Postgres's own.
+  const clock = `clock_ahead_${randomUUID().replaceAll("-", "")}`;
+  await database.execute(sql.raw(`create schema ${clock}`));
+  await database.execute(
+    sql.raw(
+      `create function ${clock}.now() returns timestamptz language sql stable as $$ select pg_catalog.now() + interval '1 minute' $$`,
+    ),
+  );
+  const url = new URL(testDatabaseUrl());
+  url.searchParams.set("search_path", `${clock},public,pg_catalog`);
+  const ahead = createDatabase(url.toString(), { max: 1 });
+  const store = createProactiveStore(ahead);
+  const minutesOut = (row: { nextRunAt: Date }) =>
+    (row.nextRunAt.getTime() - Date.now()) / 60_000;
+  try {
+    const created = await store.create(
+      owner,
+      { ...settingInput, subject: "The clock", intervalMinutes: 240 },
+      `${prefix}-clock`,
+    );
+    expect(minutesOut(created)).toBeLessThanOrEqual(240);
+    const changed = await store.update(owner, created.id, {
+      intervalMinutes: 120,
+    });
+    expect(minutesOut(changed)).toBeLessThanOrEqual(120);
+    await store.update(owner, created.id, { enabled: false });
+    expect(
+      minutesOut(await store.update(owner, created.id, { enabled: true })),
+    ).toBeLessThanOrEqual(120);
+    await ahead
+      .update(proactiveSettings)
+      .set({ nextRunAt: new Date(Date.now() - 1000) })
+      .where(eq(proactiveSettings.id, created.id));
+    const [claimed] = (await store.claimDue(10)).filter(
+      (row) => row.id === created.id,
+    );
+    if (!claimed) throw new Error("the due check-in was not claimed");
+    expect(minutesOut(claimed)).toBeLessThanOrEqual(120);
+    await store.remove(owner, created.id);
+  } finally {
+    await ahead.$client.close();
+    await database.execute(sql.raw(`drop schema ${clock} cascade`));
+  }
+});
+
 test("a run's reads come from its own successful audit rows only", async () => {
   const runId = randomUUID();
   const otherRun = randomUUID();
@@ -208,7 +295,7 @@ test("a run's reads come from its own successful audit rows only", async () => {
   expect(reads[0]?.at).toBeInstanceOf(Date);
 });
 
-test("suggestions are delivered once, listed to their owner, and resolved once", async () => {
+test("items carry their normalized title, are listed to their owner, and are resolved once", async () => {
   const [setting] = await proactive.list(owner);
   if (!setting) throw new Error("setting missing");
   const runId = randomUUID();
@@ -235,11 +322,11 @@ test("suggestions are delivered once, listed to their owner, and resolved once",
     sourceLink: null,
   });
   expect(await proactive.countSuggestions(runId)).toBe(2);
-  expect(await proactive.undelivered(runId)).toHaveLength(2);
-  await proactive.markDelivered(suggestion.id);
-  expect((await proactive.undelivered(runId)).map((row) => row.title)).toEqual([
-    "Second",
-  ]);
+  expect(suggestion).toMatchObject({
+    dedupeKey: "reply to sam",
+    pingId: null,
+    status: "open",
+  });
   expect(
     (await proactive.suggestions(owner)).some(
       (row) => row.id === suggestion.id,
@@ -266,7 +353,7 @@ test("suggestions are delivered once, listed to their owner, and resolved once",
   ).toBe(false);
 });
 
-test("a run's history is its open and recently dismissed titles, and a finished run supersedes the rest", async () => {
+test("open items stay open across check-ins until the person starts or hides one, or a check-in clears it", async () => {
   const setting = await proactive.create(
     owner,
     { ...settingInput, agentId: secondBot },
@@ -280,32 +367,60 @@ test("a run's history is its open and recently dismissed titles, and a finished 
       runId,
       title,
       detail: `${title}.`,
-      sourceApp: null,
-      sourceRef: null,
+      sourceApp: "Issue tracker",
+      sourceRef: ref,
       sourceLink: null,
     });
   const earlier = randomUUID();
-  await add(earlier, "Reply to Sam");
-  await add(earlier, "Reply to Sam");
-  const dropped = await add(earlier, "Archive old tickets");
-  await proactive.resolveSuggestion(owner, dropped.id, "dismissed");
-  expect(await proactive.history(setting.id)).toEqual({
-    open: ["Reply to Sam"],
-    dismissed: ["Archive old tickets"],
-  });
-
+  const kept = await add(earlier, "Reply to Sam");
+  const hidden = await add(earlier, "Archive old tickets");
+  const started = await add(earlier, "Book the venue");
+  const cleared = await add(earlier, "Answer the supplier");
+  await proactive.resolveSuggestion(owner, hidden.id, "dismissed");
+  await proactive.resolveSuggestion(owner, started.id, "started");
+  expect(
+    (await proactive.clearSuggestion(setting.id, cleared.id))?.status,
+  ).toBe("superseded");
+  // A later check-in's items sit beside the earlier ones: nothing is replaced wholesale.
   const latest = randomUUID();
-  const kept = await add(latest, "Reply to Sam");
-  await proactive.supersede(setting.id, latest);
+  const fresh = await add(latest, "Send the invoice");
   const open = (await proactive.suggestions(owner)).filter(
     (row) => row.settingId === setting.id,
   );
-  expect(open.map((row) => row.id)).toEqual([kept.id]);
-  // The person's dismissal is untouched; only what was still open is superseded.
-  expect(await proactive.history(setting.id)).toEqual({
-    open: ["Reply to Sam"],
-    dismissed: ["Archive old tickets"],
+  expect(open.map((row) => row.id).sort()).toEqual([kept.id, fresh.id].sort());
+  /*
+   * What the next check-in refuses against: the person's own decisions, on every one of their Bots,
+   * each naming its Bot ("Second" is the first Bot's, still open). Started is this Bot's alone.
+   */
+  const prior = await proactive.priorItems(owner, secondBot);
+  expect(prior.open.map((row) => [row.agentId, row.title]).sort()).toEqual([
+    [bot, "Second"],
+    [secondBot, "Reply to Sam"],
+    [secondBot, "Send the invoice"],
+  ]);
+  expect(prior.hidden).toEqual([
+    {
+      agentId: secondBot,
+      title: "Archive old tickets",
+      sourceLink: null,
+      sourceApp: "Issue tracker",
+    },
+  ]);
+  expect(prior.started).toEqual([{ title: "Book the venue" }]);
+  expect(await proactive.priorItems(other, secondBot)).toEqual({
+    open: [],
+    tasks: [],
+    hidden: [],
+    started: [],
   });
+  // Cleared once; a second clear, or one of another setting's, finds nothing.
+  expect(await proactive.clearSuggestion(setting.id, cleared.id)).toBeNull();
+  const [first] = await proactive
+    .list(owner)
+    .then((rows) => rows.filter((row) => row.agentId === bot));
+  expect(
+    await proactive.clearSuggestion(first?.id as string, kept.id),
+  ).toBeNull();
 });
 
 test("Bot-formed memories carry provenance, await review, and never come back once forgotten", async () => {

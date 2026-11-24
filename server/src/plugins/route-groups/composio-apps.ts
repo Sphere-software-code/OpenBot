@@ -1,5 +1,6 @@
 import { requireAdmin } from "../../auth/guards";
 import { reasonWithoutStatement } from "../../db/query-failure";
+import { appsPage } from "../../edition";
 import { BROKERED_PROFILE } from "../access";
 import {
   type BrokerApp,
@@ -241,7 +242,7 @@ export async function enableComposioApp(
     return {
       ok: false,
       error: slug
-        ? `${slug} is not an app ${BROKERED_PROFILE[activeProvider].vendor} lists for this deployment.`
+        ? `${slug} isn't one of the apps you can connect.`
         : "An app is required.",
       status: 400,
     };
@@ -338,7 +339,7 @@ export async function enableComposioApp(
     if (error instanceof CatalogueEntryUnknownError) {
       return {
         ok: false,
-        error: `${app.name} was added, and then could not be read back out of this deployment's own servers — so the row and its trail entry stand, and what is on this page may be missing it. Reload the Plugins page: if ${app.name} is there it is enabled and there is nothing to redo, and if it is not, adding it again is safe.`,
+        error: `${app.name} was added, and then could not be read back out of this deployment's own servers — so the row and its trail entry stand, and what is on this page may be missing it. Reload the ${appsPage()} page: if ${app.name} is there it is enabled and there is nothing to redo, and if it is not, adding it again is safe.`,
         status: 409,
       };
     }
@@ -390,7 +391,7 @@ export async function enableComposioApp(
       ok: false,
       ...brokerRefusal(
         error,
-        `${app.name} could not be enabled, and ${activeVendor} said nothing about why. Try again, and check this deployment's ${activeVendor} key if it persists.`,
+        `Couldn't turn on ${app.name}, and no reason was given. Try again, and check ${BROKERED_PROFILE[activeProvider].envVar} if it keeps happening.`,
       ),
     };
   }

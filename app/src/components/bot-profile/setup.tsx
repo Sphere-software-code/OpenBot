@@ -3,6 +3,7 @@ import {
   IconDeviceDesktop,
   IconEye,
   IconId,
+  IconNotes,
   IconPlugConnected,
   IconShieldCheck,
   IconTag,
@@ -12,6 +13,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Fragment, useState } from "react";
 import type { ZodType } from "zod";
 import { CallbackTokenPanel } from "@/components/agents/callback-token-panel";
+import { BusinessComputerLink } from "@/components/edition/team-features-dialog";
 import { PageRows, PageSection } from "@/components/layout/page-shell";
 import { Button } from "@/components/ui/button";
 import {
@@ -60,11 +62,13 @@ import {
   type AgentProfile,
   agentCapabilitiesQueryOptions,
 } from "@/lib/agents/queries";
+import { shownSubtitle } from "@/lib/agents/subtitle";
 import { isComposing } from "@/lib/composing";
+import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
 import { myCapabilitiesQueryOptions } from "@/lib/enterprise/queries";
 import { queryClient } from "@/query-client";
 
-type TextField = "name" | "title" | "roleDescription";
+type TextField = "name" | "title" | "roleDescription" | "instructions";
 
 const TEXT_FIELDS: {
   field: TextField;
@@ -78,14 +82,33 @@ const TEXT_FIELDS: {
     field: "roleDescription",
     // Not "Role": beside "Title" it read as a second job title, when it is the standing
     // instruction the Bot carries into every channel. The create dialog says the same.
+    // The starter Bot is the exception: this is what it does, for the person, and what it is
+    // told is the row below.
     label: "What it does",
     icon: IconTextCaption,
     multiline: true,
   },
+  {
+    // Only the starter Bot has this row. See `AgentProfile.instructions`.
+    field: "instructions",
+    label: "Instructions",
+    icon: IconNotes,
+    multiline: true,
+  },
 ];
+
+const TEXT_SCHEMAS: Record<TextField, ZodType<string>> = {
+  name: agentFormSchema.shape.name,
+  title: agentFormSchema.shape.title,
+  roleDescription: agentFormSchema.shape.roleDescription,
+  instructions: agentFormSchema.shape.instructions.unwrap(),
+};
 
 /** Who a Bot is and where it runs. Editable by whoever may manage it; read-only for everyone else. */
 export function SetupSections({ agent }: { agent: AgentProfile }) {
+  // One person and one shared computer: nobody to see a Bot, and no computer of its own to give it.
+  const personal =
+    useQuery(deploymentCapabilitiesQueryOptions()).data?.edition === "personal";
   const update = useMutation(updateAgentMutationOptions(queryClient));
   const [editing, setEditing] = useState<TextField | null>(null);
   const save = (patch: Partial<AgentFormValues>) =>
@@ -94,12 +117,30 @@ export function SetupSections({ agent }: { agent: AgentProfile }) {
       input: profileUpdateInput(agent, patch),
     });
   const open = TEXT_FIELDS.find((entry) => entry.field === editing);
+  /*
+   * The subtitle as a person reads it everywhere else (lib/agents/subtitle.ts). Saved back unchanged,
+   * it stays as stored: the Bot is told the stored subtitle, and a save of the shown wording would
+   * change that.
+   */
+  const shown = (field: TextField) =>
+    field === "title" ? shownSubtitle(agent.title) : agent[field];
+  const saveText = (field: TextField, value: string) =>
+    save({
+      [field]:
+        field === "title" && value === shownSubtitle(agent.title)
+          ? agent.title
+          : value,
+    });
+  const fields = TEXT_FIELDS.filter(
+    ({ field }) =>
+      field !== "instructions" || typeof agent.instructions === "string",
+  );
 
   return (
     <>
       <PageSection title="Identity">
         <PageRows>
-          {TEXT_FIELDS.map(({ field, label, icon: Icon }, index) => (
+          {fields.map(({ field, label, icon: Icon }, index) => (
             <Fragment key={field}>
               {index > 0 ? <Separator /> : null}
               <Item
@@ -115,7 +156,7 @@ export function SetupSections({ agent }: { agent: AgentProfile }) {
                 </ItemMedia>
                 <ItemContent>
                   <ItemTitle>{label}</ItemTitle>
-                  <ItemDescription>{agent[field]}</ItemDescription>
+                  <ItemDescription>{shown(field)}</ItemDescription>
                 </ItemContent>
                 {agent.canManage ? (
                   <ItemActions>
@@ -125,16 +166,29 @@ export function SetupSections({ agent }: { agent: AgentProfile }) {
               </Item>
             </Fragment>
           ))}
-          <Separator />
-          <VisibilityRow
-            agent={agent}
-            onSave={(visibility) => save({ visibility })}
-          />
-          <Separator />
-          <IsolatedRow
-            agent={agent}
-            onSave={(isolated) => save({ isolated })}
-          />
+          {personal ? (
+            <>
+              <Separator />
+              <Item size="sm">
+                <ItemContent>
+                  <BusinessComputerLink />
+                </ItemContent>
+              </Item>
+            </>
+          ) : (
+            <>
+              <Separator />
+              <VisibilityRow
+                agent={agent}
+                onSave={(visibility) => save({ visibility })}
+              />
+              <Separator />
+              <IsolatedRow
+                agent={agent}
+                onSave={(isolated) => save({ isolated })}
+              />
+            </>
+          )}
           {agent.systemOwned ? (
             <>
               <Separator />
@@ -159,9 +213,9 @@ export function SetupSections({ agent }: { agent: AgentProfile }) {
           label={open.label}
           multiline={open.multiline ?? false}
           onClose={() => setEditing(null)}
-          onSave={(value) => save({ [open.field]: value })}
-          schema={agentFormSchema.shape[open.field]}
-          value={agent[open.field]}
+          onSave={(value) => saveText(open.field, value)}
+          schema={TEXT_SCHEMAS[open.field]}
+          value={shown(open.field) ?? ""}
         />
       ) : null}
     </>
@@ -465,6 +519,7 @@ function ConnectionSection({ agent }: { agent: AgentProfile }) {
         <CallbackTokenPanel
           agentId={agent.id}
           hasToken={agent.hasCallbackToken}
+          fromOpenBot={agent.keyFromOpenBot === true}
         />
       ) : null}
     </PageSection>

@@ -4,8 +4,9 @@
 //! documentation, and the three differ more than they look:
 //!
 //! - **macOS.** `podman machine` puts a Linux VM behind a socket. Inside that VM
-//!   `/var/run/docker.sock` is already a symlink to the rootless socket, so Compose's mount needs no
-//!   help and `ENGINE_SOCKET` stays unset. `applehv` is the default on Apple silicon as of Podman
+//!   `/var/run/docker.sock` is already a symlink to the socket of the mode the machine runs in
+//!   (rootful for the machine OpenBot creates, see `acquire`), so Compose's mount needs no help and
+//!   `ENGINE_SOCKET` stays unset. `applehv` is the default on Apple silicon as of Podman
 //!   6.1, so no `--provider` is passed.
 //! - **Linux.** Podman is native and rootless and there is no VM. `/var/run/docker.sock` is either
 //!   absent or, with `podman-docker` installed, a symlink to the *rootful* socket, which is not the
@@ -36,6 +37,130 @@ use std::sync::OnceLock;
 use crate::quiet::command;
 
 use serde::{Deserialize, Serialize};
+
+/// One line for a setup step's row while the engine comes up.
+///
+/// `elsewhere` when the line sends the person to another app's window: Docker Desktop starting, or
+/// the system's password prompt for Podman's installer. Those windows come to the front over
+/// OpenBot's. The setup window then says the line on whichever screen the person is on, and OpenBot
+/// comes back to the front once that window is done with.
+///
+/// `asks` when the step waits for the person's go-ahead in OpenBot's own window before it raises
+/// such a prompt (`install::GoAhead`). The window explains what comes next, with one button.
+///
+/// `said` is what the person reads, in plain words: what OpenBot is doing for them. `detail` is the
+/// same moment in the log's words, with the names a person never needs on screen (Podman, the
+/// engine machine, WSL). The window shows only `said`; the log keeps both (`log_entry`). A tester
+/// read "Preparing the engine machine" for minutes and could not tell whether setup was stuck.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepLine {
+    pub said: String,
+    pub elsewhere: bool,
+    pub asks: bool,
+    /// The engine itself is being updated (`engine_versions`): the window asks nothing of it until
+    /// the update is done. An engine being updated refuses what is asked of it.
+    pub updating: bool,
+    pub detail: Option<String>,
+}
+
+impl StepLine {
+    /// A line about work OpenBot does by itself.
+    pub fn here(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            elsewhere: false,
+            asks: false,
+            updating: false,
+            detail: None,
+        }
+    }
+
+    /// A line about a window of another app that may need the person.
+    pub fn elsewhere(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            elsewhere: true,
+            asks: false,
+            updating: false,
+            detail: None,
+        }
+    }
+
+    /// A line about a step that waits for the person's go-ahead in OpenBot's window.
+    pub fn asks(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            elsewhere: false,
+            asks: true,
+            updating: false,
+            detail: None,
+        }
+    }
+
+    /// A line said while the engine itself is being updated: see `updating`.
+    pub fn updating(mut self) -> Self {
+        self.updating = true;
+        self
+    }
+
+    /// The technical words for the log, beside the plain line the window shows.
+    pub fn logged(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// What the Desktop log writes for this line: the technical detail when there is one, then
+    /// what the window said, so the log reads as the window did and loses nothing.
+    pub fn log_entry(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{detail} (window: {})", self.said),
+            None => self.said.clone(),
+        }
+    }
+}
+
+/// Preparing the machine OpenBot's containers run in (`podman machine init`). Minutes the first
+/// time: it downloads the machine's disk.
+///
+/// On Windows, Podman's own installer for WSL comes first when WSL is missing: its dialog, then
+/// Windows' administrator prompt, then a restart. Said before it happens, on whichever screen the
+/// person is on: those windows come to the front over OpenBot's.
+pub fn preparing_machine_line(os: &str) -> StepLine {
+    if os == "windows" {
+        StepLine::elsewhere(
+            "Preparing this computer to run OpenBot. If a window asks to install a Windows \
+             feature OpenBot needs, allow it. Windows then asks for your approval and a restart.",
+        )
+        .logged(
+            "Preparing the engine machine (podman machine init). If Windows Subsystem for Linux \
+             is missing, Podman offers to install it. Windows then asks for administrator approval \
+             and a restart.",
+        )
+    } else {
+        StepLine::here(
+            "Preparing this computer to run OpenBot. This takes a few minutes the first time.",
+        )
+        .logged("Preparing the engine machine (podman machine init).")
+    }
+}
+
+/// Starting that machine (`podman machine start`): at install, and on a start after a restart.
+pub fn starting_machine_line() -> StepLine {
+    StepLine::here("Starting the software OpenBot runs on.")
+        .logged("Starting the engine machine (podman machine start).")
+}
+
+/// Waiting for the engine to answer once its machine is up.
+pub fn checking_engine_line() -> StepLine {
+    StepLine::here("Checking that the software OpenBot runs on is ready.")
+        .logged("Waiting for the engine to answer.")
+}
+
+/// The engine answers: what the row says once it is done.
+pub fn engine_ready_line() -> StepLine {
+    StepLine::here("The software OpenBot runs on is ready.")
+        .logged("The container engine is answering.")
+}
 
 /// Which engine is in use, because the answer changes what is mounted and what is reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,7 +403,11 @@ pub struct EngineStatus {
 ///
 /// Somebody who already has a machine up is handed it rather than made to wait while a duplicate
 /// boots beside it. Ours is preferred among running machines only so that repeat launches settle on
-/// the same one.
+/// the same one. A machine of the person's own that OpenBot cannot run on is passed over: see
+/// `passed_over`.
+///
+/// Answers with the connection for the machine's own mode (see `acquire::connection_for`): a rootful
+/// machine is reached through `<name>-root`, where its rootful engine is.
 fn running_machine(preferred: &str) -> Option<String> {
     let output = tool(Engine::Podman)
         .args(["machine", "list", "--format", "json"])
@@ -288,11 +417,89 @@ fn running_machine(preferred: &str) -> Option<String> {
         return None;
     }
     let machines: Vec<MachineListing> = serde_json::from_slice(&output.stdout).ok()?;
+    usable_running_machine(&machines, preferred, |name| {
+        passed_over(name, std::env::consts::OS, crate::acquire::machine_behind).is_some()
+    })
+    .map(|name| crate::acquire::connection_of_machine(&name))
+}
+
+/// The running machine to use, by name: `preferred` when it runs, else the first running one that
+/// is not `passed_over`.
+fn usable_running_machine(
+    machines: &[MachineListing],
+    preferred: &str,
+    passed_over: impl Fn(&str) -> bool,
+) -> Option<String> {
     let running = || machines.iter().filter(|machine| machine.running);
+    if let Some(ours) = running().find(|machine| machine.name == preferred) {
+        return Some(ours.name.clone());
+    }
     running()
-        .find(|machine| machine.name == preferred)
-        .or_else(|| running().next())
+        .find(|machine| !passed_over(&machine.name))
         .map(|machine| machine.name.clone())
+}
+
+/**
+The person's own Podman machine behind `address`, by name, when OpenBot does not run on it and uses
+its own machine (`acquire::MACHINE`) instead.
+
+- **Rootless, anywhere.** Local Intelligence needs rootful Podman, and its CLI refuses a rootless
+  machine ("Rootless Podman is not supported"). `podman machine init` makes a rootless machine by
+  default, so a person who already uses Podman usually has one, and OpenBot used to settle on it and
+  stop at that refusal. OpenBot never switches somebody's machine (see `acquire::create_machine`).
+- **Any machine of theirs, on Windows.** OpenBot's own machine there has what OpenBot's containers
+  need to reach this computer: user-mode networking, and `host.containers.internal` set to its
+  gateway (`acquire::configure_host_gateway_after_start`). A person's machine has neither. Found on
+  a live Windows run with the person's machine switched to rootful by hand: `host.docker.internal`
+  answered with the WSL VM's bridge gateway, where nothing listens, so the server could not reach
+  Intelligence and every chat said "OpenBot couldn't reach its backend". A Mac machine has no such
+  setting: every applehv machine reaches this computer through gvproxy's gateway, and OpenBot makes
+  its own with nothing but `--rootful`, so a person's rootful machine there is used as before.
+
+OpenBot's own machine is never the person's, even one an early release created rootless: OpenBot's
+database is in it. A connection that is not a machine's (a remote host somebody added) is not one
+either, and is used as before.
+
+On Windows OpenBot's machine runs beside theirs, and on a Mac in its place while OpenBot runs (see
+`own_machine`).
+*/
+pub fn passed_over_machine(address: &Address) -> Option<String> {
+    if address.engine != Engine::Podman || !matches!(std::env::consts::OS, "macos" | "windows") {
+        return None;
+    }
+    let connection = match &address.connection {
+        Some(connection) => connection.clone(),
+        None => address.pin().ok()?.connection?,
+    };
+    passed_over(
+        &connection,
+        std::env::consts::OS,
+        crate::acquire::machine_behind,
+    )
+}
+
+/// `passed_over_machine` for the connection `connection` on `os`, with the machine behind it read
+/// by `machine_behind`.
+pub(crate) fn passed_over(
+    connection: &str,
+    os: &str,
+    machine_behind: impl FnOnce(&str) -> Result<crate::acquire::MachineFacts, String>,
+) -> Option<String> {
+    let machine = crate::acquire::machine_of(connection);
+    if machine == crate::acquire::MACHINE {
+        return None;
+    }
+    // On Windows every machine but OpenBot's is passed over, so none is asked anything.
+    if os == "windows" {
+        return Some(machine.to_string());
+    }
+    let facts = machine_behind(connection).ok()?;
+    let usable = match os {
+        "windows" => false,
+        "macos" => facts.rootful != Some(false),
+        _ => true,
+    };
+    (!usable).then(|| machine.to_string())
 }
 
 #[derive(Deserialize)]
@@ -333,6 +540,11 @@ pub fn tool(engine: Engine) -> Command {
 }
 
 fn command_at(engine: Engine, binary: &Path) -> Command {
+    command_configured(engine, binary, crate::docker_config::owned())
+}
+
+/// `command_at`, with OpenBot's Docker configuration kept in `docker_config`.
+fn command_configured(engine: Engine, binary: &Path, docker_config: Option<&Path>) -> Command {
     let mut built = command(binary);
     let mut path = tools_dir()
         .map(|dir| path_with(dir))
@@ -369,14 +581,62 @@ fn command_at(engine: Engine, binary: &Path) -> Command {
     if let Some(path) = path {
         built.env("PATH", path);
     }
+    // A pull through the person's own configuration runs Docker Desktop's credential helper,
+    // which macOS stops to ask about when OpenBot runs it. See `docker_config`.
+    if let Some(dir) = docker_config.and_then(|owned| {
+        crate::docker_config::for_commands_in(owned, |name| std::env::var_os(name))
+    }) {
+        built.env("DOCKER_CONFIG", dir);
+    }
     built
+}
+
+/**
+This process's PATH with Docker's own directories appended, for a program that looks `docker` up by
+name, or None when there is no Docker here.
+
+Opened from Finder, the app has the system's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which
+does not reach Docker Desktop's `/usr/local/bin`. Appended, so a `docker` the person put first on
+their PATH stays first; both the link and the directory it resolves to, as `command_at` does.
+*/
+pub fn path_with_docker() -> Option<OsString> {
+    path_with_engines(&[Engine::Docker])
+}
+
+/// `path_with_docker`, for each of `engines` that is here, or None when none is.
+///
+/// The Intelligence CLI runs `podman` by name as it runs `docker`, and a Podman OpenBot installed
+/// in this session is not on this process's PATH (see the PATH rule above).
+pub fn path_with_engines(engines: &[Engine]) -> Option<OsString> {
+    let binaries: Vec<PathBuf> = engines
+        .iter()
+        .filter_map(|engine| program(*engine))
+        .collect();
+    if binaries.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for binary in &binaries {
+        let resolved = std::fs::canonicalize(binary).ok();
+        for directory in [binary.parent(), resolved.as_deref().and_then(Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            if !entries.iter().any(|entry| entry == directory) {
+                entries.push(directory.to_path_buf());
+            }
+        }
+    }
+    std::env::join_paths(entries).ok()
 }
 
 /// This process's PATH with `first` in front of it.
 ///
 /// In front, so the provider OpenBot placed is the one found; appended, a broken `docker-compose`
 /// earlier on PATH would still win.
-fn path_with(first: &Path) -> OsString {
+pub(crate) fn path_with(first: &Path) -> OsString {
     let mut joined = OsString::from(first);
     if let Some(existing) = std::env::var_os("PATH") {
         if !existing.is_empty() {
@@ -436,11 +696,19 @@ fn installer_places(engine: Engine) -> Vec<PathBuf> {
             .flatten()
             .collect()
         }
+        // Docker Desktop per user, then per machine, the places `docker_desktop` looks for the app.
         #[cfg(target_os = "windows")]
-        Engine::Docker => std::env::var_os("ProgramFiles")
-            .map(|files| PathBuf::from(files).join("Docker\\Docker\\resources\\bin\\docker.exe"))
-            .into_iter()
-            .collect(),
+        Engine::Docker => [
+            std::env::var_os("LOCALAPPDATA").map(|local| {
+                PathBuf::from(local).join("Programs\\DockerDesktop\\resources\\bin\\docker.exe")
+            }),
+            std::env::var_os("ProgramFiles").map(|files| {
+                PathBuf::from(files).join("Docker\\Docker\\resources\\bin\\docker.exe")
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         #[cfg(target_os = "macos")]
         Engine::Podman => [
             "/opt/podman/bin/podman",
@@ -496,8 +764,19 @@ pub fn rootless_socket() -> Option<PathBuf> {
 #[cfg(not(target_os = "linux"))]
 pub fn rootless_socket() -> Option<PathBuf> {
     // macOS and Windows run the engine in a virtual machine, and inside it `/var/run/docker.sock`
-    // is already the rootless socket. Compose mounts that path, so there is nothing to override.
+    // is already the socket of the machine's own mode. Compose mounts that path, so there is
+    // nothing to override.
     None
+}
+
+/**
+Whether OpenBot's Podman engine here is only ever its own machine, `acquire::MACHINE`: on Windows,
+where every machine of the person's is passed over (`passed_over_machine`). There nothing of
+theirs is asked or used: not Podman's default connection, which may be theirs, and not another
+running machine. On a Mac a rootful machine of theirs is used as before.
+*/
+pub fn own_machine_only(os: &str) -> bool {
+    os == "windows"
 }
 
 /// What is here, before anything is installed.
@@ -518,9 +797,42 @@ pub fn detect_saved(saved: Option<Engine>) -> EngineStatus {
 }
 
 fn detect_among(engines: &[Engine]) -> EngineStatus {
+    detect_among_with(
+        engines,
+        own_machine_only(std::env::consts::OS),
+        Address::responds,
+        passed_over_machine,
+        || running_machine(crate::acquire::MACHINE),
+        |engine| program(engine).is_some(),
+    )
+}
+
+/// `detect_among`, with how each engine answers passed in, so the choice can be tested on any
+/// computer: whether an address answers, the person's machine behind one that OpenBot passes over
+/// (see `passed_over_machine`), the connection of a running machine OpenBot can use, and whether an
+/// engine is installed.
+fn detect_among_with(
+    engines: &[Engine],
+    own_machine_only: bool,
+    responds: impl Fn(&Address) -> bool,
+    passed_over_machine: impl Fn(&Address) -> Option<String>,
+    running_machine: impl FnOnce() -> Option<String>,
+    installed: impl Fn(Engine) -> bool,
+) -> EngineStatus {
+    // The person's machine answered first, and OpenBot uses its own machine instead.
+    let mut passed_over = None;
     for &engine in engines {
+        // Podman's default connection may be the person's machine, and on Windows OpenBot runs only
+        // on its own: never asked, and OpenBot's machine is found by name below.
+        if own_machine_only && engine == Engine::Podman {
+            continue;
+        }
         let address = Address::new(engine, None);
-        if address.responds() {
+        if responds(&address) {
+            if let Some(theirs) = passed_over_machine(&address) {
+                passed_over = Some(theirs);
+                continue;
+            }
             return answering(address);
         }
     }
@@ -528,16 +840,32 @@ fn detect_among(engines: &[Engine]) -> EngineStatus {
     // Podman's default connection can name a machine that is not running while another one is. That
     // is not "no engine", and creating a second machine in answer to it is the wrong repair.
     if engines.contains(&Engine::Podman) {
-        if let Some(machine) = running_machine(crate::acquire::MACHINE) {
+        if let Some(machine) = running_machine() {
             let address = Address::new(Engine::Podman, Some(machine));
-            if address.responds() {
+            if responds(&address) {
                 return answering(address);
             }
         }
     }
 
+    // Not answering, for OpenBot: its own machine is made or started next, as on a computer with
+    // no machine (see `own_machine`).
+    if let Some(theirs) = passed_over {
+        return EngineStatus {
+            engine: Some(Engine::Podman),
+            address: None,
+            responding: false,
+            engine_socket: None,
+            detail: format!(
+                "podman answers on {theirs}, a machine of the person's own that OpenBot does not \
+                 run on; OpenBot uses its own machine, {}, instead.",
+                crate::acquire::MACHINE
+            ),
+        };
+    }
+
     for &engine in engines {
-        if program(engine).is_some() {
+        if installed(engine) {
             return EngineStatus {
                 engine: Some(engine),
                 address: None,
@@ -646,6 +974,47 @@ fn main() {
         );
         assert_eq!(output.stdout, b"configured helper used\n");
         assert_eq!(std::fs::read(config).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Install's `docker compose pull` and a `docker run` of an image not here yet read Docker's
+    /// configuration, and Docker Desktop's names `docker-credential-desktop`, which macOS stops to
+    /// ask about when OpenBot runs it. OpenBot's commands get its own configuration instead: no
+    /// credential store, the person's context.
+    #[cfg(unix)]
+    #[test]
+    fn engine_commands_run_without_the_persons_docker_credential_helper() {
+        if crate::test_support::isolated_process(
+            "engine::tests::engine_commands_run_without_the_persons_docker_credential_helper",
+        ) {
+            return;
+        }
+        let root = crate::test_support::temp_root("engine docker config");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".docker/contexts/meta")).unwrap();
+        std::fs::write(
+            home.join(".docker/config.json"),
+            r#"{"auths":{"ghcr.io":{}},"credsStore":"desktop","currentContext":"desktop-linux"}"#,
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("DOCKER_CONFIG");
+        let owned = root.join("docker-config");
+
+        let command = command_configured(Engine::Docker, Path::new("docker"), Some(&owned));
+
+        let config = command
+            .get_envs()
+            .find(|(key, _)| *key == "DOCKER_CONFIG")
+            .and_then(|(_, value)| value);
+        assert_eq!(config, Some(owned.as_os_str()));
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(owned.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"currentContext": "desktop-linux"})
+        );
+        assert!(owned.join("contexts/meta").is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -832,6 +1201,235 @@ fn main() {
         assert_eq!(tools_dir_under(downloads), downloads.join("bin"));
     }
 
+    /// What `podman machine inspect` says of a machine, as Podman 6.1.1 reports it.
+    fn facts(rootful: bool) -> Result<crate::acquire::MachineFacts, String> {
+        Ok(crate::acquire::MachineFacts {
+            rootful: Some(rootful),
+            api: None,
+        })
+    }
+
+    const THEIRS: &str = "podman-machine-default";
+
+    /// The live Windows run: the person's `podman-machine-default`, made the default way and so
+    /// rootless, answered first. OpenBot settled on it, and the CLI refused it ("Rootless Podman is
+    /// not supported"). Switched to rootful by hand, it answered and chat still could not reach the
+    /// back end: it has none of the networking OpenBot's own machine is given. So on Windows every
+    /// machine of the person's is passed over, and on a Mac a rootless one.
+    #[test]
+    fn the_persons_machine_is_passed_over_rootless_anywhere_and_any_on_windows() {
+        let missing = |_: &str| Err("Error: not a machine".to_string());
+        for (os, rootful, passed) in [
+            ("windows", false, true),
+            ("windows", true, true),
+            ("macos", false, true),
+            ("macos", true, false),
+        ] {
+            assert_eq!(
+                passed_over(THEIRS, os, |_| facts(rootful)),
+                passed.then(|| THEIRS.to_string()),
+                "{os}, rootful {rootful}"
+            );
+            // Reached through its root connection, it is the same machine.
+            assert_eq!(
+                passed_over(&format!("{THEIRS}-root"), os, |_| facts(rootful)),
+                passed.then(|| THEIRS.to_string()),
+                "{os}, rootful {rootful}, root connection"
+            );
+            // OpenBot's own machine is used as it is, whatever its mode: its database is in it.
+            assert_eq!(passed_over("openbot-root", os, |_| facts(rootful)), None);
+            assert_eq!(passed_over("openbot", os, |_| facts(rootful)), None);
+            // A connection that is not a machine's is used as before on a Mac. On Windows OpenBot
+            // runs only on its own machine, so it is passed over too.
+            assert_eq!(
+                passed_over("remote-host", os, missing),
+                (os == "windows").then(|| "remote-host".to_string())
+            );
+        }
+        // On Windows nothing of the person's is asked anything to decide it.
+        let never = |connection: &str| -> Result<crate::acquire::MachineFacts, String> {
+            panic!("{connection} was inspected")
+        };
+        assert_eq!(
+            passed_over("mine", "windows", never),
+            Some("mine".to_string())
+        );
+    }
+
+    fn listing(machines: &[(&str, bool)]) -> Vec<MachineListing> {
+        machines
+            .iter()
+            .map(|(name, running)| MachineListing {
+                name: name.to_string(),
+                running: *running,
+            })
+            .collect()
+    }
+
+    /// Box I, after OpenBot was uninstalled with its data: OpenBot's machine was gone, Podman had
+    /// made the person's rootless `mine` its default connection, and the engine check landed on it.
+    /// On Windows, Podman's default connection is never asked, and from the running machines only
+    /// OpenBot's is ever picked, without asking any other one anything. So there is no engine for
+    /// OpenBot until its own machine is made again, and the person's is never touched.
+    #[test]
+    fn on_windows_only_openbots_own_machine_is_ever_looked_at() {
+        let touched = std::cell::RefCell::new(Vec::<String>::new());
+        let detect = |machines: Vec<MachineListing>| {
+            detect_among_with(
+                &[Engine::Podman],
+                own_machine_only("windows"),
+                |address| {
+                    touched
+                        .borrow_mut()
+                        .push(format!("asked {:?}", address.connection));
+                    address.connection.as_deref() == Some("openbot-root")
+                },
+                |address| {
+                    touched
+                        .borrow_mut()
+                        .push(format!("passed over? {:?}", address.connection));
+                    None
+                },
+                || {
+                    usable_running_machine(&machines, crate::acquire::MACHINE, |name| {
+                        passed_over(name, "windows", |connection| {
+                            panic!("{connection} was inspected")
+                        })
+                        .is_some()
+                    })
+                    .map(|name| format!("{name}-root"))
+                },
+                |engine| engine == Engine::Podman,
+            )
+        };
+
+        // Only the person's machine, running and the default: no engine for OpenBot.
+        let gone = detect(listing(&[("mine", true)]));
+        assert!(!gone.responding, "{}", gone.detail);
+        assert_eq!(gone.address, None);
+        assert_eq!(gone.engine, Some(Engine::Podman));
+        assert!(touched.borrow().is_empty(), "{:?}", touched.borrow());
+
+        // OpenBot's machine made again and running beside theirs: it, and only it, is used.
+        let ours = detect(listing(&[("mine", true), ("openbot", true)]));
+        assert!(ours.responding);
+        assert_eq!(
+            ours.address.and_then(|address| address.connection),
+            Some("openbot-root".into())
+        );
+        assert_eq!(*touched.borrow(), ["asked Some(\"openbot-root\")"]);
+        assert!(own_machine_only("windows"));
+        assert!(!own_machine_only("macos"));
+    }
+
+    fn podman_default() -> Address {
+        Address::new(Engine::Podman, None)
+    }
+
+    /// The person's machine answers on Podman's default connection and OpenBot's is not up yet: no
+    /// engine for OpenBot, so setup makes and starts its own (`own_machine`), and the person's is
+    /// left out of it. Once OpenBot's machine runs, it is the one used, through its root connection.
+    #[test]
+    fn a_passed_over_machine_leaves_openbot_waiting_for_its_own_then_using_it() {
+        let theirs = |address: &Address| {
+            (address.engine == Engine::Podman && address.connection.is_none())
+                .then(|| THEIRS.to_string())
+        };
+        let answers = |address: &Address| address.engine == Engine::Podman;
+
+        let waiting = detect_among_with(
+            &[Engine::Docker, Engine::Podman],
+            false,
+            answers,
+            theirs,
+            || None,
+            |_| true,
+        );
+        assert!(!waiting.responding);
+        assert_eq!(waiting.engine, Some(Engine::Podman));
+        assert_eq!(waiting.address, None);
+        assert!(waiting.detail.contains(THEIRS), "{}", waiting.detail);
+        assert!(waiting.detail.contains("openbot"), "{}", waiting.detail);
+
+        let ours = detect_among_with(
+            &[Engine::Docker, Engine::Podman],
+            false,
+            answers,
+            theirs,
+            || Some("openbot-root".into()),
+            |_| true,
+        );
+        assert!(ours.responding);
+        assert_eq!(
+            ours.address.and_then(|address| address.connection),
+            Some("openbot-root".into())
+        );
+    }
+
+    /// Docker, and a machine of the person's that OpenBot runs on (rootful, on a Mac), keep today's
+    /// behaviour: whatever answers is used.
+    #[test]
+    fn docker_or_a_usable_machine_that_answers_is_used_as_before() {
+        let never_passed = |_: &Address| None;
+        let docker = detect_among_with(
+            &[Engine::Docker, Engine::Podman],
+            false,
+            |address| address.engine == Engine::Docker,
+            never_passed,
+            || panic!("Docker answered"),
+            |_| true,
+        );
+        assert!(docker.responding);
+        assert_eq!(docker.engine, Some(Engine::Docker));
+
+        let podman = detect_among_with(
+            &[Engine::Docker, Engine::Podman],
+            false,
+            |address| address.engine == Engine::Podman,
+            never_passed,
+            || panic!("the default connection answered"),
+            |_| true,
+        );
+        assert!(podman.responding);
+        assert_eq!(podman.address, Some(podman_default()));
+    }
+
+    /// A machine of the person's that OpenBot passes over is never picked from the running
+    /// machines either. Ours is, and so is one OpenBot can use.
+    #[test]
+    fn a_running_passed_over_machine_is_never_the_one_used() {
+        let listing = |machines: &[(&str, bool)]| -> Vec<MachineListing> {
+            machines
+                .iter()
+                .map(|(name, running)| MachineListing {
+                    name: name.to_string(),
+                    running: *running,
+                })
+                .collect()
+        };
+        let theirs_passed = |name: &str| name == THEIRS;
+        assert_eq!(
+            usable_running_machine(&listing(&[(THEIRS, true)]), "openbot", theirs_passed),
+            None
+        );
+        assert_eq!(
+            usable_running_machine(
+                &listing(&[(THEIRS, true), ("openbot", true)]),
+                "openbot",
+                theirs_passed
+            ),
+            Some("openbot".into())
+        );
+        assert_eq!(
+            usable_running_machine(
+                &listing(&[(THEIRS, true), ("rootful-one", true)]),
+                "openbot",
+                theirs_passed
+            ),
+            Some("rootful-one".into())
+        );
+    }
+
     #[test]
     fn an_answering_engine_says_which_machine_answered() {
         let status = answering(Address::new(Engine::Podman, Some("openbot".into())));
@@ -843,6 +1441,24 @@ fn main() {
         );
     }
 }
+
+/**
+Where a container under rootless Podman reaches this machine's loopback.
+
+Rootless Podman puts its containers in a network namespace of the person's own, and by default
+nothing in it leads back to the host's `127.0.0.1`: slirp4netns runs with host loopback disabled
+and pasta with `--no-map-gw`. The server is a container now, and what it calls on this machine
+listens only on loopback: a local Intelligence. Measured
+on Ubuntu 24.04 (Podman 4.9.3, slirp4netns) and Fedora 44 (Podman 5.8.9, pasta): a container on a
+Compose network reached neither, at any address, until [`local_api::HOST_LOOPBACK_CONFIG`] was in
+place, and then reached both at this address, which is slirp4netns's fixed one and which pasta is
+told to map.
+
+Docker Desktop and the Podman machines on macOS and Windows already forward `host.docker.internal`
+to the host's loopback, so this is for rootless Podman on Linux alone. Compose is pointed at it
+through `OPENBOT_HOST_GATEWAY` (see `env::compose`).
+*/
+pub const ROOTLESS_HOST_LOOPBACK: &str = "10.0.2.2";
 
 /// A native Podman API service belongs to the desktop session only when this session spawned it.
 /// Existing user/systemd services are probed and reused, never stopped or reconfigured.
@@ -861,6 +1477,81 @@ pub mod local_api {
     pub struct Service {
         child: Option<Child>,
         socket: Option<(PathBuf, u64, u64)>,
+        /// Where [`allow_host_loopback`](Service::allow_host_loopback) last wrote, so a Start can
+        /// ask whether the reset it calls for is still owed.
+        config_home: Option<PathBuf>,
+    }
+
+    /// Podman's own drop-in directory, under the person's configuration home.
+    pub const HOST_LOOPBACK_CONFIG: &str = "containers/containers.conf.d/90-openbot-host.conf";
+
+    /**
+    Present from the moment [`HOST_LOOPBACK_CONFIG`] changes until a Start has taken OpenBot's
+    stack down, so the containers after it build a new rootless network namespace.
+
+    A file rather than a flag in memory, so the reset is still owed after a Start whose teardown
+    failed, and after the app quit between writing the drop-in and starting. Beside Podman's
+    configuration rather than in `containers.conf.d`, where Podman reads drop-ins.
+    */
+    pub const HOST_LOOPBACK_PENDING: &str = "containers/openbot-host-loopback.pending";
+
+    /**
+    The drop-in that opens the rootless network namespace to this machine's loopback at
+    [`super::ROOTLESS_HOST_LOOPBACK`], for both of the programs rootless Podman builds it with.
+    Only the one in use reads its own key.
+
+    Appended rather than set, so options the person gave either program in their own files are
+    kept: a later drop-in's list otherwise replaces an earlier one's. Both Podman 4.9 and 5.8
+    parse `{append=true}`.
+
+    Nothing here renames `host.containers.internal` or `host.docker.internal` for the person's
+    other containers. OpenBot's own services are pointed at this address by Compose, and anything
+    else would have to ask for it by number.
+    */
+    pub fn host_loopback_config() -> String {
+        let address = super::ROOTLESS_HOST_LOOPBACK;
+        format!(
+            "# Written by OpenBot Desktop: lets its containers reach services this machine runs on\n\
+             # 127.0.0.1, such as OpenBot's backend, at {address}.\n\
+             [engine]\n\
+             network_cmd_options = [\"allow_host_loopback=true\", {{append=true}}]\n\
+             \n\
+             [network]\n\
+             pasta_options = [\"--map-host-loopback\", \"{address}\", {{append=true}}]\n"
+        )
+    }
+
+    /// Write [`host_loopback_config`] under `config_home`, saying whether anything changed.
+    /// Replaced whole, through a sibling, so Podman never reads half of it. A change marks the
+    /// reset owed ([`HOST_LOOPBACK_PENDING`]) first, so no drop-in is ever in place without it.
+    pub fn write_host_loopback(config_home: &Path) -> Result<bool, String> {
+        let path = config_home.join(HOST_LOOPBACK_CONFIG);
+        let wanted = host_loopback_config();
+        match std::fs::read_to_string(&path) {
+            Ok(current) if current == wanted => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
+        let directory = path.parent().expect("the drop-in has a directory");
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let pending = config_home.join(HOST_LOOPBACK_PENDING);
+        std::fs::write(&pending, "").map_err(|error| format!("{}: {error}", pending.display()))?;
+        let partial = path.with_extension("conf.partial");
+        std::fs::write(&partial, wanted)
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Where the person's configuration lives, as Podman looks for it.
+    #[cfg(target_os = "linux")]
+    fn config_home() -> Option<PathBuf> {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     }
 
     fn problem(detail: impl Into<String>) -> Problem {
@@ -927,6 +1618,9 @@ pub mod local_api {
                 });
             let socket = runtime.join("podman/podman.sock");
             let log = root.join("logs/podman-api.log");
+            let config_home =
+                config_home().ok_or_else(|| problem("Neither XDG_CONFIG_HOME nor HOME is set."))?;
+            self.allow_host_loopback(&config_home)?;
             self.ensure_with(&socket, &log, || {
                 let mut command = address.command();
                 command
@@ -1025,6 +1719,48 @@ pub mod local_api {
                     cleanup.said, cleanup.detail
                 ),
             }))
+        }
+
+        /// Write the host loopback drop-in before any container needs it. A service this session
+        /// started read its configuration when it started, so a change stops it, and the
+        /// `ensure` that follows starts it again. A service somebody else runs is left alone.
+        pub(super) fn allow_host_loopback(&mut self, config_home: &Path) -> Result<(), Problem> {
+            self.config_home = Some(config_home.to_path_buf());
+            if write_host_loopback(config_home).map_err(problem)? {
+                self.stop()?;
+            }
+            Ok(())
+        }
+
+        /**
+        Whether a Start still owes the host loopback configuration a teardown of OpenBot's stack.
+
+        Podman reads it only when the rootless network namespace is created, and that namespace
+        lives while any container on a Compose network does, so a stack still running from before
+        keeps the old one. Measured: written while a container held the namespace, nothing
+        changed; once the last one stopped, the next container reached the host.
+
+        Owed until [`acknowledge_host_loopback_reset`](Self::acknowledge_host_loopback_reset),
+        which a Start calls only once the teardown succeeded.
+        */
+        pub fn host_loopback_reset_pending(&self) -> bool {
+            self.config_home
+                .as_ref()
+                .is_some_and(|home| home.join(HOST_LOOPBACK_PENDING).exists())
+        }
+
+        /// The teardown [`host_loopback_reset_pending`](Self::host_loopback_reset_pending) asked
+        /// for is done.
+        pub fn acknowledge_host_loopback_reset(&self) -> Result<(), Problem> {
+            let Some(home) = self.config_home.as_ref() else {
+                return Ok(());
+            };
+            let pending = home.join(HOST_LOOPBACK_PENDING);
+            match std::fs::remove_file(&pending) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(problem(format!("{}: {error}", pending.display()))),
+            }
         }
 
         pub fn stop(&mut self) -> Result<(), Problem> {
@@ -1134,6 +1870,108 @@ mod local_api_tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
                 .unwrap();
         }
+    }
+
+    /// The drop-in opens host loopback for both programs, at the one address Compose is given, and
+    /// appends to what the person configured rather than replacing it.
+    #[test]
+    fn the_host_loopback_drop_in_names_both_programs_and_keeps_the_persons_options() {
+        let config = super::local_api::host_loopback_config();
+        let address = super::ROOTLESS_HOST_LOOPBACK;
+        assert!(config.contains(
+            "[engine]\nnetwork_cmd_options = [\"allow_host_loopback=true\", {append=true}]\n"
+        ));
+        assert!(config.contains(&format!(
+            "[network]\npasta_options = [\"--map-host-loopback\", \"{address}\", {{append=true}}]\n"
+        )));
+        // slirp4netns serves the host's loopback at its gateway, which is fixed.
+        assert_eq!(address, "10.0.2.2");
+        assert!(!config.contains("host_containers_internal_ip"));
+    }
+
+    #[test]
+    fn the_host_loopback_drop_in_is_written_once_and_restored_when_changed() {
+        let home = temp_root("host-loopback-drop-in");
+        let path = home.join(super::local_api::HOST_LOOPBACK_CONFIG);
+        let theirs = path.with_file_name("10-person.conf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &theirs,
+            "[network]\npasta_options = [\"--mtu\", \"1400\"]\n",
+        )
+        .unwrap();
+
+        let pending = home.join(super::local_api::HOST_LOOPBACK_PENDING);
+        assert!(super::local_api::write_host_loopback(&home).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            super::local_api::host_loopback_config()
+        );
+        assert!(pending.exists(), "a new drop-in owes a reset");
+        std::fs::remove_file(&pending).unwrap();
+        assert!(!super::local_api::write_host_loopback(&home).unwrap());
+        assert!(!pending.exists(), "an unchanged drop-in owes nothing");
+
+        std::fs::write(&path, "[network]\n").unwrap();
+        assert!(super::local_api::write_host_loopback(&home).unwrap());
+        assert!(pending.exists(), "a changed drop-in owes a reset");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            super::local_api::host_loopback_config()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            "[network]\npasta_options = [\"--mtu\", \"1400\"]\n",
+            "the person's own drop-in is not touched"
+        );
+        assert!(!path.with_extension("conf.partial").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A change restarts the service this session owns, because it read its configuration when it
+    /// started, and owes a Start a teardown until one acknowledges it. No change leaves it running.
+    #[test]
+    fn a_host_loopback_change_restarts_the_owned_api_and_owes_a_reset_until_acknowledged() {
+        let root = temp_root("host-loopback-restart");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = root.join("config");
+        let socket = root.join("api.sock");
+        let log = root.join("api.log");
+        let mut owned = Service::default();
+        owned
+            .ensure_with(&socket, &log, || fixture(&socket))
+            .unwrap();
+        let first = owned.child_id().unwrap();
+
+        owned.allow_host_loopback(&home).unwrap();
+        assert_eq!(
+            unsafe { libc::kill(first as i32, 0) },
+            -1,
+            "the owned service that predates the change is stopped"
+        );
+        owned
+            .ensure_with(&socket, &log, || fixture(&socket))
+            .unwrap();
+        let second = owned.child_id().unwrap();
+        assert_ne!(first, second);
+        assert!(owned.host_loopback_reset_pending());
+        // A Start whose teardown failed acknowledges nothing, so asking again still says owed.
+        assert!(owned.host_loopback_reset_pending());
+
+        // Nor is it forgotten with the app: a later session, with the drop-in already in place
+        // and nothing written, still owes it.
+        owned.allow_host_loopback(&home).unwrap();
+        assert_eq!(owned.child_id(), Some(second), "no change, no restart");
+        let mut later = Service::default();
+        later.allow_host_loopback(&home).unwrap();
+        assert!(later.host_loopback_reset_pending());
+
+        later.acknowledge_host_loopback_reset().unwrap();
+        assert!(!later.host_loopback_reset_pending());
+        assert!(!owned.host_loopback_reset_pending());
+        later.acknowledge_host_loopback_reset().unwrap();
+        owned.stop().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

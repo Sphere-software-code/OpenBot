@@ -51,7 +51,51 @@ export type EscalationRoute = (input: {
   initiator?: AuditInitiator;
   question: string;
   why?: string;
+  /** The decisions inside the question, one or several, when the Bot sent them as parts. */
+  parts?: QuestionPart[];
 }) => Promise<{ reached: string } | { refusal: string }>;
+
+/**
+ * One decision inside a question, with the answers the Bot expects when it can name them. The person
+ * can always answer in their own words instead, so `options` are a shortcut, never a limit.
+ *
+ * NO LOWER BOUND ON `options`. It used to take two at least, and a free-text decision (which city,
+ * what name) has no likely answers to name: models send it with `options: []`, which that bound
+ * refused before anybody was asked, so the first-use "Find weekend plans" starter drew its city
+ * question as Blocked. An empty list is the same question as one with no list, and `freeText` below
+ * drops it before the question travels. One option is kept: it is a suggestion the person can take
+ * with one click or answer past, and refusing it would leave the person unasked over a hint.
+ */
+export const questionPartSchema = z.object({
+  header: z
+    .string()
+    .trim()
+    .min(1)
+    .max(40)
+    .describe("A short label for this decision, two or three words"),
+  question: z
+    .string()
+    .trim()
+    .min(1)
+    .max(500)
+    .describe("This one decision, as a question"),
+  options: z
+    .array(z.string().trim().min(1).max(120))
+    .max(6)
+    .optional()
+    .describe(
+      "Optional. The likely answers, when you can name them. Leave this out for an answer the " +
+        "person types, such as a city, a name or a date",
+    ),
+});
+export type QuestionPart = z.infer<typeof questionPartSchema>;
+
+/** A decision with an empty `options` list is a free-text one: it travels without the list. */
+function freeText(part: QuestionPart): QuestionPart {
+  if (part.options?.length) return part;
+  const { options: _none, ...rest } = part;
+  return rest;
+}
 
 /**
  * The route this template ships with: the person who is already here.
@@ -75,6 +119,25 @@ const parameters = z.object({
     .describe(
       "Why this needs a person rather than you: what you cannot settle on your own",
     ),
+  /*
+   * One part is a question too.
+   *
+   * This took two to six, written for the case it was added for: several decisions that used to
+   * arrive numbered inside one sentence. A single decision with the answers the Bot expects (which
+   * time zone, and the three it thinks likely) is the same shape with one entry, and models send it
+   * that way. Refused, the person was never asked, the chat drew the step as Blocked, and the Bot
+   * went on to guess, which is the one thing this tool is for stopping.
+   */
+  parts: z
+    .array(questionPartSchema)
+    .min(1)
+    .max(6)
+    .optional()
+    .describe(
+      "The decisions you need, one entry per decision, with `options` when you can name the " +
+        "likely answers. A single decision is one entry. With several, `question` sums them up " +
+        "in a sentence",
+    ),
 });
 
 /**
@@ -96,11 +159,21 @@ export function escalationTool(options: {
   return {
     name: ESCALATE_TOOL,
     ref: `bot/${ESCALATE_TOOL}`,
+    /*
+     * The closed test the prompt's asking section gives, in the same words. This used to say
+     * "Prefer this to guessing" and was offered on every run, which pulled a routine with nobody
+     * watching toward questions instead of a delivered answer with its assumptions said.
+     */
     description:
-      "Put a question to a person when the work needs judgement you do not have: a decision only " +
-      "they can make, a fact only they know, permission you do not hold. Prefer this to guessing, " +
-      "and prefer it to asking another Bot when no other Bot could settle it either. Say what you " +
-      "need and why, then stop and wait for their answer.",
+      "Put a question to a person only when you cannot go on without them: a wrong guess would " +
+      "send, delete, pay or do something else hard to undo; the possible readings would lead to " +
+      "materially different work; or only they know the answer. Otherwise make the call, say what " +
+      "you assumed, and keep going. Do everything that does not depend on the answer before you " +
+      "ask. Prefer it to asking another Bot when no other Bot could settle it either. Say what you " +
+      "need and why, then stop and wait for their answer. Put each decision in `parts`, one " +
+      "entry each: one decision is a single entry, and several are separate entries rather than " +
+      "numbered inside one sentence. `options` is optional: give it when you can name the likely " +
+      "answers, and leave it out when the person types the answer, such as a city, a name or a date.",
     parameters,
     execute: async (args: unknown) => {
       const parsed = parameters.safeParse(args);
@@ -160,6 +233,9 @@ export function escalationTool(options: {
           ...(from.initiator ? { initiator: from.initiator } : {}),
           question,
           ...(parsed.data.why ? { why: parsed.data.why } : {}),
+          ...(parsed.data.parts
+            ? { parts: parsed.data.parts.map(freeText) }
+            : {}),
         });
       } catch (error) {
         /*

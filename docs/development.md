@@ -28,13 +28,58 @@ Chrome or Edge first: the helper opens an isolated browser window for the deploy
 sign-in, lets you choose an accessible project, and creates or reuses `openbot` before minting
 its runtime key. Local development may use a loopback HTTP origin. Existing key-only setups
 use authenticated Intelligence administration to create a container and assign it in OpenBot Admin.
-There is no managed licence step. Then add `OPENAI_API_KEY`.
+There is no managed license step. Then add `OPENAI_API_KEY`.
+
+The same CLI sign-in also prepares Composio on the first `bash scripts/start.sh`;
+`bun run setup:composio` runs that step alone, independently of Learning. A failure
+does not stop the start: OpenBot runs with apps unavailable until a retry succeeds. A supplied
+`COMPOSIO_API_KEY`, an explicit Arcade selection, or an Arcade-only key is preserved.
+The helper saves a stable installation UUID privately before any provisioning request,
+then the CLI saves this installation's Composio project key in `.env`. Keep
+`.env.openbot-installation-id` with the installation when restarting or retrying;
+new installations generate their own file. A compatible published CLI and enabled hosted
+provisioning service must be available before adopting this startup flow. See
+[automatic project setup](plugins/composio.md#automatic-project-setup).
 
 Start the stack:
 
 ```sh
 bash scripts/start.sh
 ```
+
+## Windows (WSL 2)
+
+On Windows, run the clone inside WSL 2 with Ubuntu. This was checked on Windows Server 2022 with
+Ubuntu 26.04.
+
+1. Install WSL 2 and Ubuntu with [Microsoft's instructions](https://learn.microsoft.com/windows/wsl/install)
+   (`wsl --install` in an administrator PowerShell), and restart Windows when it asks.
+
+2. In an Ubuntu terminal, install the tools from [Setup](#setup). A new Ubuntu 26.04 had none of them,
+   and Bun's installer stops without `unzip`:
+
+   ```sh
+   sudo apt-get update
+   sudo apt-get install -y ca-certificates curl git lsof openssl unzip nodejs npm
+   curl -fsSL https://bun.sh/install | bash
+   ```
+
+3. Install Docker Engine and its Compose plugin inside Ubuntu with
+   [Docker's Ubuntu instructions](https://docs.docker.com/engine/install/ubuntu/), then let your
+   user run it and open a new Ubuntu terminal:
+
+   ```sh
+   sudo usermod -aG docker $USER
+   ```
+
+4. Clone into your Ubuntu home directory, for example `~/OpenBot`, and follow [Setup](#setup) from
+   there. `npx --yes copilotkit@latest login` opens the sign-in page in your Windows browser.
+
+5. Keep an Ubuntu terminal open while you use OpenBot. WSL stops Ubuntu shortly after its last
+   terminal closes, and the app, the API server and Docker stop with it.
+
+6. Open the app from your Windows browser at <http://127.0.0.1:3010>. WSL forwards the port, and
+   <http://localhost:3010> works too.
 
 ## Running services
 
@@ -112,11 +157,13 @@ success over the tables they should have created. Nothing is applied; the refusa
 and recreate the database, which is almost always the right answer for a development one; see
 [deployment.md](deployment.md) for how to repair one you have to keep.
 
-**If `drizzle-kit migrate` hangs and then exits non-zero with no error**, the journal names a
-migration file that is not there. A rebase does this: `meta/_journal.json` is a checked-in file, so
-restoring it can reinstate entries for migrations that were renamed. `drizzle-kit check` reports
-"Everything's fine" in that state, because it compares schemas rather than checking that the journal
-and the directory agree. Compare `meta/_journal.json` against `ls server/drizzle/*.sql`.
+**If `db:migrate` stops with `ENOENT` naming a `server/drizzle/<tag>.sql` file**, the journal names
+a migration file that is not there. `db:migrate` reads every file the journal lists before it
+applies anything, so nothing has been applied. A rebase does this: `meta/_journal.json` is a
+checked-in file, so restoring it can reinstate entries for migrations that were renamed.
+`drizzle-kit check` reports "Everything's fine" in that state, because it compares schemas rather
+than checking that the journal and the directory agree. Compare `meta/_journal.json` against
+`ls server/drizzle/*.sql`.
 
 ## Quality checks
 
@@ -134,7 +181,7 @@ Integration tests expect a PostgreSQL database with pgvector. Point `TEST_DATABA
 
 They refuse to use the application `openbot` database. `DATABASE_URL` is still the application setting, and the database client removes it from the process environment after opening a connection to preserve the Windows Bun connection fix, so tests use `TEST_DATABASE_URL` as their immutable fixture address. Running them against a deployment you are using puts test Bots in its audit trail and its activity reports, so create a separate database and migrate that before running the integration suite.
 
-CI uses `bun run test:ci` to verify the expected test count in addition to normal tests.
+CI uses `bun run test:ci` to verify the expected test count in addition to normal tests. It runs the suite in shards, one runner each, and the `tests` check passes only when every shard passed and their counts add up to the floor in `scripts/test-floor.ts`. To run one shard the way CI does, pass it to the same script: `bun run test:ci --shard=2/4`.
 
 `bun run test:smoke` is separate and needs a deployment that is up, and a session on it:
 

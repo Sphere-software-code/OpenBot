@@ -34,17 +34,21 @@
 //!   already runs.
 //! - **macOS.** The package writes to `/opt/podman` and needs administrator rights, so the person
 //!   sees one standard macOS authorization prompt. There is no way around that prompt and no reason
-//!   to want one: it is the same dialog every other installer raises.
+//!   to want one: it is the same dialog every other installer raises. It is never raised unexplained,
+//!   and never behind a click: the package downloads while the person signs in, then the step says
+//!   the prompt is coming and why, leaves it a moment to be read, and raises it by itself
+//!   (`install_with_password`). A prompt closed without a password is asked again (`GoAhead`). The
+//!   prompt itself says why in OpenBot's words (`PODMAN_PASSWORD_PROMPT`).
 //! - **Linux.** Podman there is not a binary but a set of them (`conmon`, `crun`, `netavark`,
 //!   `slirp4netns`), wired to the distribution's own paths, so downloading one file would produce
 //!   something that runs nothing. The distribution's package manager installs it, through
 //!   `pkexec`, which raises that desktop's own authorization prompt.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, StepLine};
 use crate::problem::Problem;
 
 /// The releases this was tested against.
@@ -53,8 +57,6 @@ use crate::problem::Problem;
 /// there, a digest is what was run. Moving these means re-recording the digests below.
 pub const PODMAN: &str = "6.1.1";
 pub const COMPOSE: &str = "5.5.1";
-/// Keep aligned with the repository's packageManager and container runtime.
-pub const BUN: &str = "1.4.3";
 
 /// A file to fetch and the digest it has to have.
 #[derive(Debug, PartialEq, Eq)]
@@ -71,38 +73,37 @@ pub struct Download {
 /// The Intel Mac case is real and not hypothetical: Podman 6.1.1 publishes `arm64` only. Answering
 /// with the arm64 package there would install something that cannot run, so it says so instead.
 pub fn podman_download() -> Result<Download, Problem> {
-    let (file, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => (
-            "podman-installer-windows-amd64.msi",
-            "91d0e8ea0846c0151d531c88c329bb2729387231e4d1e42306a8e3ae9d09fc8a",
-        ),
-        ("windows", "aarch64") => (
-            "podman-installer-windows-arm64.msi",
-            "8ededac563c3b96abe55560f3379962ff59fd8bda1a185ed221891cb6ccf5cba",
-        ),
-        ("macos", "aarch64") => (
-            "podman-installer-macos-arm64.pkg",
-            "9c7b90b406681e5458d69cdb1164a589f7c9b214cab1ca6705fe375876491c09",
-        ),
-        ("macos", _) => {
-            return Err(Problem::with(
-                "OpenBot cannot install the container engine on an Intel Mac. Install Podman \
-                 Desktop or Docker Desktop, then start OpenBot again.",
+    let (file, sha256) =
+        match (std::env::consts::OS, crate::windows::machine_arch()) {
+            ("windows", "x86_64") => (
+                "podman-installer-windows-amd64.msi",
+                "91d0e8ea0846c0151d531c88c329bb2729387231e4d1e42306a8e3ae9d09fc8a",
+            ),
+            ("windows", "aarch64") => (
+                "podman-installer-windows-arm64.msi",
+                "8ededac563c3b96abe55560f3379962ff59fd8bda1a185ed221891cb6ccf5cba",
+            ),
+            ("macos", "aarch64") => (
+                "podman-installer-macos-arm64.pkg",
+                "9c7b90b406681e5458d69cdb1164a589f7c9b214cab1ca6705fe375876491c09",
+            ),
+            ("macos", _) => return Err(Problem::with(
+                "OpenBot can't install the software it runs on on an Intel Mac. Install Docker \
+                 Desktop or Podman Desktop, then start OpenBot again.",
                 format!("Podman {PODMAN} publishes an arm64 package only"),
-            ))
-        }
-        ("linux", _) => {
-            return Err(Problem::plain(
-                "On Linux the engine comes from the distribution's own packages.",
-            ))
-        }
-        (os, arch) => {
-            return Err(Problem::with(
-                "OpenBot cannot install the container engine on this kind of computer.",
-                format!("no Podman installer for {os} on {arch}"),
-            ))
-        }
-    };
+            )),
+            ("linux", _) => return Err(Problem::with(
+                "On Linux, the software OpenBot runs on comes from your system's own packages. \
+                 Install the podman package, then start OpenBot again.",
+                "on Linux the engine comes from the distribution's own packages",
+            )),
+            (os, arch) => {
+                return Err(Problem::with(
+                    "OpenBot can't install the software it runs on on this kind of computer.",
+                    format!("no Podman installer for {os} on {arch}"),
+                ))
+            }
+        };
     Ok(Download {
         url: format!(
             "https://github.com/podman-container-tools/podman/releases/download/v{PODMAN}/{file}"
@@ -117,7 +118,7 @@ pub fn podman_download() -> Result<Download, Problem> {
 /// One static binary on every platform, which is the whole reason this can be placed beside the
 /// engine rather than installed into the system.
 pub fn compose_download() -> Result<Download, Problem> {
-    let (file, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+    let (file, sha256) = match (std::env::consts::OS, crate::windows::machine_arch()) {
         ("windows", "x86_64") => (
             "docker-compose-windows-x86_64.exe",
             "a3c0c73033eaede90210345d0cc2233edf4fab8fe0282a91dad8fd8436809d2f",
@@ -144,8 +145,7 @@ pub fn compose_download() -> Result<Download, Problem> {
         ),
         (os, arch) => {
             return Err(Problem::with(
-                "OpenBot cannot install the piece that runs the containers on this kind of \
-                 computer.",
+                "OpenBot can't install the software it runs on on this kind of computer.",
                 format!("no Compose build for {os} on {arch}"),
             ))
         }
@@ -161,38 +161,80 @@ pub fn compose_download() -> Result<Download, Problem> {
 ///
 /// A file already there with the right digest is kept, so a retry after a failed install is not a
 /// second download. A file already there with the wrong one is replaced: that is a half-written
-/// download far more often than it is an attack, and either way it must not be run.
+/// download far more often than it is an attack, and either way it must not be run. The download
+/// itself is the early downloads' (`early_downloads::fetch`): from downloads.copilotkit.ai first,
+/// resumed where an earlier one stopped, and waited for when the first screen already started it.
 fn fetch_verified(download: &Download, into: &Path) -> Result<PathBuf, Problem> {
-    let path = into.join(download.file);
-    if let Ok(existing) = std::fs::read(&path) {
-        if digest_of(&existing) == download.sha256 {
-            return Ok(path);
-        }
-    }
-
-    let body = crate::deployment::get(&download.url).map_err(|error| {
+    fetch_pinned(download, into, &()).map_err(|error| {
         Problem::with(
             "OpenBot could not download the software it needs to run. Check the internet \
              connection and try again.",
             format!("{}: {error}", download.url),
         )
-    })?;
+    })
+}
 
-    let got = digest_of(&body);
-    if got != download.sha256 {
-        return Err(Problem::with(
-            "What OpenBot downloaded is not what it was expecting, so it has not been run. Try \
-             again.",
-            format!(
-                "{} from {}: expected sha256 {}, got {got}",
-                download.file, download.url, download.sha256
-            ),
-        ));
+fn fetch_pinned(
+    download: &Download,
+    into: &Path,
+    progress: &dyn crate::early_downloads::Progress,
+) -> Result<PathBuf, String> {
+    let pinned = crate::early_downloads::Pinned {
+        name: download.file.to_string(),
+        sha256: download.sha256.to_string(),
+        size: None,
+        sources: crate::deployment::mirrored(&download.url)
+            .into_iter()
+            .chain(std::iter::once(download.url.clone()))
+            .collect(),
+    };
+    crate::early_downloads::fetch(&pinned, into, progress)
+}
+
+/// Podman's installer for this computer, into `into`, before Install needs it. Never installed here.
+pub fn fetch_podman_installer(
+    into: &Path,
+    progress: &dyn crate::early_downloads::Progress,
+) -> Result<PathBuf, String> {
+    fetch_pinned(
+        &podman_download().map_err(|problem| problem.said)?,
+        into,
+        progress,
+    )
+}
+
+/// Compose for this computer, ready to run on its own, for `config` before any engine is here: the
+/// verified download, copied where nothing looks for a provider and made executable.
+pub fn runnable_compose(
+    into: &Path,
+    progress: &dyn crate::early_downloads::Progress,
+) -> Result<PathBuf, String> {
+    let staged = fetch_compose(into, progress)?;
+    let folder = into.join("early-compose");
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("could not make {}: {error}", folder.display()))?;
+    let named = folder.join(compose_provider_name());
+    std::fs::copy(&staged, &named)
+        .map_err(|error| format!("could not copy Compose to {}: {error}", named.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod 755 {}: {error}", named.display()))?;
     }
+    Ok(named)
+}
 
-    std::fs::create_dir_all(into).map_err(|error| unwritable(into, &error.to_string()))?;
-    std::fs::write(&path, &body).map_err(|error| unwritable(&path, &error.to_string()))?;
-    Ok(path)
+/// Compose for this computer, into `into`, before Install places it.
+pub fn fetch_compose(
+    into: &Path,
+    progress: &dyn crate::early_downloads::Progress,
+) -> Result<PathBuf, String> {
+    fetch_pinned(
+        &compose_download().map_err(|problem| problem.said)?,
+        into,
+        progress,
+    )
 }
 
 /// One sentence for every "could not write here", because the person's fix is the same each time.
@@ -204,7 +246,9 @@ fn unwritable(path: &Path, error: &str) -> Problem {
     )
 }
 
+#[cfg(test)]
 fn digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
@@ -214,172 +258,14 @@ fn digest_of(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// A fresh account has no developer tools. Acquire the host runtime as that user,
-/// without changing PATH or requiring an administrator. Existing installations remain usable.
-pub fn ensure_bun(cache: &Path, existing: Option<PathBuf>) -> Result<PathBuf, Problem> {
-    ensure_bun_with(existing, || install_bun(cache))
-}
-
-fn ensure_bun_with(
-    existing: Option<PathBuf>,
-    install: impl FnOnce() -> Result<PathBuf, Problem>,
-) -> Result<PathBuf, Problem> {
-    match existing {
-        Some(path) if verify_bun(&path).is_ok() => Ok(path),
-        _ => install(),
-    }
-}
-
-fn bun_download(os: &str, arch: &str) -> Result<Download, Problem> {
-    // Official bun-v1.4.3/SHASUMS256.txt. The baseline x64 build also supports older CPUs.
-    let (file, sha256) = match (os, arch) {
-        ("windows", "x86_64") => (
-            "bun-windows-x64-baseline.zip",
-            "d7a7d3eb216614544aab0cde2d8d9f2e4e87839bf5a30a1cd11d077f02d84e0c",
-        ),
-        ("windows", "aarch64") => (
-            "bun-windows-aarch64.zip",
-            "5e8f142ef722cbc9f67dc068a166e46ee72be8307b38cac7186589d2face668f",
-        ),
-        ("macos", "x86_64") => (
-            "bun-darwin-x64-baseline.zip",
-            "0fde04e8b092156b97fe6432e899baf16d9ed6ce52cbb4218d2d9c07a2f827ef",
-        ),
-        ("macos", "aarch64") => (
-            "bun-darwin-aarch64.zip",
-            "80afd4c069b46a6fa8f3ec520bebc750a7843e4a8d5b9583d29ad436c00a3403",
-        ),
-        ("linux", "x86_64") => (
-            "bun-linux-x64-baseline.zip",
-            "1fc2edac843102909e3a1be1d8d9802cc6071cf074e67e88231f4ffe0f8b397b",
-        ),
-        ("linux", "aarch64") => (
-            "bun-linux-aarch64.zip",
-            "efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21",
-        ),
-        _ => {
-            return Err(Problem::with(
-                "OpenBot cannot install its app runtime on this kind of computer.",
-                format!("no Bun {BUN} build for {os} on {arch}"),
-            ))
-        }
-    };
-    Ok(Download {
-        url: format!("https://github.com/oven-sh/bun/releases/download/bun-v{BUN}/{file}"),
-        sha256,
-        file,
-    })
-}
-
-fn install_bun(cache: &Path) -> Result<PathBuf, Problem> {
-    let download = bun_download(std::env::consts::OS, std::env::consts::ARCH)?;
-    let entry = format!(
-        "{}/bun{}",
-        download.file.trim_end_matches(".zip"),
-        std::env::consts::EXE_SUFFIX,
-    );
-    let into = crate::acquire::download_dir(cache).join(format!("bun-{BUN}"));
-    install_bun_with(
-        &into,
-        &download,
-        |archive, target| extract_bun(archive, target, &entry),
-        verify_bun,
-    )
-}
-
-fn install_bun_with(
-    into: &Path,
-    download: &Download,
-    extract: impl FnOnce(&Path, &Path) -> Result<(), Problem>,
-    verify: impl Fn(&Path) -> Result<(), Problem>,
-) -> Result<PathBuf, Problem> {
-    let binary = into.join(format!("bun{}", std::env::consts::EXE_SUFFIX));
-    if binary.is_file() {
-        verify(&binary)?;
-        return Ok(binary);
-    }
-    let archive = fetch_verified(download, into)?;
-    let staged = into.join(format!("bun.download{}", std::env::consts::EXE_SUFFIX));
-    let result = extract(&archive, &staged)
-        .and_then(|()| verify(&staged))
-        .and_then(|()| {
-            std::fs::rename(&staged, &binary)
-                .map_err(|error| unwritable(&binary, &error.to_string()))
-        });
-    if let Err(mut problem) = result {
-        if let Err(error) = std::fs::remove_file(&staged) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                problem.detail = Some(format!(
-                    "{}; could not remove incomplete runtime {}: {error}",
-                    problem.detail.as_deref().unwrap_or(&problem.said),
-                    staged.display(),
-                ));
-            }
-        }
-        return Err(problem);
-    }
-    Ok(binary)
-}
-
-fn extract_bun(archive: &Path, target: &Path, entry: &str) -> Result<(), Problem> {
-    let unpack_error = |error: &dyn std::fmt::Display| {
-        Problem::with(
-            "OpenBot could not unpack its app runtime. Try again.",
-            format!("{} entry {entry}: {error}", archive.display()),
-        )
-    };
-
-    // Only the named executable is copied to our chosen staging path. Archive paths never
-    // choose output locations, and installation needs no external archive utility or shell.
-    let file = std::fs::File::open(archive).map_err(|error| unpack_error(&error))?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|error| unpack_error(&error))?;
-    let mut executable = zip.by_name(entry).map_err(|error| unpack_error(&error))?;
-    let mut file =
-        std::fs::File::create(target).map_err(|error| unwritable(target, &error.to_string()))?;
-    std::io::copy(&mut executable, &mut file).map_err(|error| unpack_error(&error))?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| unwritable(target, &error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_bun(binary: &Path) -> Result<(), Problem> {
-    let output = crate::quiet::command(binary)
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            Problem::with(
-                "OpenBot could not start its app runtime.",
-                format!("{}: {error}", binary.display()),
-            )
-        })?;
-    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != BUN {
-        return Err(Problem::with(
-            "OpenBot could not verify its app runtime.",
-            format!(
-                "{} --version: {}; expected {BUN}; stdout: {}; stderr: {}",
-                binary.display(),
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Put the engine on this machine, and a Compose it can run.
 ///
 /// Both halves, in that order, because the second is invisible until the first has succeeded and
 /// somebody presses Start. Answers with the sentence for the step row, or a failure in both
 /// registers. `saved` is the engine the installation was set up on, if it saved one.
 pub fn install_engine(cache: &Path, saved: Option<Engine>) -> Result<String, Problem> {
-    install_engine_observed(cache, saved, |_, _| {}, &mut |_| {}).map(|chosen| chosen.said)
+    install_engine_observed(cache, saved, |_, _| {}, &mut |_| {}, &|| {}, &|| false)
+        .map(|chosen| chosen.said)
 }
 
 /// The engine the install step settled on, and the sentence for its step row.
@@ -391,21 +277,255 @@ pub struct EngineChosen {
 
 /// Observe an actual engine install, excluding engines that were already here, starting Docker
 /// Desktop and Compose repair; `progress` is each line for the step row.
+///
+/// `back` brings OpenBot's window to the front again after another app's window took it: Docker
+/// Desktop once it answers, or the system's password prompt once Podman's installer is done.
+///
+/// `cancelled` ends a wait for the person's go-ahead (`GoAhead`): Stop or Quit while it waits.
 pub fn install_engine_observed(
     cache: &Path,
     saved: Option<Engine>,
     installed: impl FnMut(Engine, bool),
-    progress: &mut dyn FnMut(String),
+    progress: &mut dyn FnMut(StepLine),
+    back: &dyn Fn(),
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<EngineChosen, Problem> {
+    // Only one of the two runs, so they share the step row's lines one at a time.
+    let progress = std::cell::RefCell::new(progress);
     install_engine_with(
         cache,
         Found::here(saved),
         saved,
         installed,
-        || crate::docker_desktop::start(progress),
-        install_podman,
+        || crate::docker_desktop::start(&mut **progress.borrow_mut(), back),
+        |into| install_podman(into, &mut **progress.borrow_mut(), back, cancelled),
         place_compose,
     )
+}
+
+/*
+ * The person reads "the software OpenBot runs on", never "Podman": a person setting OpenBot up
+ * does not know what Podman is, and does not need to. The log names it (`StepLine::logged`).
+ */
+
+/// The step row's line while Podman's package downloads, before anything needs the person.
+pub fn podman_downloading() -> StepLine {
+    StepLine::here("Downloading the software OpenBot runs on.").logged("Downloading Podman.")
+}
+
+/// After the person closed macOS's password prompt without a password: said plainly, with Try
+/// again in the window, and asked again by itself after `ASK_AGAIN_AFTER`.
+pub fn podman_declined() -> StepLine {
+    StepLine::asks(
+        "OpenBot needs your password to install what it needs to run. It asks again in a moment, \
+         or choose Try again.",
+    )
+    .logged("The password prompt was closed, so Podman isn't installed yet; asking again.")
+}
+
+/// What macOS's password prompt says, under the name of the process that raised it.
+pub const PODMAN_PASSWORD_PROMPT: &str =
+    "OpenBot needs your password to install the software it runs on.";
+
+/// How long the line saying the prompt is coming stays on screen before the prompt covers it.
+pub const BEFORE_PROMPT: Duration = Duration::from_millis(2500);
+
+/// How long after a closed prompt OpenBot asks again by itself.
+pub const ASK_AGAIN_AFTER: Duration = Duration::from_secs(15);
+
+/**
+Asking again, after the person closed the system's password prompt: now, when they choose Try
+again in the window, or by itself after a while.
+
+The person is never asked to click before the prompt. The step says what is coming and why, gives
+it a moment to be read, and raises the prompt (`install_with_password`). Only a prompt closed without
+a password waits here, and not for long. A Try again given while nothing waits counts for nothing,
+so a click left over never brings a prompt early.
+*/
+pub struct GoAhead {
+    state: Mutex<Asked>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    Nothing,
+    Waiting,
+    Given,
+}
+
+impl Default for GoAhead {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GoAhead {
+    pub const fn new() -> Self {
+        Self {
+            state: Mutex::new(Asked::Nothing),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Asked> {
+        self.state.lock().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The person chose Try again. True when a step was waiting to ask again.
+    pub fn give(&self) -> bool {
+        let mut state = self.state();
+        if *state != Asked::Waiting {
+            return false;
+        }
+        *state = Asked::Given;
+        self.changed.notify_all();
+        true
+    }
+
+    /// Say why, then wait until Try again or `limit`, whichever comes first. `cancelled` (Stop or
+    /// Quit) ends the wait with nothing asked.
+    pub fn wait(
+        &self,
+        limit: Duration,
+        ask: impl FnOnce(),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), Problem> {
+        *self.state() = Asked::Waiting;
+        ask();
+        let until = std::time::Instant::now() + limit;
+        let mut state = self.state();
+        loop {
+            if *state == Asked::Given || std::time::Instant::now() >= until {
+                *state = Asked::Nothing;
+                return Ok(());
+            }
+            if cancelled() {
+                *state = Asked::Nothing;
+                return Err(stopped_before_installing());
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(|held| held.into_inner())
+                .0;
+        }
+    }
+}
+
+fn stopped_before_installing() -> Problem {
+    Problem::with(
+        "OpenBot stopped before installing the software it runs on. Start again when you're \
+         ready.",
+        "stopped before the password prompt to install Podman",
+    )
+}
+
+/// The Try again Install listens for after the password prompt was closed.
+pub static PODMAN_GO_AHEAD_GATE: GoAhead = GoAhead::new();
+
+/// The window's Try again. True when Install was waiting to ask again.
+pub fn allow_podman_install() -> bool {
+    PODMAN_GO_AHEAD_GATE.give()
+}
+
+/// How the password prompt and the installer behind it ended.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum Prompted {
+    Installed,
+    /// The person closed the prompt. A decision, not a failure: the step asks again.
+    Declined,
+    Failed(Problem),
+}
+
+/**
+Download Podman's package, say the password prompt is coming and why, then raise it.
+
+No click first. The download needs nobody, so it runs while the person signs in. Then the step says
+"Your Mac will ask for your password so OpenBot can install what it needs to run." and leaves it
+`before_prompt` to be read before the prompt covers it. A prompt closed without a password is said
+plainly and asked again, by itself after `ask_again_after` or at once on Try again, rather than
+failing Install behind a screen with no way to start it again.
+*/
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn install_with_password(
+    fetch: impl FnOnce() -> Result<PathBuf, Problem>,
+    progress: &mut dyn FnMut(StepLine),
+    again: &GoAhead,
+    cancelled: &dyn Fn() -> bool,
+    mut prompt: impl FnMut(&str) -> Prompted,
+    back: &dyn Fn(),
+    before_prompt: Duration,
+    ask_again_after: Duration,
+) -> Result<(), Problem> {
+    progress(podman_downloading());
+    let package = fetch()?;
+    let script = podman_install_script(&package);
+    loop {
+        progress(podman_install_said("macos"));
+        // Read first: the prompt comes up over everything.
+        let until = std::time::Instant::now() + before_prompt;
+        while std::time::Instant::now() < until {
+            if cancelled() {
+                return Err(stopped_before_installing());
+            }
+            std::thread::sleep(Duration::from_millis(50).min(before_prompt));
+        }
+        if cancelled() {
+            return Err(stopped_before_installing());
+        }
+        let prompted = prompt(&script);
+        // The prompt was in front of OpenBot's window, however it ended.
+        back();
+        match prompted {
+            Prompted::Installed => return Ok(()),
+            Prompted::Declined => {
+                again.wait(ask_again_after, || progress(podman_declined()), cancelled)?
+            }
+            Prompted::Failed(problem) => return Err(problem),
+        }
+    }
+}
+
+/// The AppleScript that installs Podman's package as an administrator, with OpenBot's own words in
+/// the password prompt. `with prompt` is `do shell script`'s text for that dialog (StandardAdditions).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn podman_install_script(package: &Path) -> String {
+    format!(
+        "do shell script \"/usr/sbin/installer -pkg {} -target /\" with administrator privileges \
+         with prompt {}",
+        applescript_shell_arg(package),
+        applescript_string(PODMAN_PASSWORD_PROMPT)
+    )
+}
+
+/// Text as an AppleScript string literal.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn applescript_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The step row's line while Podman installs, naming the prompt the platform raises for it.
+///
+/// macOS asks for the person's password, because the package writes to `/opt/podman`. Windows
+/// asks for nothing here: the MSI installs for this account alone. Linux asks through `pkexec`.
+/// A prompt is a window of the system's own, in front of OpenBot's, so its line is `elsewhere`.
+pub fn podman_install_said(os: &str) -> StepLine {
+    match os {
+        "macos" => StepLine::elsewhere(
+            "Your Mac will ask for your password so OpenBot can install what it needs to run.",
+        )
+        .logged("Installing Podman's package; macOS asks for the password."),
+        "linux" => StepLine::elsewhere(
+            "Your computer will ask for your password so OpenBot can install what it needs to run.",
+        )
+        .logged("Installing Podman with pkexec; the system asks for the password."),
+        _ => {
+            StepLine::here("Installing the software OpenBot runs on.").logged("Installing Podman.")
+        }
+    }
 }
 
 /// What engines this machine has, read once so the choice below can be tested on any machine.
@@ -442,7 +562,7 @@ impl Found {
 
 /// What the install step does to have an engine answering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Choice {
+pub enum Choice {
     /// Docker answers now.
     UseDocker,
     /// Docker Desktop is installed and stopped, and opening it shows nothing that needs the person.
@@ -488,6 +608,11 @@ fn choose(found: Found, saved: Option<Engine>) -> Choice {
     }
 }
 
+/// What Install would do for an engine on this computer now. The early downloads fetch what it needs.
+pub fn choice_here(saved: Option<Engine>) -> Choice {
+    choose(Found::here(saved), saved)
+}
+
 fn install_engine_with(
     cache: &Path,
     found: Found,
@@ -531,8 +656,8 @@ fn install_engine_with(
     // reporting no engine on a machine that has just installed one.
     if engine::program(Engine::Podman).is_none() {
         return Err(Problem::with(
-            "OpenBot installed the container engine, but cannot find it afterwards. Install \
-             Podman Desktop and start OpenBot again.",
+            "OpenBot installed the software it runs on, but can't find it afterwards. Install \
+             Podman Desktop, then start OpenBot again.",
             format!(
                 "the {PODMAN} installer reported success; podman is on neither PATH nor any \
                  install location this platform uses"
@@ -549,14 +674,32 @@ fn install_engine_with(
 
 /// Place the Compose provider where the engine will find it, unless something already provides one.
 ///
-/// Nothing is placed when Compose already answers. Docker Desktop ships a provider, and a Linux
-/// machine may have `docker-compose-v2` from its own packages; putting a second one in front of
-/// either is a version somebody did not choose.
+/// Nothing is placed when a Compose new enough for OpenBot already answers. Docker Desktop ships a
+/// provider, and a Linux machine may have `docker-compose-v2` from its own packages; putting a
+/// second one in front of either is a version somebody did not choose. One too old to run OpenBot
+/// (an old Docker Desktop's, found on PATH by Podman) is put behind ours: see `engine_versions`.
 fn place_compose(into: &Path) -> Result<String, Problem> {
-    if crate::acquire::address().composes() {
+    let address = crate::acquire::address();
+    if address.composes() && !compose_too_old(&address) {
         return Ok("Compose is already here.".into());
     }
+    place_newer_compose(into)
+}
 
+/// Whether the Compose that answers through `address` is older than OpenBot needs. Not on Linux,
+/// whose Compose comes from the distribution (see `engine_versions`).
+fn compose_too_old(address: &engine::Address) -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        && crate::engine_versions::read(address)
+            .compose
+            .is_some_and(|version| version < crate::engine_versions::COMPOSE)
+}
+
+/// Place OpenBot's own Compose provider, in front of whatever provider is already there.
+///
+/// It goes in OpenBot's tools directory, which every engine command OpenBot runs has first on its
+/// PATH (`engine::command_at`). Nothing anybody else installed is changed or removed.
+pub fn place_newer_compose(into: &Path) -> Result<String, Problem> {
     let download = compose_download()?;
     let staged = fetch_verified(&download, into)?;
 
@@ -574,7 +717,7 @@ fn place_compose(into: &Path) -> Result<String, Problem> {
         std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o755)).map_err(
             |error| {
                 Problem::with(
-                    "OpenBot could not finish installing the piece that runs the containers.",
+                    "OpenBot couldn't finish installing the software it runs on. Try again.",
                     format!("chmod 755 {}: {error}", named.display()),
                 )
             },
@@ -582,6 +725,219 @@ fn place_compose(into: &Path) -> Result<String, Problem> {
     }
 
     Ok(format!("Compose {COMPOSE} installed."))
+}
+
+/**
+Update a Podman that is too old to run OpenBot, by running OpenBot's own pinned installer over it.
+
+The same installer, the same digest check and the same prompt as a first install (`install_podman`):
+the package on a Mac, the MSI on Windows. Both upgrade in place. Neither removes Podman's machines,
+which live in the person's own folders, so every machine and every container, image and volume in
+it are there afterwards. Podman 6 reads the machines Podman 5 made on macOS and Windows (only
+machines on Linux had to be made again, and Linux is not updated here).
+
+EVERY MACHINE THAT WAS RUNNING IS RUNNING AFTERWARDS, WITH ITS API ANSWERING: the person's own as
+much as OpenBot's. OpenBot runs on its own machine beside the person's `podman-machine-default` on
+Windows (see `own_machine`), and the MSI stops the helpers of every machine it finds running. On a live Windows run the 6.1.1 MSI over
+5.8.9 left the person's machine up and its `win-sshproxy` gone, and with it the Docker API every
+pull uses (see `acquire`). Only OpenBot's own machine used to be stopped and started.
+
+So the machines running are listed first. On Windows they are stopped before the MSI, because their
+helpers (`gvproxy`, `win-sshproxy`) run from Podman's folder. Afterwards each one whose API does not
+answer is stopped and started (`bring_back`), with the containers that were running in it. On a Mac
+the package does not stop them: its `preinstall` removes `/opt/podman` and its `postinstall` installs
+`podman-mac-helper`, and a running `vfkit` or `gvproxy` keeps running from the file it opened. A Mac
+machine is restarted only if its API does not answer afterwards. A machine is started again even when
+the installer failed, so one OpenBot stopped is never left stopped.
+*/
+pub fn update_podman(
+    cache: &Path,
+    progress: &mut dyn FnMut(StepLine),
+    back: &dyn Fn(),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), Problem> {
+    let into = crate::acquire::download_dir(cache);
+    update_podman_with(
+        &mut ThisComputer::default(),
+        cfg!(target_os = "windows"),
+        progress,
+        &mut |progress| {
+            install_podman(&into, progress, back, cancelled)?;
+            if engine::program(Engine::Podman).is_none() {
+                return Err(Problem::with(
+                    "OpenBot updated the software it runs on, but can't find it afterwards. \
+                     Start OpenBot again.",
+                    format!("the Podman {PODMAN} installer reported success; podman is not found"),
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+/// The row's line while Podman updates: why it is updating, since it is the person's own Podman.
+pub fn podman_updating() -> StepLine {
+    StepLine::here("The Podman on this computer is too old for OpenBot, so OpenBot is updating it.")
+        .updating()
+}
+
+/// A line the installer says, as the update says it. Work OpenBot does by itself says why it is
+/// updating. A system prompt that is coming says why, then the prompt, so it is explained before it
+/// comes up. A wait for the person's go-ahead is said as it is. The log keeps the installer's words.
+fn while_updating(line: StepLine) -> StepLine {
+    if line.asks {
+        return line;
+    }
+    let why = podman_updating().said;
+    // The installer's prompt, said short after why: "...so OpenBot is updating it. Your Mac will
+    // ask for your password." The whole of both did not fit the background row.
+    let said = if line.elsewhere {
+        format!(
+            "{why} {}",
+            line.said
+                .split_once(" so OpenBot")
+                .map_or(line.said.clone(), |(prompt, _)| format!("{prompt}."))
+        )
+    } else {
+        why
+    };
+    let detail = line.detail.clone().unwrap_or_else(|| line.said.clone());
+    StepLine {
+        said,
+        detail: Some(detail),
+        updating: true,
+        ..line
+    }
+}
+
+/// The Podman machines on this computer, as an update needs them, so the sequence can be tested
+/// without one.
+pub trait Machines {
+    /// The machines running now, by name.
+    fn running(&mut self) -> Result<Vec<String>, String>;
+    /// Stop one, remembering the containers running in it.
+    fn stop(&mut self, name: &str) -> Result<(), String>;
+    /// Start one, and the containers `stop` found running in it.
+    fn start(&mut self, name: &str) -> Result<(), String>;
+    /// It is running and its Docker API answers, or why not.
+    fn answers(&mut self, name: &str) -> Result<(), String>;
+}
+
+/// `Machines` on this computer.
+#[derive(Default)]
+struct ThisComputer {
+    containers: std::collections::HashMap<String, crate::acquire::Containers>,
+}
+
+impl Machines for ThisComputer {
+    fn running(&mut self) -> Result<Vec<String>, String> {
+        crate::acquire::running_machines()
+    }
+
+    fn stop(&mut self, name: &str) -> Result<(), String> {
+        // Asked before the stop, and only the first time: a second stop finds nothing running.
+        let running = crate::acquire::running_containers(name);
+        if !running.is_empty() {
+            self.containers.entry(name.to_string()).or_insert(running);
+        }
+        crate::acquire::stop_machine_named(name)
+    }
+
+    fn start(&mut self, name: &str) -> Result<(), String> {
+        let containers = self.containers.remove(name).unwrap_or_default();
+        crate::acquire::start_machine_named(name, &containers)
+    }
+
+    fn answers(&mut self, name: &str) -> Result<(), String> {
+        crate::acquire::machine_api_answers(name)
+    }
+}
+
+/// Running the installer, saying its lines on the row as it goes.
+type Installer<'a> = dyn FnMut(&mut dyn FnMut(StepLine)) -> Result<(), Problem> + 'a;
+
+fn update_podman_with(
+    machines: &mut dyn Machines,
+    stop_first: bool,
+    progress: &mut dyn FnMut(StepLine),
+    install: &mut Installer<'_>,
+) -> Result<(), Problem> {
+    progress(podman_updating().logged(format!(
+        "Podman is older than {}; installing Podman {PODMAN} over it.",
+        crate::engine_versions::PODMAN
+    )));
+    let running = machines.running().unwrap_or_else(|error| {
+        log::warn!(
+            "[engine] could not list the machines running before the Podman update: {error}"
+        );
+        Vec::new()
+    });
+    log::info!(
+        "[engine] machines running before the Podman update: {}",
+        if running.is_empty() {
+            "none".to_string()
+        } else {
+            running.join(", ")
+        }
+    );
+    if stop_first {
+        for name in &running {
+            progress(podman_updating().logged(format!(
+                "Stopping {name} before the installer replaces Podman's files (podman machine stop)."
+            )));
+            if let Err(error) = machines.stop(name) {
+                log::warn!("[engine] could not stop {name} before the Podman update: {error}");
+            }
+        }
+    }
+    let installed = install(&mut |line| progress(while_updating(line)));
+    let brought_back = bring_back(machines, &running, progress);
+    if let (Err(_), Err(problem)) = (&installed, &brought_back) {
+        log::warn!(
+            "[engine] after a failed Podman update: {}",
+            problem.detail.as_deref().unwrap_or(&problem.said)
+        );
+    }
+    installed?;
+    brought_back
+}
+
+/// Every machine in `running` running again with its API answering: one that answers is left as it
+/// is, and any other is stopped and started.
+fn bring_back(
+    machines: &mut dyn Machines,
+    running: &[String],
+    progress: &mut dyn FnMut(StepLine),
+) -> Result<(), Problem> {
+    let mut failed = Vec::new();
+    for name in running {
+        match machines.answers(name) {
+            Ok(()) => {
+                log::info!("[engine] {name} answers after the Podman update");
+                continue;
+            }
+            Err(why) => log::info!(
+                "[engine] {name} does not answer after the Podman update ({why}); stopping and \
+                 starting it"
+            ),
+        }
+        progress(podman_updating().logged(format!(
+            "Starting {name} again (podman machine stop, then start), so its API answers."
+        )));
+        if let Err(error) = machines.stop(name) {
+            log::info!("[engine] podman machine stop {name}: {error}");
+        }
+        if let Err(error) = machines.start(name) {
+            failed.push(format!("podman machine start {name}: {error}"));
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(Problem::with(
+        "OpenBot updated Podman, but couldn't start it again. Try again.",
+        failed.join("; "),
+    ))
 }
 
 /// The filename Podman looks a provider up by.
@@ -594,7 +950,14 @@ pub fn compose_provider_name() -> &'static str {
 }
 
 #[cfg(target_os = "windows")]
-fn install_podman(into: &Path) -> Result<(), Problem> {
+fn install_podman(
+    into: &Path,
+    progress: &mut dyn FnMut(StepLine),
+    _back: &dyn Fn(),
+    _cancelled: &dyn Fn() -> bool,
+) -> Result<(), Problem> {
+    // The MSI installs for this account alone and asks for nothing.
+    progress(podman_install_said("windows"));
     let download = podman_download()?;
     let msi = fetch_verified(&download, into)?;
     let log = into.join("podman-install.log");
@@ -667,9 +1030,9 @@ fn installer_stopped(verb: &str, msi: &Path, failure: MsiexecFailure, log: &Path
             if code == 1625 {
                 // ERROR_INSTALL_PACKAGE_REJECTED requires an administrator to resolve policy.
                 // https://learn.microsoft.com/en-us/windows/win32/msi/error-codes
-                "Windows policy blocks installing Podman, the container engine OpenBot needs. \
-                 Ask an administrator to allow the installation or install Podman for your \
-                 account, then try again."
+                "Windows policy blocks installing Podman, which OpenBot needs to run. Ask an \
+                 administrator to allow the installation or install Podman for your account, \
+                 then try again."
             } else {
                 "Installing the software OpenBot needs did not finish. Try again."
             },
@@ -683,39 +1046,50 @@ fn installer_stopped(verb: &str, msi: &Path, failure: MsiexecFailure, log: &Path
 }
 
 #[cfg(target_os = "macos")]
-fn install_podman(into: &Path) -> Result<(), Problem> {
-    let download = podman_download()?;
-    let pkg = fetch_verified(&download, into)?;
+fn install_podman(
+    into: &Path,
+    progress: &mut dyn FnMut(StepLine),
+    back: &dyn Fn(),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), Problem> {
+    install_with_password(
+        || fetch_verified(&podman_download()?, into),
+        progress,
+        &PODMAN_GO_AHEAD_GATE,
+        cancelled,
+        run_administrator_script,
+        back,
+        BEFORE_PROMPT,
+        ASK_AGAIN_AFTER,
+    )
+}
 
-    // The package writes to `/opt/podman`, which needs administrator rights. `do shell script ...
-    // with administrator privileges` is how macOS asks for them: the person sees the standard
-    // authorization dialog, and no password passes through this process.
-    let script = format!(
-        "do shell script \"/usr/sbin/installer -pkg {} -target /\" with administrator privileges",
-        applescript_shell_arg(&pkg)
-    );
-    let output = crate::quiet::command("osascript")
-        .args(["-e", &script])
+/// Run `script` through `osascript`. `do shell script ... with administrator privileges` is how
+/// macOS asks for administrator rights: the person sees the standard authorization dialog, and no
+/// password passes through this process.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_administrator_script(script: &str) -> Prompted {
+    let output = match crate::quiet::command("osascript")
+        .args(["-e", script])
         .output()
-        .map_err(|error| {
-            Problem::with(
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return Prompted::Failed(Problem::with(
                 "OpenBot could not start the installer for the software it needs.",
                 format!("osascript: {error}"),
-            )
-        })?;
-
+            ))
+        }
+    };
     if output.status.success() {
-        return Ok(());
+        return Prompted::Installed;
     }
     let said = crate::quiet::said(&output.stderr);
     // -128 is AppleScript's "user cancelled", which is a decision rather than a failure.
     if said.contains("-128") {
-        return Err(Problem::plain(
-            "The install was cancelled, so OpenBot does not have the software it needs yet. Press \
-             Start to try again.",
-        ));
+        return Prompted::Declined;
     }
-    Err(Problem::with(
+    Prompted::Failed(Problem::with(
         "Installing the software OpenBot needs did not finish. Try again.",
         said,
     ))
@@ -725,18 +1099,32 @@ fn install_podman(into: &Path) -> Result<(), Problem> {
 ///
 /// Two layers, applied in this order: single-quote it for the shell, then escape what AppleScript
 /// treats as special in the double-quoted string that carries it.
-#[cfg(target_os = "macos")]
-fn applescript_shell_arg(path: &Path) -> String {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn applescript_shell_arg(path: &Path) -> String {
     let quoted = format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     quoted.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(target_os = "linux")]
-fn install_podman(_into: &Path) -> Result<(), Problem> {
+fn install_podman(
+    _into: &Path,
+    progress: &mut dyn FnMut(StepLine),
+    back: &dyn Fn(),
+    _cancelled: &dyn Fn() -> bool,
+) -> Result<(), Problem> {
+    progress(podman_install_said("linux"));
+    let result = install_podman_with_pkexec();
+    // pkexec's prompt was in front of OpenBot's window.
+    back();
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn install_podman_with_pkexec() -> Result<(), Problem> {
     let (manager, args) = linux_package_manager().ok_or_else(|| {
         Problem::with(
-            "OpenBot cannot install the software it needs on this system. Install the `podman` \
-             package, then start OpenBot again.",
+            "OpenBot can't install the software it needs on this system. Install the podman \
+             package with your system's package manager, then start OpenBot again.",
             "no apt-get, dnf, zypper or pacman in /usr/bin",
         )
     })?;
@@ -1106,18 +1494,9 @@ mod tests {
     fn every_pinned_digest_is_a_lowercase_sha256() {
         // The table is written by hand from each release's own checksums, and a digest with a typo
         // in it fails on somebody else's machine at install time rather than here.
-        for download in [
-            compose_download(),
-            podman_download(),
-            bun_download("windows", "x86_64"),
-            bun_download("windows", "aarch64"),
-            bun_download("macos", "x86_64"),
-            bun_download("macos", "aarch64"),
-            bun_download("linux", "x86_64"),
-            bun_download("linux", "aarch64"),
-        ]
-        .into_iter()
-        .flatten()
+        for download in [compose_download(), podman_download()]
+            .into_iter()
+            .flatten()
         {
             assert_eq!(download.sha256.len(), 64, "{download:?}");
             assert!(
@@ -1138,6 +1517,33 @@ mod tests {
             digest_of(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// A Podman installer whose download was cut off, by a dropped connection or by quitting the app,
+    /// carries on from the bytes already on disk at the next try, and is checked whole before it is
+    /// kept. Before the early downloads, every try downloaded the whole file again into memory.
+    #[test]
+    fn a_download_cut_off_part_way_carries_on_from_where_it_stopped() {
+        use crate::early_downloads::tests::{file, ranged, whole, Server};
+        let (body, sha256) = file(400_000);
+        let served = body.clone();
+        let server = Server::start(move |request, index| match index {
+            0 => whole(&served, Some(150_000)),
+            _ => ranged(request, &served),
+        });
+        let dir = temp_root("install-resume");
+        let download = Download {
+            url: server.url("/podman-installer-macos-arm64.pkg"),
+            sha256: Box::leak(sha256.into_boxed_str()),
+            file: "podman-installer-macos-arm64.pkg",
+        };
+        let path = fetch_verified(&download, &dir).expect("the installer, carried on");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].range.as_deref(), Some("bytes=150000-"), "{seen:?}");
+        assert_eq!(server.sent(), body.len(), "nothing was downloaded twice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1176,310 +1582,6 @@ mod tests {
         let path = fetch_verified(&pinned, &dir).expect("the file already here should be kept");
         assert_eq!(path, dir.join("kept"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn cached_bun_archive(name: &str) -> (PathBuf, Download) {
-        let dir = temp_root(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        let download = Download {
-            url: "http://127.0.0.1:1/never-reached".into(),
-            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            file: "bun.zip",
-        };
-        std::fs::write(dir.join(download.file), b"abc").unwrap();
-        (dir, download)
-    }
-
-    fn bun_zip_fixture(name: &str) -> (PathBuf, Download) {
-        use base64::Engine as _;
-
-        // A deflated ZIP containing bun-fixture/bun, a /bin/sh script printing 1.4.3,
-        // and an unrelated traversal entry that must never be extracted. Fixed bytes keep
-        // digest verification and real decompression in this offline regression.
-        let bytes = base64::engine::general_purpose::STANDARD.decode(
-            "UEsDBBQAAAAIAAAAIVxUT2uCHQAAABsAAAAPAAAAYnVuLWZpeHR1cmUvYnVuU1bUT8rM0y/O4CooyswrSVNQN9Qz0TOOyVPnAgBQSwMEFAAAAAgAAAAhXDpV0AcXAAAAFQAAAA0AAAAuLi91bmV4cGVjdGVkyy0tLlHIyy9RSEpVSK0oKUpMLklNAQBQSwECFAMUAAAACAAAACFcVE9rgh0AAAAbAAAADwAAAAAAAAAAAAAAgAEAAAAAYnVuLWZpeHR1cmUvYnVuUEsBAhQDFAAAAAgAAAAhXDpV0AcXAAAAFQAAAA0AAAAAAAAAAAAAAIABSgAAAC4uL3VuZXhwZWN0ZWRQSwUGAAAAAAIAAgB4AAAAjAAAAAAA",
-        ).unwrap();
-        let root = temp_root(name);
-        std::fs::create_dir_all(&root).unwrap();
-        let download = Download {
-            url: "http://127.0.0.1:1/never-reached".into(),
-            sha256: "2620378dbeb5b75aa500d3402928732c4e9f800a4546e609f2ff99be95470a29",
-            file: "bun-fixture.zip",
-        };
-        std::fs::write(root.join(download.file), bytes).unwrap();
-        (root, download)
-    }
-
-    #[test]
-    fn linux_runtime_downloads_are_pinned_for_both_supported_architectures() {
-        for (arch, file, sha256) in [
-            (
-                "x86_64",
-                "bun-linux-x64-baseline.zip",
-                "1fc2edac843102909e3a1be1d8d9802cc6071cf074e67e88231f4ffe0f8b397b",
-            ),
-            (
-                "aarch64",
-                "bun-linux-aarch64.zip",
-                "efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21",
-            ),
-        ] {
-            let download = bun_download("linux", arch).unwrap();
-            assert_eq!(download.file, file);
-            assert_eq!(download.sha256, sha256);
-            assert_eq!(
-                download.url,
-                format!("https://github.com/oven-sh/bun/releases/download/bun-v{BUN}/{file}")
-            );
-        }
-        assert!(bun_download("linux", "unsupported").is_err());
-    }
-
-    #[test]
-    fn macos_runtime_downloads_are_pinned_for_both_supported_architectures() {
-        for (arch, file) in [
-            ("aarch64", "bun-darwin-aarch64.zip"),
-            ("x86_64", "bun-darwin-x64-baseline.zip"),
-        ] {
-            let download = bun_download("macos", arch).unwrap();
-            assert_eq!(download.file, file);
-            assert_eq!(
-                download.url,
-                format!("https://github.com/oven-sh/bun/releases/download/bun-v{BUN}/{file}")
-            );
-        }
-        assert!(bun_download("macos", "unsupported").is_err());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn bun_installation_works_without_developer_tools() {
-        if crate::test_support::isolated_process(
-            "install::tests::bun_installation_works_without_developer_tools",
-        ) {
-            return;
-        }
-        std::env::set_var("PATH", "/openbot-no-developer-tools");
-        let (root, download) = bun_zip_fixture("bun user's fresh account");
-        let binary = ensure_bun_with(None, || {
-            install_bun_with(
-                &root,
-                &download,
-                |archive, target| extract_bun(archive, target, "bun-fixture/bun"),
-                verify_bun,
-            )
-        })
-        .unwrap();
-        assert_eq!(binary, root.join("bun"));
-        verify_bun(&binary).unwrap();
-        assert!(!root.join("bun.download").exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn bun_extraction_only_writes_the_expected_file() {
-        let (root, download) = bun_zip_fixture("bun extraction paths");
-        let into = root.join("installed");
-        std::fs::create_dir(&into).unwrap();
-        let target = into.join(format!("bun{}", std::env::consts::EXE_SUFFIX));
-        let archive = fetch_verified(&download, &root).unwrap();
-        extract_bun(&archive, &target, "bun-fixture/bun").unwrap();
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"#!/bin/sh\nprintf '1.4.3\\n'\n"
-        );
-        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 1);
-        assert!(!root.join("unexpected").exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
-                0o755
-            );
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn missing_bun_archive_entry_is_not_published_or_run() {
-        let (root, download) = bun_zip_fixture("bun missing entry");
-        let failure = install_bun_with(
-            &root,
-            &download,
-            |archive, target| extract_bun(archive, target, "missing/bun"),
-            |_| panic!("a missing archive entry must not be run"),
-        )
-        .unwrap_err();
-        assert!(failure.detail.unwrap().contains("missing/bun"));
-        assert!(!root
-            .join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        assert!(!root
-            .join(format!("bun.download{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_fresh_account_acquires_bun_before_returning_its_executable() {
-        let (dir, download) = cached_bun_archive("bun-fresh-account");
-        let binary = ensure_bun_with(None, || {
-            install_bun_with(
-                &dir,
-                &download,
-                |archive, target| {
-                    assert_eq!(std::fs::read(archive).unwrap(), b"abc");
-                    assert!(!dir
-                        .join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-                        .exists());
-                    std::fs::write(target, b"executable").unwrap();
-                    Ok(())
-                },
-                |target| {
-                    assert_eq!(std::fs::read(target).unwrap(), b"executable");
-                    assert!(
-                        !dir.join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-                            .exists(),
-                        "verify before publishing"
-                    );
-                    Ok(())
-                },
-            )
-        })
-        .unwrap();
-        assert_eq!(
-            binary,
-            dir.join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-        );
-        assert_eq!(std::fs::read(binary).unwrap(), b"executable");
-        assert!(!dir
-            .join(format!("bun.download{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn an_existing_bun_does_not_trigger_installation() {
-        let root = temp_root("existing-pinned-bun");
-        let existing = runtime_version_fixture(&root, BUN);
-        assert_eq!(
-            ensure_bun_with(Some(existing.clone()), || panic!("already installed")).unwrap(),
-            existing
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    fn runtime_version_fixture(root: &Path, version: &str) -> PathBuf {
-        std::fs::create_dir_all(root).unwrap();
-        let source = root.join("runtime.rs");
-        std::fs::write(&source, format!("fn main() {{ assert_eq!(std::env::args().nth(1).as_deref(), Some(\"--version\")); println!({version:?}); }}")).unwrap();
-        let binary = root.join(format!("bun{}", std::env::consts::EXE_SUFFIX));
-        crate::test_support::compile_fixture(&source, &binary);
-        binary
-    }
-
-    #[test]
-    fn unsupported_existing_bun_acquires_pinned_runtime_without_changing_user_binary() {
-        let root = temp_root("unsupported-existing-bun");
-        let existing = runtime_version_fixture(&root.join("user"), "1.2.15");
-        let pinned = runtime_version_fixture(&root.join("openbot"), BUN);
-        let before = std::fs::read(&existing).unwrap();
-        let chosen = ensure_bun_with(Some(existing.clone()), || Ok(pinned.clone())).unwrap();
-        assert_eq!(
-            chosen, pinned,
-            "an incompatible user runtime must not be selected"
-        );
-        assert_eq!(
-            std::fs::read(existing).unwrap(),
-            before,
-            "the user's runtime is untouched"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn an_acquired_bun_is_checked_and_reused_without_extracting_again() {
-        let (dir, download) = cached_bun_archive("bun-reuse");
-        let binary = dir.join(format!("bun{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(&binary, b"installed").unwrap();
-        std::fs::remove_file(dir.join(download.file)).unwrap();
-        let result = install_bun_with(
-            &dir,
-            &download,
-            |_, _| panic!("must not replace the installed runtime"),
-            |target| {
-                assert_eq!(target, binary);
-                Ok(())
-            },
-        );
-        assert_eq!(result.unwrap(), binary);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn bun_extraction_failure_keeps_the_diagnostic_and_publishes_nothing() {
-        let (dir, download) = cached_bun_archive("bun-extraction-failure");
-        let failure = Problem::with("could not unpack", "PowerShell exit 1: access denied");
-        let result = install_bun_with(
-            &dir,
-            &download,
-            |_, target| {
-                std::fs::write(target, b"partially extracted executable").unwrap();
-                Err(failure.clone())
-            },
-            |_| panic!("failed extraction must not be executed"),
-        );
-        assert_eq!(result, Err(failure));
-        assert!(!dir
-            .join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        assert!(!dir
-            .join(format!("bun.download{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn bun_that_cannot_run_is_not_published_and_its_failure_is_preserved() {
-        let (dir, download) = cached_bun_archive("bun-probe-failure");
-        let failure = Problem::with("could not start", "bun --version exited 1");
-        let result = ensure_bun_with(None, || {
-            install_bun_with(
-                &dir,
-                &download,
-                |_, target| {
-                    std::fs::write(target, b"broken executable").unwrap();
-                    Ok(())
-                },
-                |_| Err(failure.clone()),
-            )
-        });
-        assert_eq!(result, Err(failure));
-        assert!(!dir
-            .join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        assert!(!dir
-            .join(format!("bun.download{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn an_unverified_bun_archive_is_never_extracted_or_run() {
-        let (dir, download) = cached_bun_archive("bun-wrong-digest");
-        std::fs::write(dir.join(download.file), b"corrupt archive").unwrap();
-        let result = install_bun_with(
-            &dir,
-            &download,
-            |_, _| panic!("an unverified archive must not be extracted"),
-            |_| panic!("an unverified runtime must not be run"),
-        );
-        assert!(result.unwrap_err().detail.is_some());
-        assert!(!dir
-            .join(format!("bun{}", std::env::consts::EXE_SUFFIX))
-            .exists());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Podman publishes an `arm64` package only, so an Intel Mac has to be told rather than handed
@@ -1604,9 +1706,9 @@ mod tests {
         );
         assert_eq!(
             problem.said,
-            "Windows policy blocks installing Podman, the container engine \
-            OpenBot needs. Ask an administrator to allow the installation or install Podman for \
-            your account, then try again."
+            "Windows policy blocks installing Podman, which OpenBot needs to run. Ask an \
+             administrator to allow the installation or install Podman for your account, then \
+             try again."
         );
         assert_eq!(
             problem.detail,
@@ -1718,5 +1820,584 @@ esac
         assert!(quoted.starts_with('\''), "{quoted}");
         assert!(quoted.contains("Application Support"), "{quoted}");
         assert!(!quoted.contains("\\\""), "{quoted}");
+    }
+
+    /// The prompt is named where there is one, and none is promised where there is not.
+    #[test]
+    fn the_podman_install_line_names_the_prompt_each_platform_raises() {
+        // A prompt is the system's own window in front of OpenBot's: the line says so wherever
+        // the person is, and OpenBot comes back once the installer is done.
+        for os in ["macos", "linux"] {
+            let line = podman_install_said(os);
+            assert!(line.said.contains("password"), "{os}");
+            assert!(line.elsewhere, "{os}");
+        }
+        let windows = podman_install_said("windows");
+        assert_eq!(windows.said, "Installing the software OpenBot runs on.");
+        assert!(!windows.elsewhere);
+    }
+
+    /// Words a person setting OpenBot up doesn't know. The screen never says them; the log does.
+    const TECHNICAL: &[&str] = &[
+        "Podman",
+        "WSL",
+        "Windows Subsystem for Linux",
+        "engine machine",
+        "engine",
+        "machine",
+        "k3s",
+        "Helm",
+        "Compose",
+    ];
+
+    /// A tester read "Preparing the engine machine" and "Installing Podman" for minutes and could
+    /// not tell whether setup was stuck. Every line setup shows while it prepares this computer is
+    /// in plain words; the log keeps the technical names beside it.
+    #[test]
+    fn every_line_shown_while_preparing_this_computer_is_plain_and_the_log_keeps_the_detail() {
+        let lines = [
+            podman_downloading(),
+            podman_declined(),
+            podman_install_said("macos"),
+            podman_install_said("linux"),
+            podman_install_said("windows"),
+            engine::preparing_machine_line("macos"),
+            engine::preparing_machine_line("windows"),
+            engine::preparing_machine_line("linux"),
+            engine::starting_machine_line(),
+            engine::checking_engine_line(),
+            engine::engine_ready_line(),
+        ];
+        let shown = lines
+            .iter()
+            .map(|line| line.said.as_str())
+            .chain([PODMAN_PASSWORD_PROMPT]);
+        for said in shown {
+            for word in TECHNICAL {
+                assert!(
+                    !said.to_lowercase().contains(&word.to_lowercase()),
+                    "{word:?} is on screen: {said:?}"
+                );
+            }
+        }
+        for line in &lines {
+            let detail = line.detail.as_deref().expect("the log keeps the detail");
+            let entry = line.log_entry();
+            assert!(entry.contains(detail), "{entry}");
+            assert!(entry.contains(&line.said), "{entry}");
+        }
+        let log = lines
+            .iter()
+            .map(StepLine::log_entry)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for kept in [
+            "Podman",
+            "engine machine",
+            "Windows Subsystem for Linux",
+            "podman machine init",
+            "podman machine start",
+            "Waiting for the engine to answer.",
+        ] {
+            assert!(log.contains(kept), "{kept:?} is not in the log:\n{log}");
+        }
+    }
+
+    /// Where Podman's package lands: the app's cache, which has a space in its path on macOS.
+    const PACKAGE: &str = "/Users/a b/Library/Caches/OpenBot/podman-installer-macos-arm64.pkg";
+
+    /// What happened, in order: the step's lines, the download, the prompt and OpenBot coming back.
+    #[derive(Clone, Default)]
+    struct Seen(std::sync::Arc<Mutex<Vec<String>>>);
+
+    impl Seen {
+        fn add(&self, what: impl Into<String>) {
+            self.0.lock().unwrap().push(what.into());
+        }
+
+        fn line(&self, line: StepLine) {
+            let kind = if line.asks {
+                "asks"
+            } else if line.elsewhere {
+                "elsewhere"
+            } else {
+                "here"
+            };
+            self.add(format!("{kind}: {}", line.said));
+        }
+
+        fn all(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Each time a prompt came up, how long after the line before it.
+        fn prompts(&self) -> usize {
+            self.all().iter().filter(|seen| *seen == "prompt").count()
+        }
+    }
+
+    const SAY_FIRST: &str =
+        "elsewhere: Your Mac will ask for your password so OpenBot can install what it needs to run.";
+
+    /// David's direction for 1.0.1: no Continue before the password prompt. The person is told what
+    /// is coming and why, has a moment to read it, and the prompt comes up by itself. Here nothing
+    /// in the window ever gives a go-ahead, and the prompt still comes, after the line and the pause.
+    #[test]
+    fn the_password_prompt_comes_after_its_explanation_without_a_click() {
+        let gate = GoAhead::new();
+        let seen = Seen::default();
+        let said_at = std::sync::Mutex::new(None);
+        let mut scripts = Vec::new();
+        let installed = install_with_password(
+            || {
+                seen.add("downloaded");
+                Ok(PathBuf::from(PACKAGE))
+            },
+            &mut |line| {
+                if line.elsewhere {
+                    *said_at.lock().unwrap() = Some(std::time::Instant::now());
+                }
+                seen.line(line)
+            },
+            &gate,
+            &|| false,
+            |script| {
+                let waited = said_at.lock().unwrap().unwrap().elapsed();
+                assert!(waited >= Duration::from_millis(200), "{waited:?}");
+                seen.add("prompt");
+                scripts.push(script.to_owned());
+                Prompted::Installed
+            },
+            &|| seen.add("back"),
+            Duration::from_millis(200),
+            Duration::from_secs(60),
+        );
+        assert!(installed.is_ok(), "{installed:?}");
+        assert_eq!(
+            seen.all(),
+            [
+                "here: Downloading the software OpenBot runs on.",
+                "downloaded",
+                SAY_FIRST,
+                "prompt",
+                "back",
+            ]
+        );
+        // Nothing asked the person to click: no line asked for their go-ahead.
+        assert!(!seen.all().iter().any(|line| line.starts_with("asks: ")));
+        assert_eq!(
+            scripts,
+            [concat!(
+                r#"do shell script "/usr/sbin/installer -pkg '/Users/a b/Library/Caches/OpenBot/"#,
+                r#"podman-installer-macos-arm64.pkg' -target /" with administrator privileges "#,
+                r#"with prompt "OpenBot needs your password to install the software it runs on.""#
+            )]
+        );
+    }
+
+    /// Closing the prompt without a password is a decision, and recoverable: no failure, the step
+    /// says plainly that OpenBot needs it, and asks again by itself after a short wait.
+    #[test]
+    fn a_closed_password_prompt_asks_again_by_itself_without_an_error() {
+        let gate = GoAhead::new();
+        let seen = Seen::default();
+        let mut answers = [Prompted::Declined, Prompted::Installed].into_iter();
+        let installed = install_with_password(
+            || Ok(PathBuf::from(PACKAGE)),
+            &mut |line| seen.line(line),
+            &gate,
+            &|| false,
+            |_| {
+                seen.add("prompt");
+                answers.next().unwrap()
+            },
+            &|| seen.add("back"),
+            Duration::from_millis(10),
+            Duration::from_millis(300),
+        );
+        assert!(installed.is_ok(), "{installed:?}");
+        assert_eq!(
+            seen.all(),
+            [
+                "here: Downloading the software OpenBot runs on.",
+                SAY_FIRST,
+                "prompt",
+                "back",
+                "asks: OpenBot needs your password to install what it needs to run. It asks again \
+                 in a moment, or choose Try again.",
+                SAY_FIRST,
+                "prompt",
+                "back",
+            ]
+        );
+    }
+
+    /// Try again, in the window after a closed prompt, asks again at once.
+    #[test]
+    fn try_again_after_a_closed_prompt_asks_at_once() {
+        let gate = std::sync::Arc::new(GoAhead::new());
+        let seen = Seen::default();
+        let window = {
+            let (gate, seen) = (gate.clone(), seen.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !seen.all().iter().any(|line| line.starts_with("asks: ")) {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(gate.give());
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut answers = [Prompted::Declined, Prompted::Installed].into_iter();
+        let installed = install_with_password(
+            || Ok(PathBuf::from(PACKAGE)),
+            &mut |line| seen.line(line),
+            &gate,
+            &|| false,
+            |_| {
+                seen.add("prompt");
+                answers.next().unwrap()
+            },
+            &|| {},
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+        window.join().unwrap();
+        assert!(installed.is_ok(), "{installed:?}");
+        assert_eq!(seen.prompts(), 2);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Stop or Quit while the line is being read, or while it waits to ask again, raises no prompt.
+    #[test]
+    fn stopping_before_the_prompt_raises_none() {
+        let seen = Seen::default();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let failed = install_with_password(
+            || Ok(PathBuf::from(PACKAGE)),
+            &mut |line| {
+                seen.line(line);
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            &GoAhead::new(),
+            &|| stopped.load(std::sync::atomic::Ordering::SeqCst),
+            |_| {
+                seen.add("prompt");
+                Prompted::Installed
+            },
+            &|| seen.add("back"),
+            Duration::from_millis(200),
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failed.said,
+            "OpenBot stopped before installing the software it runs on. Start again when you're \
+             ready."
+        );
+        assert_eq!(seen.prompts(), 0, "{:?}", seen.all());
+    }
+
+    /// A Try again left over from earlier, or sent twice, never brings a prompt early.
+    #[test]
+    fn a_try_again_with_nothing_waiting_counts_for_nothing() {
+        let gate = GoAhead::new();
+        assert!(!gate.give());
+        let asked_once = std::sync::atomic::AtomicUsize::new(0);
+        // The earlier click is not taken: the wait ends only by the limit or the stop.
+        let waited = gate.wait(
+            Duration::from_secs(60),
+            || {
+                asked_once.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            &|| asked_once.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        );
+        assert!(waited.is_err());
+        assert!(!gate.give());
+    }
+
+    /*
+     * The person's own Podman machine through a Podman update, on a fake that does what the real
+     * platform did on a live Windows run (Podman 5.8.9 with `podman-machine-default` running, the
+     * person's container and volume in it, updated to 6.1.1 by OpenBot's MSI):
+     *
+     * - `podman machine list --format json` lists it by its name with "Running": true (the
+     *   listing below is the shape Podman 6.1.1 prints on a Mac, `Running` and all).
+     * - The MSI leaves a machine it finds running up and its Docker API gone: `win-sshproxy` was
+     *   stopped and nothing started it again. Pulls then failed at "failed to connect to the docker
+     *   API at npipe:////./pipe/podman-machine-default ... The system cannot find the file
+     *   specified."
+     * - `podman machine stop` stops it and its API; `podman machine start` starts both.
+     */
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Machine {
+        running: bool,
+        api: bool,
+    }
+
+    #[derive(Default)]
+    struct Computer {
+        machines: Vec<(&'static str, Machine)>,
+        done: Vec<String>,
+    }
+
+    impl Computer {
+        fn machine(&mut self, name: &str) -> &mut Machine {
+            &mut self
+                .machines
+                .iter_mut()
+                .find(|(named, _)| *named == name)
+                .expect("a machine Podman lists")
+                .1
+        }
+    }
+
+    /// The machines, shared with the installer, which acts on them between what the update does
+    /// before it and after it.
+    #[derive(Clone, Default)]
+    struct FakeMachines(std::rc::Rc<std::cell::RefCell<Computer>>);
+
+    impl FakeMachines {
+        fn running_default() -> Self {
+            let fake = Self::default();
+            fake.0.borrow_mut().machines.push((
+                "podman-machine-default",
+                Machine {
+                    running: true,
+                    api: true,
+                },
+            ));
+            fake
+        }
+
+        fn machine(&self, name: &str) -> Machine {
+            *self.0.borrow_mut().machine(name)
+        }
+
+        fn set(&self, name: &str, machine: Machine) {
+            *self.0.borrow_mut().machine(name) = machine;
+        }
+
+        fn done(&self) -> Vec<String> {
+            self.0.borrow().done.clone()
+        }
+
+        /// What the MSI did to every machine it found running.
+        fn installer_ran(&self) {
+            let mut computer = self.0.borrow_mut();
+            computer.done.push("install".into());
+            for (_, machine) in &mut computer.machines {
+                if machine.running {
+                    machine.api = false;
+                }
+            }
+        }
+    }
+
+    impl Machines for FakeMachines {
+        fn running(&mut self) -> Result<Vec<String>, String> {
+            // Read from Podman's own listing, as `acquire::running_machines` does.
+            let listing = serde_json::Value::Array(
+                self.0
+                    .borrow()
+                    .machines
+                    .iter()
+                    .map(|(name, machine)| {
+                        serde_json::json!({
+                            "Name": name,
+                            "Default": true,
+                            "Running": machine.running,
+                            "Starting": false,
+                            "VMType": "wsl",
+                        })
+                    })
+                    .collect(),
+            )
+            .to_string();
+            crate::acquire::running_in(&listing)
+        }
+        fn stop(&mut self, name: &str) -> Result<(), String> {
+            self.0.borrow_mut().done.push(format!("stop {name}"));
+            self.set(
+                name,
+                Machine {
+                    running: false,
+                    api: false,
+                },
+            );
+            Ok(())
+        }
+        fn start(&mut self, name: &str) -> Result<(), String> {
+            self.0.borrow_mut().done.push(format!("start {name}"));
+            self.set(
+                name,
+                Machine {
+                    running: true,
+                    api: true,
+                },
+            );
+            Ok(())
+        }
+        fn answers(&mut self, name: &str) -> Result<(), String> {
+            self.0.borrow_mut().done.push(format!("answers {name}"));
+            match self.machine(name) {
+                Machine { running: false, .. } => Err(format!("{name} is stopped")),
+                Machine { api: false, .. } => Err(format!(
+                    "npipe:////./pipe/{name}: The system cannot find the file specified. (os error 2)"
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// `update_podman_with` on `machines`, with an installer that says what the Windows one says
+    /// and does what the MSI did; `fails` makes it stop with an error after that.
+    fn update(
+        machines: &FakeMachines,
+        windows: bool,
+        fails: bool,
+    ) -> (Result<(), Problem>, Vec<StepLine>) {
+        let mut said = Vec::new();
+        let installer = machines.clone();
+        let result = update_podman_with(
+            &mut machines.clone(),
+            windows,
+            &mut |line| said.push(line),
+            &mut |progress| {
+                progress(podman_install_said("windows"));
+                installer.installer_ran();
+                if fails {
+                    return Err(Problem::with(
+                        "Installing the software OpenBot needs did not finish. Try again.",
+                        "msiexec /i stopped with exit code 1603",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        (result, said)
+    }
+
+    /// On Windows the person's own running machine is stopped before the MSI and started after
+    /// it, so its API answers when the update is done. Only OpenBot's own machine used to be.
+    #[test]
+    fn a_persons_own_running_machine_survives_the_podman_update_with_its_api_answering() {
+        let machines = FakeMachines::running_default();
+        let (result, said) = update(&machines, true, false);
+        result.unwrap();
+        assert_eq!(
+            machines.done(),
+            [
+                "stop podman-machine-default",
+                "install",
+                "answers podman-machine-default",
+                "stop podman-machine-default",
+                "start podman-machine-default",
+            ]
+        );
+        assert_eq!(
+            machines.machine("podman-machine-default"),
+            Machine {
+                running: true,
+                api: true
+            }
+        );
+        // The row says why, the whole time: what the installer says goes to the log.
+        let why = "The Podman on this computer is too old for OpenBot, so OpenBot is updating it.";
+        assert!(!said.is_empty());
+        assert!(said.iter().all(|line| line.said == why), "{said:?}");
+        assert!(said
+            .iter()
+            .any(|line| line.detail.as_deref() == Some("Installing Podman.")));
+    }
+
+    /// During an update the Mac's password prompt is said after why, short enough for the row:
+    /// "...so OpenBot is updating it. Your Mac will ask for your password." The installer's own
+    /// words go to the log, and the line stays one about the engine being updated.
+    #[test]
+    fn the_password_prompt_during_an_update_says_why_first_and_fits() {
+        let line = while_updating(podman_install_said("macos"));
+        assert_eq!(
+            line.said,
+            "The Podman on this computer is too old for OpenBot, so OpenBot is updating it. Your \
+             Mac will ask for your password."
+        );
+        assert!(line.elsewhere && line.updating);
+        assert_eq!(
+            line.detail.as_deref(),
+            Some("Installing Podman's package; macOS asks for the password.")
+        );
+        // A go-ahead the person gives in OpenBot's own window is said as it is.
+        assert_eq!(while_updating(podman_declined()), podman_declined());
+    }
+
+    /// A machine the installer took the API from is stopped and started even when it was not
+    /// stopped first: a Mac, where it is not, or a stop that failed.
+    #[test]
+    fn a_machine_whose_api_the_installer_took_is_stopped_and_started_after_it() {
+        let machines = FakeMachines::running_default();
+        let (result, _) = update(&machines, false, false);
+        result.unwrap();
+        assert_eq!(
+            machines.done(),
+            [
+                "install",
+                "answers podman-machine-default",
+                "stop podman-machine-default",
+                "start podman-machine-default",
+            ]
+        );
+        assert!(machines.machine("podman-machine-default").api);
+    }
+
+    /// A stopped machine stays stopped: only what was running is started again.
+    #[test]
+    fn a_stopped_machine_is_left_stopped() {
+        let machines = FakeMachines::running_default();
+        machines.set(
+            "podman-machine-default",
+            Machine {
+                running: false,
+                api: false,
+            },
+        );
+        let (result, _) = update(&machines, true, false);
+        result.unwrap();
+        assert_eq!(machines.done(), ["install"]);
+    }
+
+    /// An installer that failed still leaves the machine it stopped running again, and its failure
+    /// is the one said.
+    #[test]
+    fn a_failed_update_still_starts_the_machine_it_stopped() {
+        let machines = FakeMachines::running_default();
+        let (result, _) = update(&machines, true, true);
+        assert_eq!(
+            result.unwrap_err().detail.as_deref(),
+            Some("msiexec /i stopped with exit code 1603")
+        );
+        assert_eq!(
+            machines.machine("podman-machine-default"),
+            Machine {
+                running: true,
+                api: true
+            }
+        );
+    }
+
+    /// The live run's listing, read: `Running` decides, by name.
+    #[test]
+    fn the_running_machines_are_read_from_podmans_listing() {
+        let listing = r#"[
+            {"Name": "openbot-s1", "Default": true, "Running": false, "Starting": false, "VMType": "applehv"},
+            {"Name": "podman-machine-default", "Default": false, "Running": true, "Starting": false, "VMType": "wsl"},
+            {"Name": "openbot", "Default": false, "Running": true, "Starting": false, "VMType": "wsl"}
+        ]"#;
+        assert_eq!(
+            crate::acquire::running_in(listing).unwrap(),
+            ["podman-machine-default", "openbot"]
+        );
+        assert!(crate::acquire::running_in("not json").is_err());
     }
 }

@@ -4,6 +4,7 @@ import {
 } from "@openbot/shared/connect-prompt";
 import type { GrantedTool } from "@openbot/toolkit/granted-tool";
 import { z } from "zod";
+import { currentEdition } from "../edition";
 import type { AppAccess, AppAccessState } from "./app-access";
 import { ownerAppsAllowed } from "./owner-grants";
 import type {
@@ -59,8 +60,11 @@ export function appAccessTools(options: {
     {
       name: SHOW_APP_ACCESS_TOOL,
       ref: `app-access/${SHOW_APP_ACCESS_TOOL}`,
+      // No administrator in the personal edition: the card offers the step itself.
       description:
-        "Show the person a card saying whether they can use one work app through you, and the one thing that would let them: connecting their own account, or asking an administrator to switch the app on, grant it to you, or connect its shared account. Call it whenever a question needs an app you hold no tools for, instead of only saying it is missing.",
+        currentEdition() === "personal"
+          ? "Show the person a card saying whether they can use one work app through you, and the one thing that would let them: connecting it, or setting it up. Call it whenever a question needs an app you hold no tools for or one that needs connecting, instead of only saying it is missing."
+          : "Show the person a card saying whether they can use one work app through you, and the one thing that would let them: connecting their own account, or asking an administrator to switch the app on, grant it to you, or connect its shared account. Call it whenever a question needs an app you hold no tools for, instead of only saying it is missing.",
       parameters,
       async execute(args) {
         const parsed = parameters.safeParse(args);
@@ -122,5 +126,38 @@ function toldTheModel(access: AppAccess): string {
     not_granted: `${name} is switched on, and you have not been granted it. The card in front of the person lets them ask an administrator to grant it to you.`,
     owner_grantable: `${name} is switched on, and you have not been given it. This person owns you and can give it to you themselves: the card in front of them asks whether to let you use their ${name}. Ask them to try again once they have.`,
   };
+  /*
+   * ONE PERSON, NO ADMINISTRATOR. In the personal edition the card offers the step itself, so the
+   * model is not told to send anybody to an administrator, and it is told the button the card draws.
+   */
+  if (
+    currentEdition() === "personal" &&
+    (access.state === "disabled" || access.state === "not_granted")
+  )
+    said[access.state] = personalStep(access);
   return `${said[access.state]} Do not browse to its website or ask them to sign in there.`;
+}
+
+/**
+ * The personal edition's card for an app that is off, in the words of its own button, read the way
+ * `PersonalConnectAction` and `AdminAction` in the app's `app-access-action.tsx` read it.
+ *
+ * TURN ON IS ITS OWN PRESS WHERE THE SIGN-IN IS NOT KNOWN YET. A broker app nobody has added has no
+ * auth scheme until it is turned on, so the card says Turn on, and Connect follows as a second
+ * press once the app is on and needs the person's account. A Bot told "press Connect" there sent
+ * the person looking for a button the card did not show.
+ */
+function personalStep(access: AppAccess): string {
+  const name = access.displayName;
+  const oneStep =
+    access.state === "not_granted" ||
+    access.unavailable === null ||
+    access.unavailable === "absent";
+  if (!oneStep)
+    return `${name} isn't set up yet. The card in front of the person offers Set it up, which opens the page where they finish it; ask them to try again once they have.`;
+  if (access.connect === "key")
+    return `${name} isn't connected yet. The card in front of the person offers Set up, which opens the page where they add its key; ask them to try again once they have.`;
+  if (access.connect === "oauth" || access.connect === "consent")
+    return `${name} isn't connected yet. The card in front of the person offers Connect, which turns it on and connects it in one press; ask them to try again once they have.`;
+  return `${name} isn't connected yet. The card in front of the person offers Turn on. If the card then offers Connect, they press that next to connect their account. Ask them to try again once they have.`;
 }

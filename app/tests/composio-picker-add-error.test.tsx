@@ -84,7 +84,8 @@ beforeEach(() => {
         await slackWaits;
         return json({ error: SLACK_REFUSAL }, 409);
       }
-      return json({ ok: true });
+      // The route's own answer: the row it made.
+      return json({ server: { id: `composio-${slug}` } }, 201);
     }
     if (path === "/api/plugins/composio/apps") {
       return json({
@@ -96,6 +97,8 @@ beforeEach(() => {
             logo: null,
             categories: [],
             actionCount: 167,
+            // What the server sends on every row; Slack and Gmail are both sign-in apps.
+            connection: { kind: "consent" },
             enabled: false,
           },
           {
@@ -105,6 +108,8 @@ beforeEach(() => {
             logo: null,
             categories: [],
             actionCount: 42,
+            // What the server sends on every row; Slack and Gmail are both sign-in apps.
+            connection: { kind: "consent" },
             enabled: false,
           },
         ],

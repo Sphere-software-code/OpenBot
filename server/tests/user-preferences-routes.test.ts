@@ -10,6 +10,7 @@ import { userPreferencesRoutes } from "../src/user-preferences-routes";
 function fixture() {
   const state = new Map<string, UserPreferences>();
   const store: UserPreferencesStore = {
+    claimStarterTour: async () => {},
     read: async (id) => state.get(id) ?? DEFAULT_USER_PREFERENCES,
     patch: async (id, patch) => {
       const saved = { ...DEFAULT_USER_PREFERENCES, ...state.get(id), ...patch };
@@ -55,6 +56,7 @@ test("preferences default to thread and persist separately for each authenticate
       selfHostBannerDismissed: false,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     },
   });
   const saved = await alice.request(
@@ -68,6 +70,7 @@ test("preferences default to thread and persist separately for each authenticate
       selfHostBannerDismissed: false,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     },
   });
   expect(await (await appFor("bob").request(path)).json()).toEqual({
@@ -76,6 +79,7 @@ test("preferences default to thread and persist separately for each authenticate
       selfHostBannerDismissed: false,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     },
   });
 });
@@ -91,6 +95,13 @@ test.each([
   { skin: "retired-skin" },
   { skin: "" },
   { skin: null },
+  { proactive: "sometimes" },
+  { proactive: true },
+  { proactive: null },
+  { starterTourDismissed: true },
+  { starterTourDismissed: false },
+  { starterTourDismissed: null },
+  { starterTourChannelId: "replacement" },
 ])("rejects invalid or extra preference fields: %j", async (body) => {
   const { appFor, state } = fixture();
   expect((await appFor("alice").request(path, patch(body))).status).toBe(400);
@@ -127,6 +138,7 @@ test("saves the self-host banner dismissal without touching message list emphasi
       selfHostBannerDismissed: true,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     },
   });
   expect(await (await appFor("bob").request(path)).json()).toEqual({
@@ -135,6 +147,7 @@ test("saves the self-host banner dismissal without touching message list emphasi
       selfHostBannerDismissed: false,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     },
   });
 });
@@ -155,6 +168,7 @@ test("keeps the person's narration choice without touching the others, and start
       selfHostBannerDismissed: false,
       narration: "on",
       skin: "openbot",
+      proactive: "on",
     },
   });
   await alice.request(path, patch({ narration: "off" }));
@@ -178,6 +192,7 @@ test("saves the skin on the account without touching the other preferences", asy
       selfHostBannerDismissed: false,
       narration: null,
       skin: "opendots",
+      proactive: "on",
     },
   });
   // Another browser signed in as Alice reads the same skin; Bob keeps the default.
@@ -187,6 +202,7 @@ test("saves the skin on the account without touching the other preferences", asy
       selfHostBannerDismissed: false,
       narration: null,
       skin: "opendots",
+      proactive: "on",
     },
   });
   expect(
@@ -208,4 +224,32 @@ test("a skin OpenBot does not ship is refused with the skins it does", async () 
   expect(((await refused.json()) as { error: string }).error).toContain(
     "openbot, openduet, opendots, openmuse",
   );
+});
+
+test("check-ins start on, and a person's off is kept without touching the others", async () => {
+  // Off stops every one of this person's Bots checking in; the default keeps them checking.
+  const { appFor } = fixture();
+  const alice = appFor("alice");
+  expect((await (await alice.request(path)).json()).preferences.proactive).toBe(
+    "on",
+  );
+  await alice.request(path, patch({ skin: "openduet" }));
+  const saved = await alice.request(path, patch({ proactive: "off" }));
+  expect(saved.status).toBe(200);
+  expect(await (await appFor("alice").request(path)).json()).toEqual({
+    preferences: {
+      messageListEmphasis: "thread",
+      selfHostBannerDismissed: false,
+      narration: null,
+      skin: "openduet",
+      proactive: "off",
+    },
+  });
+  expect(
+    (await (await appFor("bob").request(path)).json()).preferences.proactive,
+  ).toBe("on");
+  await alice.request(path, patch({ proactive: "on" }));
+  expect(
+    (await (await appFor("alice").request(path)).json()).preferences.proactive,
+  ).toBe("on");
 });

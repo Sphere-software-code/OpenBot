@@ -70,6 +70,8 @@ describe("headless components mirror the compiled gallery", () => {
         (spec) => spec.name === entry.name,
       );
       expect(mirror?.title).toBe(entry.title);
+      // The words a catalogue row nobody edited is kept up to date with. See `followBuild`.
+      expect(mirror?.buildDescription).toBe(entry.description);
       expect(z.toJSONSchema(mirror?.parameters as z.ZodType)).toEqual(
         z.toJSONSchema(entry.parameters as z.ZodType),
       );
@@ -213,6 +215,34 @@ describe("headless component tools", () => {
     expect(
       tools.find((tool) => tool.definition.name === "showLineChart")?.hidden,
     ).toBeTrue();
+  });
+
+  /*
+   * A routine or a check-in runs with nobody watching, so a card that waits for an answer would wait
+   * on nobody, and the routine's work would stop at it. Its prompt says to decide, say what it
+   * assumed and carry on; this is the harness half: the choice card is never offered there, even to a
+   * Bot that holds it, and neither are the other cards that wait.
+   */
+  test("an unattended run is never offered the choice card or another card that waits", async () => {
+    const tools = await createHeadlessComponentTools({
+      store: {
+        listForAgent: async () =>
+          ["askChoice", "askApproval", "askForm", "showBarChart"].map(
+            (name) => ({ name, description: `${name}, as published.` }),
+          ),
+        decide: async () => ({ allowed: true, description: "" }),
+        mayCall: async () => false,
+      } as unknown as ComponentStore,
+      botId: "bot",
+      ownerUserId: "owner",
+      initiator,
+    });
+    const offered = tools
+      .filter((tool) => !tool.hidden)
+      .map((tool) => tool.definition.name);
+    expect(offered).toContain("showBarChart");
+    for (const waits of ["askChoice", "askApproval", "askForm"])
+      expect(tools.map((tool) => tool.definition.name)).not.toContain(waits);
   });
 
   test("invalid arguments and a refused decision are recorded as not shown and audited", async () => {

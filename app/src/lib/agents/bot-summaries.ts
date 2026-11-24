@@ -37,11 +37,22 @@ export function sharingSummary(
     : "Specific people and groups";
 }
 
-export function setupSummary(agent: {
-  builtIn: boolean;
-  endpoint: string | null;
-}): string {
+/**
+ * Where it runs. The personal edition names what runs it when OpenBot knows: its one person
+ * picked that harness at setup, and the address is the container OpenBot started for it, which
+ * means nothing to them. A team deployment shows the address, which an admin or owner gave it.
+ */
+export function setupSummary(
+  agent: {
+    builtIn: boolean;
+    endpoint: string | null;
+    framework?: string;
+  },
+  edition: "team" | "personal" = "team",
+): string {
   if (agent.builtIn || !agent.endpoint) return "Built in";
+  if (edition === "personal" && agent.framework)
+    return `Runs on ${agent.framework}`;
   try {
     return new URL(agent.endpoint).host;
   } catch {
@@ -63,15 +74,11 @@ export function reachSummary(transports: readonly string[]): string {
   return places.length ? places.join(", ") : "Only in OpenBot";
 }
 
-/** The apps feeding this Bot facts, and whether it researches in the background. */
+/** The apps feeding this Bot facts, and whether it checks in on them. */
 export function memorySummary(sources: number, research: boolean): string {
   const parts = [
     sources ? countLabel(sources, "source", "sources", "") : "",
-    research
-      ? sources
-        ? "background research on"
-        : "Background research on"
-      : "",
+    research ? (sources ? "check-ins on" : "Check-ins on") : "",
   ].filter(Boolean);
   return parts.length ? parts.join(", ") : "Nothing connected";
 }

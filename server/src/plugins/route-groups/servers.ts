@@ -1,9 +1,11 @@
 import { requireAdmin } from "../../auth/guards";
 import { reasonWithoutStatement } from "../../db/query-failure";
+import { BROKERED_PROFILE } from "../access";
 import { brokerSentence, schemeKind } from "../broker";
-import { CATALOGUE } from "../catalogue";
+import { CATALOGUE, summaryFor } from "../catalogue";
 import { vendorSentence } from "../composio";
 import { redirectUriFor } from "../oauth";
+import { ALWAYS_ON_REFUSAL, isAlwaysOn } from "../personal-defaults";
 import { asAccountMode } from "../shared-accounts";
 import { asSharedUseApproval, type SharedUseApproval } from "../shared-use";
 import {
@@ -35,7 +37,7 @@ export function mountServerRoutes({
         key: entry.key,
         title: entry.title,
         vendor: entry.vendor,
-        summary: entry.summary,
+        summary: summaryFor(entry),
         docsUrl: entry.docsUrl,
         /*
          * The kind, not the whole thing. The page needs to know what to ask an administrator for;
@@ -45,6 +47,16 @@ export function mountServerRoutes({
          */
         auth: entry.auth.kind,
         perInstance: entry.host === null,
+        /*
+         * Whether connecting needs nothing typed first: no account at all, or an OAuth vendor this
+         * deployment registers itself with. The personal edition lists only these on Connections.
+         */
+        oneStep:
+          entry.host !== null &&
+          (entry.auth.kind === "none" ||
+            entry.auth.kind === "builtin" ||
+            (entry.auth.kind === "user-oauth" &&
+              entry.auth.clientRegistration === "dynamic")),
       })),
       /*
        * Whether a Bot with no credential of its own can still call a tool back.
@@ -218,6 +230,7 @@ export function mountServerRoutes({
       title?: unknown;
       url?: unknown;
       credentialId?: unknown;
+      entraScope?: unknown;
     } | null;
     if (
       typeof body?.id !== "string" ||
@@ -243,6 +256,23 @@ export function mountServerRoutes({
         400,
       );
     }
+    /*
+     * Marks the server as reached as the signed-in person through Microsoft, with this scope. Null
+     * puts it back on the deployment's credential; absent leaves it as it is.
+     */
+    if (
+      body.entraScope !== undefined &&
+      body.entraScope !== null &&
+      (typeof body.entraScope !== "string" || !body.entraScope.trim())
+    ) {
+      return context.json(
+        {
+          error:
+            "An Entra scope must be a non-empty string, or null to stop reaching the server as the signed-in person.",
+        },
+        400,
+      );
+    }
 
     try {
       const server = await store.addCustomServer({
@@ -253,7 +283,14 @@ export function mountServerRoutes({
           typeof body.credentialId === "string"
             ? body.credentialId.trim()
             : undefined,
+        entraScope:
+          typeof body.entraScope === "string"
+            ? body.entraScope.trim()
+            : body.entraScope === null
+              ? null
+              : undefined,
         by: actorEmail(context),
+        actorId: context.var.actor.id,
       });
       return context.json({ server });
     } catch (error) {
@@ -367,6 +404,8 @@ export function mountServerRoutes({
     if (forbidden) return forbidden;
 
     const serverId = context.req.param("id");
+    if (isAlwaysOn(serverId))
+      return context.json({ error: ALWAYS_ON_REFUSAL }, 403);
     /*
      * READ BEFORE THE ROW GOES. The ask-before-write rule a Shared app was given lives in the
      * approval policy, not on the row, so nothing cascades it away; asked afterwards, the mode is
@@ -409,7 +448,7 @@ export function mountServerRoutes({
 
       const refusal = brokerRefusal(
         error,
-        `Removing this app did not finish, and neither this deployment nor ${activeVendor} said why, so the app is still here rather than gone with grants of its own left live at the vendor. Press Remove again: every account is withdrawn at ${activeVendor} before anything here is deleted, so repeating it is safe and asks only for what is left. Check this deployment's ${activeVendor} key if it persists.`,
+        `Couldn't finish removing this app, and no reason was given. It's still here. Press Remove again. It's safe to repeat. Check ${BROKERED_PROFILE[activeProvider].envVar} if it keeps happening.`,
       );
       return context.json({ error: refusal.error }, refusal.status);
     }

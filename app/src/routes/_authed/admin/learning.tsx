@@ -1,24 +1,63 @@
 import type {
   LearningAutoAssignState,
+  LearningProposal,
+  LearningRunSummary,
   LearningSettings,
   LearningTarget,
 } from "@openbot/shared/learning";
+import {
+  IconChevronRight,
+  IconHistory,
+  IconSparkles,
+} from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useId, useState } from "react";
-import { PageSection, PageShell } from "@/components/layout/page-shell";
+import { Fragment, useId, useState } from "react";
+import {
+  PeopleProposalsSection,
+  SharingRequestsSection,
+  WhoApprovesSection,
+} from "@/components/admin/controls/people-learning";
+import { SkillSharingSection } from "@/components/admin/controls/skill-sharing-section";
+import {
+  PageEmpty,
+  PageRows,
+  PageSection,
+  PageShell,
+} from "@/components/layout/page-shell";
+import { LearnedSkillDialog } from "@/components/learning/learned-skill-dialog";
+import { ProposalDialog } from "@/components/learning/proposal-dialog";
+import { skillTitle } from "@/lib/learning/display";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemMedia,
+  ItemTitle,
+} from "@/components/ui/item";
+import { Separator } from "@/components/ui/separator";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import {
+  reviewLearningProposalMutationOptions,
+  startLearningRunMutationOptions,
+} from "@/lib/learning/mutations";
+import {
   createLearningContainer,
+  learnedSkillsQueryOptions,
   learningAutomaticQueryOptions,
   learningDeliveryQueryOptions,
   learningKeys,
   learningOverviewQueryOptions,
+  learningProposalQueryOptions,
+  learningProposalsQueryOptions,
+  learningRunsQueryOptions,
   learningSettingsQueryOptions,
   saveLearningSettings,
 } from "@/lib/learning/queries";
+import { queryClient as appQueryClient } from "@/query-client";
 
 export const Route = createFileRoute("/_authed/admin/learning")({
   component: LearningPage,
@@ -35,13 +74,15 @@ function automaticMessage(
     automatic.state === "assigned" &&
     settings.defaultTarget?.containerId === automatic.containerId
   )
-    return `OpenBot assigned this Intelligence project's "${automatic.containerId}" container automatically. You can change it here.`;
+    return `OpenBot assigned this project's "${automatic.containerId}" container automatically. You can change it here.`;
   if (automatic.state === "absent")
-    return `This Intelligence project has no "${automatic.containerId}" Learning container yet. Nothing is collected.`;
+    return `This project has no "${automatic.containerId}" Learning container yet. Nothing is collected.`;
   if (automatic.state === "not_entitled")
-    return "This Intelligence project's plan doesn't include Learning. No container was assigned.";
+    return "This project's plan doesn't include Learning. No container was assigned.";
+  if (automatic.state === "learning_off")
+    return "Learning is switched off in the backend. Nothing is collected until it's turned on there.";
   if (automatic.state === "unavailable")
-    return "Couldn't reach Intelligence to find this project's Learning container. OpenBot will try again.";
+    return "Couldn't reach the backend to find this project's Learning container. OpenBot will try again.";
   return undefined;
 }
 
@@ -127,7 +168,7 @@ function ContainerSetup({
               : `Create the ${automatic.containerId} container`}
           </Button>
           <span className="text-muted-foreground">
-            Uses this deployment's credential, not the runtime key.
+            Uses this deployment's backend credentials.
           </span>
         </div>
       )}
@@ -144,6 +185,16 @@ function ContainerSetup({
       )}
     </div>
   );
+}
+
+/**
+ * Who approves is saved from its own dialog. A Participation draft copied the
+ * whole object earlier, so sending those two keys back would overwrite a
+ * newer choice; PUT /settings keeps the stored value when they are omitted.
+ */
+function withoutReviewKeys(settings: LearningSettings): LearningSettings {
+  const { personalReview: _review, autoApprove: _auto, ...rest } = settings;
+  return rest;
 }
 
 export function LearningPage() {
@@ -193,11 +244,11 @@ export function LearningPage() {
   return (
     <PageShell
       title="Automatic learning"
-      description="Learn from finished conversations, review the skills Intelligence proposes, and give published skills to Bots."
+      description="Learn from finished conversations, review the skills OpenBot proposes, and give published skills to Bots."
     >
       <PageSection
         title="Participation"
-        description="Container changes apply to new conversations. Existing ones keep their first container. Containers must already exist in the same Intelligence project. Until you save here, OpenBot uses that project's openbot container."
+        description="Container changes apply to new conversations. Existing ones keep their first container. Containers must already exist in the same project. Until you save here, OpenBot uses that project's openbot container."
       >
         {settingsQuery.isPending && (
           <p role="status">Loading Learning settings…</p>
@@ -212,7 +263,7 @@ export function LearningPage() {
             className="grid gap-5"
             onSubmit={(event) => {
               event.preventDefault();
-              save.mutate(settings);
+              save.mutate(withoutReviewKeys(settings));
             }}
           >
             <label className="flex items-center gap-2 text-sm">
@@ -311,15 +362,15 @@ export function LearningPage() {
                 );
               })}
             </fieldset>
-            <div className="flex items-center gap-3">
-              <Button type="submit" disabled={save.isPending}>
-                {save.isPending ? "Saving…" : "Save Learning settings"}
-              </Button>
+            <div className="flex items-center justify-end gap-3">
               {saved && (
                 <p role="status" className="text-sm">
                   Settings saved.
                 </p>
               )}
+              <Button type="submit" disabled={save.isPending}>
+                {save.isPending ? "Saving…" : "Save Learning settings"}
+              </Button>
             </div>
             {save.error && (
               <p role="alert" className="text-destructive">
@@ -331,7 +382,7 @@ export function LearningPage() {
       </PageSection>
       <PageSection
         title="Review and publish"
-        description="Intelligence studies finished conversations and proposes skills. Review and publish them in Intelligence. Bots only use published skills."
+        description="OpenBot studies finished conversations and proposes skills. Review and publish them below. Bots only use published skills."
       >
         <div className="grid gap-4">
           <label className="grid gap-2 text-sm">
@@ -349,7 +400,7 @@ export function LearningPage() {
               ))}
             </select>
           </label>
-          {overview.isPending && <p role="status">Checking Intelligence…</p>}
+          {overview.isPending && <p role="status">Checking the backend…</p>}
           {overview.error && (
             <p role="alert" className="text-destructive">
               {overview.error.message}
@@ -366,33 +417,28 @@ export function LearningPage() {
                       ? "Choose a Bot, or set a default container."
                       : "No Learning container is assigned."}
               </p>
+              {snapshot.modelProblem && (
+                <p role="alert" className="text-destructive text-sm">
+                  {snapshot.modelProblem}
+                </p>
+              )}
               <dl className="grid grid-cols-2 gap-4 rounded-lg border p-4 text-sm">
-                <div>
-                  <dt className="text-muted-foreground">Threads ready</dt>
-                  <dd className="font-semibold text-xl">
-                    {snapshot.pendingThreadCount}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">
-                    Candidates to review
-                  </dt>
-                  <dd className="font-semibold text-xl">
-                    {snapshot.pendingCandidateCount}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Published skills</dt>
-                  <dd className="font-semibold text-xl">
-                    {snapshot.publishedSkillCount}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Insights</dt>
-                  <dd className="font-semibold text-xl">
-                    {snapshot.insightCount}
-                  </dd>
-                </div>
+                {(
+                  [
+                    ["Threads ready", snapshot.pendingThreadCount],
+                    ["Candidates to review", snapshot.pendingCandidateCount],
+                    ["Published skills", snapshot.publishedSkillCount],
+                    ["Insights", snapshot.insightCount],
+                  ] as const
+                ).map(([label, count]) =>
+                  // An older Intelligence with no dashboard does not count these for a project key.
+                  count === null ? null : (
+                    <div key={label}>
+                      <dt className="text-muted-foreground">{label}</dt>
+                      <dd className="font-semibold text-xl">{count}</dd>
+                    </div>
+                  ),
+                )}
               </dl>
               <p className="text-sm">
                 {snapshot.hasActiveRun
@@ -401,33 +447,29 @@ export function LearningPage() {
                     ? `Latest analysis: ${snapshot.latestRunStatus}.`
                     : "No analysis has run yet."}
               </p>
-              <div className="flex flex-wrap gap-4 text-sm underline">
-                <a
-                  href={snapshot.links.learning}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Manage Learning in Intelligence
-                </a>
-                {snapshot.links.candidates && (
-                  <a
-                    href={snapshot.links.candidates}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Review skill candidates
-                  </a>
-                )}
-                {snapshot.links.runs && (
-                  <a
-                    href={snapshot.links.runs}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    View analysis runs
-                  </a>
-                )}
-              </div>
+              {/* Links into Intelligence's dashboard, where there is one to link to. */}
+              {(snapshot.links.learning || snapshot.links.candidates) && (
+                <div className="flex flex-wrap gap-4 text-sm underline">
+                  {snapshot.links.learning && (
+                    <a
+                      href={snapshot.links.learning}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Manage Learning in the backend dashboard
+                    </a>
+                  )}
+                  {snapshot.links.candidates && (
+                    <a
+                      href={snapshot.links.candidates}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Review skill candidates
+                    </a>
+                  )}
+                </div>
+              )}
             </>
           )}
           {selected && (
@@ -473,18 +515,323 @@ export function LearningPage() {
             onClick={() => {
               void overview.refetch();
               if (selected) void delivery.refetch();
+              // The sections below read the same container, and a run only moves on when read again.
+              for (const key of [
+                learningKeys.proposals(selected || undefined),
+                learningKeys.runs(selected || undefined),
+                learningKeys.skills(selected || undefined),
+              ])
+                void queryClient.invalidateQueries({ queryKey: key });
             }}
           >
             Refresh status
           </Button>
           <p className="text-muted-foreground text-sm">
-            Managing Learning needs your Intelligence account and project
-            access. OpenBot keeps project credentials on the server. Turning
-            Learning off here keeps settings and conversation assignments.
-            Schedules and publishing stay in Intelligence.
+            OpenBot keeps project credentials on the server. Turning Learning
+            off here keeps settings and conversation assignments. Schedules stay
+            in the backend.
           </p>
         </div>
       </PageSection>
+      <ProposedSkills agentId={selected || undefined} />
+      <AnalysisRuns agentId={selected || undefined} />
+      <PublishedSkills agentId={selected || undefined} />
+      <WhoApprovesSection />
+      <PeopleProposalsSection />
+      <SharingRequestsSection />
+      <SkillSharingSection />
     </PageShell>
+  );
+}
+
+const STATUS: Record<LearningProposal["status"], string> = {
+  pending_review: "To review",
+  approved: "Published",
+  rejected: "Rejected",
+};
+
+/**
+ * The skills Intelligence proposed for the container shown above, to approve (which publishes it to
+ * that container's Bots) or reject, and Learn now. Here because a bundled Intelligence has no
+ * dashboard of its own to do it in.
+ */
+function ProposedSkills({ agentId }: { agentId?: string }) {
+  const proposals = useQuery(learningProposalsQueryOptions(agentId));
+  const learnNow = useMutation(startLearningRunMutationOptions(appQueryClient));
+  const review = useMutation(
+    reviewLearningProposalMutationOptions(appQueryClient),
+  );
+  const [open, setOpen] = useState<string | null>(null);
+  const containerId = proposals.data?.containerId ?? null;
+  return (
+    <PageSection
+      title="Proposed skills"
+      description="Approve a skill to publish it to the Bots that use this container. Each decision is recorded in the audit log."
+      action={
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={!containerId || learnNow.isPending}
+          onClick={() => learnNow.mutate(agentId)}
+        >
+          {learnNow.isPending ? "Starting…" : "Learn now"}
+        </Button>
+      }
+    >
+      {learnNow.isSuccess && (
+        <p role="status" className="mt-4 text-sm">
+          Learning started. New skills appear here when it finishes.
+        </p>
+      )}
+      {learnNow.error && (
+        <p role="alert" className="mt-4 text-destructive text-sm">
+          {learnNow.error.message}
+        </p>
+      )}
+      {proposals.isPending ? null : proposals.error ? (
+        <p role="alert" className="mt-4 text-destructive text-sm">
+          {proposals.error.message}
+        </p>
+      ) : !containerId ? (
+        <PageEmpty icon={IconSparkles} title="No container">
+          Choose a container under Participation to see the skills OpenBot
+          proposes for it.
+        </PageEmpty>
+      ) : proposals.data.proposals.length === 0 ? (
+        <PageEmpty icon={IconSparkles} title="No proposed skills yet">
+          OpenBot proposes skills once it has learned from finished
+          conversations. Learn now starts it.
+        </PageEmpty>
+      ) : (
+        <PageRows>
+          {proposals.data.proposals.map((proposal, index) => (
+            <Fragment key={proposal.id}>
+              {index > 0 ? <Separator /> : null}
+              <Item
+                render={
+                  <button onClick={() => setOpen(proposal.id)} type="button" />
+                }
+                size="sm"
+              >
+                <ItemMedia variant="icon">
+                  <IconSparkles />
+                </ItemMedia>
+                <ItemContent>
+                  <ItemTitle>
+                    {skillTitle(proposal.title, proposal.description)}
+                  </ItemTitle>
+                  <ItemDescription>{proposal.description}</ItemDescription>
+                </ItemContent>
+                <ItemActions>
+                  <span className="text-muted-foreground text-sm">
+                    {STATUS[proposal.status]}
+                  </span>
+                  <IconChevronRight className="size-4 text-muted-foreground" />
+                </ItemActions>
+              </Item>
+            </Fragment>
+          ))}
+        </PageRows>
+      )}
+      {open && (
+        <ProposalDialog
+          decided={review.data?.status}
+          deciding={review.isPending}
+          error={review.error}
+          load={learningProposalQueryOptions(open, agentId)}
+          onClose={() => {
+            setOpen(null);
+            review.reset();
+          }}
+          onDecide={(decision) =>
+            review.mutate({
+              proposalId: open,
+              decision,
+              ...(agentId ? { agentId } : {}),
+            })
+          }
+        />
+      )}
+    </PageSection>
+  );
+}
+
+const RUN_STATUS: Record<LearningRunSummary["status"], string> = {
+  queued: "Queued",
+  freezing: "Starting",
+  batching: "Analyzing",
+  reducing: "Analyzing",
+  finalizing: "Finishing",
+  succeeded: "Finished",
+  failed: "Failed",
+};
+
+const FAILURES: Record<string, string> = {
+  LEARNING_MODEL_NOT_CONFIGURED:
+    "The backend has no model set up for Learning yet.",
+  LEARNING_NOT_ENABLED: "Learning isn't turned on in the backend.",
+  LEARNING_CONTAINER_NOT_FOUND: "The backend no longer has this container.",
+};
+
+/** What an admin reads for a failed run. The code itself stays in the row's title. */
+function failureSentence(code: string | null): string {
+  return (code && FAILURES[code]) || "The run failed.";
+}
+
+const RUN_POLL_MS = 10_000;
+
+/** Re-read the runs every few seconds while one is still going, so Queued does not outlive the run. */
+export function runPollInterval(
+  runs: Pick<LearningRunSummary, "status">[] | undefined,
+): number | false {
+  return runs?.some(
+    (run) => run.status !== "succeeded" && run.status !== "failed",
+  )
+    ? RUN_POLL_MS
+    : false;
+}
+
+/** One line saying how many skills and insights a run produced, for the counts it has. */
+function runCounts(run: LearningRunSummary): string | null {
+  const counts = [
+    run.proposals !== null ? `${run.proposals} proposed` : null,
+    run.insights !== null ? `${run.insights} insights` : null,
+  ].filter((count) => count !== null);
+  return counts.length > 0 ? counts.join(", ") : null;
+}
+
+/** The times a run started and finished, as the reader's local time. */
+function runTimes(run: LearningRunSummary): string | null {
+  const times = [
+    run.startedAt
+      ? `Started ${new Date(run.startedAt).toLocaleString()}`
+      : null,
+    run.completedAt
+      ? `Finished ${new Date(run.completedAt).toLocaleString()}`
+      : null,
+  ].filter((time) => time !== null);
+  return times.length > 0 ? times.join(". ") : null;
+}
+
+/** The analysis runs of the container shown above, newest first, so no dashboard is needed to see one fail. */
+function AnalysisRuns({ agentId }: { agentId?: string }) {
+  const runs = useQuery({
+    ...learningRunsQueryOptions(agentId),
+    refetchInterval: (query) => runPollInterval(query.state.data?.runs),
+  });
+  return (
+    <PageSection
+      title="Analysis runs"
+      description="Each run looks at finished conversations and proposes skills."
+    >
+      {runs.isPending ? null : runs.error ? (
+        <p role="alert" className="mt-4 text-destructive text-sm">
+          {runs.error.message}
+        </p>
+      ) : !runs.data.containerId ? (
+        <PageEmpty icon={IconHistory} title="No container">
+          Choose a container under Participation to see its analysis runs.
+        </PageEmpty>
+      ) : runs.data.runs.length === 0 ? (
+        <PageEmpty icon={IconHistory} title="No analysis runs yet">
+          A run appears here once Learning has analyzed conversations.
+        </PageEmpty>
+      ) : (
+        <PageRows>
+          {runs.data.runs.map((run, index) => (
+            <Fragment key={run.id}>
+              {index > 0 ? <Separator /> : null}
+              <Item size="sm">
+                <ItemMedia variant="icon">
+                  <IconHistory />
+                </ItemMedia>
+                <ItemContent>
+                  <ItemTitle>
+                    {RUN_STATUS[run.status]} ·{" "}
+                    {run.trigger === "manual" ? "Manual" : "Automatic"}
+                  </ItemTitle>
+                  {[runTimes(run), runCounts(run)]
+                    .filter((line) => line !== null)
+                    .map((line) => (
+                      <ItemDescription key={line}>{line}</ItemDescription>
+                    ))}
+                  {run.status === "failed" ? (
+                    <ItemDescription title={run.failureCode ?? undefined}>
+                      {failureSentence(run.failureCode)}
+                    </ItemDescription>
+                  ) : null}
+                </ItemContent>
+              </Item>
+            </Fragment>
+          ))}
+        </PageRows>
+      )}
+    </PageSection>
+  );
+}
+
+/** The skills published in the container shown above, each opening to its files. */
+function PublishedSkills({ agentId }: { agentId?: string }) {
+  const skills = useQuery(learnedSkillsQueryOptions(agentId));
+  const [open, setOpen] = useState<string | null>(null);
+  return (
+    <PageSection
+      title="Published skills"
+      description="Bots on this container use these skills. Open one to read it."
+    >
+      {skills.isPending ? null : skills.error ? (
+        <p role="alert" className="mt-4 text-destructive text-sm">
+          {skills.error.message}
+        </p>
+      ) : !skills.data.containerId ? (
+        <PageEmpty icon={IconSparkles} title="No container">
+          Choose a container under Participation to see its published skills.
+        </PageEmpty>
+      ) : skills.data.skills.length === 0 ? (
+        <PageEmpty icon={IconSparkles} title="No published skills yet">
+          Skills you approve above appear here.
+        </PageEmpty>
+      ) : (
+        <PageRows>
+          {skills.data.skills.map((skill, index) => (
+            <Fragment key={skill.name}>
+              {index > 0 ? <Separator /> : null}
+              <Item
+                render={
+                  <button onClick={() => setOpen(skill.name)} type="button" />
+                }
+                size="sm"
+              >
+                <ItemMedia variant="icon">
+                  <IconSparkles />
+                </ItemMedia>
+                <ItemContent>
+                  <ItemTitle>
+                    {skillTitle(skill.name, skill.description)}
+                  </ItemTitle>
+                  <ItemDescription>{skill.description}</ItemDescription>
+                </ItemContent>
+                <ItemActions>
+                  <IconChevronRight className="size-4 text-muted-foreground" />
+                </ItemActions>
+              </Item>
+            </Fragment>
+          ))}
+        </PageRows>
+      )}
+      <LearnedSkillDialog
+        name={open}
+        title={(() => {
+          // The title its row showed.
+          const shown = skills.data?.skills.find(
+            (skill) => skill.name === open,
+          );
+          return shown ? skillTitle(shown.name, shown.description) : undefined;
+        })()}
+        onClose={() => setOpen(null)}
+        source={{ kind: "admin", agentId }}
+      />
+    </PageSection>
   );
 }

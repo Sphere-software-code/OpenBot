@@ -70,10 +70,10 @@ function browserVoice(): Pick<VoiceDeps, "Recognition" | "getUserMedia"> {
 const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000];
 /** The live status of a recording whose streamer could not be created (its storage did not open, say). */
 const NOT_STARTED =
-  "The Recorder could not start sending this recording to Intelligence.";
+  "The Recorder could not start sending this recording to OpenBot's backend.";
 /** What the service worker shows after Stop for such a recording: none of it was stored, so none of it can be sent. */
 const NOT_SENT =
-  "Nothing of this recording reached Intelligence: the Recorder could not start sending it. Try recording again.";
+  "Nothing of this recording reached OpenBot's backend: the Recorder could not start sending it. Try recording again.";
 /** The sequencer's last issued seq, in the outbox's meta store. */
 const SEQ_META_KEY = "seq";
 /** Answers the service worker must not miss: one that could not be delivered is posted again once the port is back. */
@@ -357,7 +357,28 @@ export function createOffscreenController(deps: OffscreenControllerDeps): void {
     });
   }
 
+  /** The retrying sentence last told to the service worker, by recording (`offscreen.retrying`). */
+  const retrying = new Map<string, string>();
+
+  /** Tells the service worker when a recording's events stop going out while the streamer retries, and when they go
+   * out again: a stopped recording's streamer reports no status of its own, and its drain should not read as sending. */
+  function retryingStatus(update: StreamerStatus): void {
+    const recordingId = owners.get(update.trajectoryId);
+    if (recordingId === undefined) return;
+    const reason =
+      update.intelligence === "retrying" ? update.reason : undefined;
+    if (retrying.get(recordingId) === reason) return;
+    if (reason === undefined) retrying.delete(recordingId);
+    else retrying.set(recordingId, reason);
+    post({
+      type: "offscreen.retrying",
+      recordingId,
+      ...(reason === undefined ? {} : { reason }),
+    });
+  }
+
   function streamerStatus(stream: Stream, update: StreamerStatus): void {
+    retryingStatus(update);
     const target = live;
     // Only the live recording's streamer reports a status; the service worker also filters by trajectory.
     if (!target || target.stream !== stream) return;

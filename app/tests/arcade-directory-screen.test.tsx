@@ -63,6 +63,9 @@ function airtableFromFixture() {
     classifiedCount: tools.filter((tool) => tool.metadata?.behavior).length,
     permissionCount: new Set(sets.map((s) => [...s].sort().join(" "))).size,
     scopedActionCount: sets.length,
+    // Arcade has no per-person key form: an app with an authorization block is a sign-in, as
+    // `connectionOf` in `arcade-adapter.ts` reads it, and AirtableApi has one.
+    connection: { kind: sets.length > 0 ? "consent" : "no-auth" },
     enabled: false,
   };
 }
@@ -154,16 +157,18 @@ test("the Arcade directory renders the coverage warning and the breadth line on 
 
   // Not pending, not a redirect: the screen itself.
   expect(view.queryByText("the plugins index")).toBeNull();
-  expect(view.getByText("Browse Arcade")).toBeTruthy();
+  expect(view.getByText("Browse apps")).toBeTruthy();
 
   await waitFor(() => {
     expect(row.textContent).toContain(
-      "This provider has not said which of its actions only read, so every action is treated as a destructive write and every call will ask for approval.",
+      "This provider hasn't said which of its actions only read, so each one is treated as a change. Bots ask before using it wherever changes need approval, and check-ins can't use it.",
     );
   });
   expect(row.textContent).toContain(
     "This app uses 1 separate permission across 2 actions. A further 1 requests no permission of its own and becomes callable with any approval here.",
   );
+  // Arcade signs a person in to its apps and never asks them for a key, so no row says one.
+  expect(row.textContent).not.toContain("Needs a key");
 });
 
 test("the Arcade directory redirects on a Composio deployment", async () => {
@@ -173,7 +178,7 @@ test("the Arcade directory redirects on a Composio deployment", async () => {
   await waitFor(() => {
     expect(view.getByText("the plugins index")).toBeTruthy();
   });
-  expect(view.queryByLabelText("Search Arcade apps")).toBeNull();
+  expect(view.queryByLabelText("Search apps")).toBeNull();
 });
 
 test("the Arcade directory draws nothing until the page names a provider", async () => {
@@ -190,7 +195,7 @@ test("the Arcade directory draws nothing until the page names a provider", async
   }) as unknown as typeof fetch;
 
   const view = renderDirectory();
-  expect(view.queryByLabelText("Search Arcade apps")).toBeNull();
+  expect(view.queryByLabelText("Search apps")).toBeNull();
   expect(view.queryByText("the plugins index")).toBeNull();
   expect(view.queryByRole("alert")).toBeNull();
   release();

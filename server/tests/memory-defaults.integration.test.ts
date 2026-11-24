@@ -64,6 +64,7 @@ function defaults(
     },
     sources: true,
     research: true,
+    edition: "team",
     channelBots: async () => [bot],
     canDeliver: async (person) => person === owner,
     mintThreadId: () => `thread-${randomUUID()}`,
@@ -355,19 +356,23 @@ describe("memory sources, on by default", () => {
 describe("background research, on by default", () => {
   const channel = `channel-${suite}`;
 
-  test("a fresh person gets research from the Bot they talk to, read-only and a full interval out", async () => {
+  test("a fresh person gets hourly check-ins from the Bot they talk to, the first an hour out", async () => {
     await reset();
     const before = Date.now();
     expect(await defaults().adoptResearch(owner, bot, channel)).toBe(true);
     const [setting] = await researchOf(owner, bot);
+    expect(DEFAULT_RESEARCH_INTERVAL_MINUTES).toBe(60);
     expect(setting).toMatchObject({
       channelId: channel,
       enabled: true,
-      intervalMinutes: DEFAULT_RESEARCH_INTERVAL_MINUTES,
+      intervalMinutes: 60,
       lastStatus: "idle",
     });
     expect(setting?.nextRunAt.getTime()).toBeGreaterThanOrEqual(
-      before + DEFAULT_RESEARCH_INTERVAL_MINUTES * 60_000 - 1_000,
+      before + 60 * 60_000 - 1_000,
+    );
+    expect(setting?.nextRunAt.getTime()).toBeLessThanOrEqual(
+      Date.now() + 60 * 60_000 + 1_000,
     );
     // Not due, so the sweep does not take it.
     expect(
@@ -424,5 +429,27 @@ describe("background research, on by default", () => {
     }
     expect(await researchOf(owner, bot)).toHaveLength(1);
     expect(await sourcesOf(owner, bot)).toHaveLength(1);
+  });
+});
+
+describe("the personal edition", () => {
+  const channel = `personal-channel-${suite}`;
+
+  test("adopts no memory source, on a Bot's turn or when the person speaks, and still adopts research", async () => {
+    await reset();
+    synced.length = 0;
+    // OpenBot Desktop's local Intelligence isn't licensed for memory. The switch is left on.
+    const personal = defaults({ edition: "personal" });
+    expect(await personal.adoptSources(owner, bot)).toEqual([]);
+    personal.botTurn(owner, bot);
+    personal.personSpoke(owner, channel);
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if ((await researchOf(owner, bot)).length) break;
+      await Bun.sleep(50);
+    }
+    await Bun.sleep(200);
+    expect(await researchOf(owner, bot)).toHaveLength(1);
+    expect(await sourcesOf(owner, bot)).toEqual([]);
+    expect(synced).toEqual([]);
   });
 });

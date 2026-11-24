@@ -11,20 +11,32 @@
  * an answer nothing had recorded, which is the failure nobody can debug: the first Bot says it handed
  * the work over, the second says it answered, and no row anywhere agrees.
  */
-import type { AbstractAgent, BaseEvent } from "@ag-ui/client";
+import {
+  AbstractAgent,
+  type BaseEvent,
+  EventType,
+  type RunAgentInput,
+} from "@ag-ui/client";
+import { answeredBy, answerMessageId } from "@openbot/shared/handoff-markers";
 import { THREAD_LOCK_TTL_SECONDS } from "@openbot/toolkit/copilotkit/thread-lock";
 import { keepLease } from "@openbot/toolkit/lease";
 import type { ThreadLock, TurnAdmission } from "@openbot/toolkit/ports";
-import type { Observable } from "rxjs";
+import {
+  observeDetachedRun,
+  type PlatformRun,
+  type StopRecorder,
+} from "@openbot/toolkit/run-stop";
+import { from, type Observable } from "rxjs";
 import type { AuditInitiator } from "../audit";
-import type { HandoffDelivery } from "./handoff-runner";
+import type { HandoffDelivery, HandoffWork } from "./handoff-runner";
 import { textOf } from "./message-text";
 
 /** Whatever runs an agent against a thread and records what it did. */
 
 /**
- * The conversation an answer belongs in has a run going. Usually the Bot that asked, still finishing
- * the sentence that said it had asked, so the first retry comes quickly rather than a minute later.
+ * The conversation an answer belongs in still has a run going after the hop waited for it (see
+ * `BUSY_WAIT_MS`), so the hop goes back on the queue and the first retry comes quickly rather than a
+ * minute later.
  */
 export class ThreadBusyError extends Error {
   constructor(message: string) {
@@ -40,12 +52,48 @@ export type ThreadRunner = {
     input: unknown;
     /** What the conversation keeps, when that is not the whole of what the model was sent. */
     persistedInputMessages?: readonly unknown[];
+    /** Called by a runner that records its own stops with Intelligence. */
+    recordStop?: StopRecorder;
   }) => Observable<BaseEvent>;
   /** Stop a run in flight, as a pause does for every other turn. */
   stop?: (input: { threadId: string; runId: string }) => Promise<unknown>;
 };
 
 export function createHandoffDelivery(options: {
+  prepareRunInput?: (
+    input: {
+      threadId: string;
+      runId: string;
+      messages: unknown[];
+      tools: never[];
+      context: never[];
+      state: object;
+      forwardedProps: { openbotRun: string };
+    },
+    work: import("./handoff-runner").HandoffWork,
+  ) => Promise<unknown>;
+  /**
+   * The hop's analytics context, for the thread lock alone. Asked for before the lock, since the
+   * lock is what starts the run on the platform; the run input never carries it.
+   */
+  /**
+   * The run's `recordStop`, so a hop stopped here (a pause, the deadline) reads as cancelled on the
+   * platform. Absent, or answering undefined, where the client cannot record a stop.
+   */
+  recordStopFor?: (
+    run: PlatformRun,
+    holdsLock: () => boolean,
+  ) => StopRecorder | undefined;
+  /** A stop this delivery knows it made, a pause, or one Intelligence relayed. Never a lost lock. */
+  onKnownStop?: (
+    actorId: string,
+    runId: string,
+    reason: "cancelled",
+  ) => Promise<void>;
+  analyticsContextFor?: (
+    run: { threadId: string; runId: string },
+    work: import("./handoff-runner").HandoffWork,
+  ) => Promise<Record<string, unknown> | undefined>;
   /**
    * The addressed Bot, built for the person whose conversation this is.
    *
@@ -86,10 +134,10 @@ export function createHandoffDelivery(options: {
    *
    * A scratch thread rather than the Bot's own channel with the person, which is where answers used
    * to land. Two conversations for one question meant the person read the answer somewhere they
-   * never asked anything; now the runner relays what came back through the Bot that asked, in the
-   * conversation they are actually watching, and the scratch thread is never mapped to a channel so
-   * nobody is shown it. It still exists on the platform, which is what makes the turn a recorded
-   * run rather than an unlogged model call.
+   * never asked anything; now the runner carries what came back into the conversation they are
+   * actually watching, as the answering Bot's own message, and the scratch thread is never mapped
+   * to a channel so nobody is shown it. It still exists on the platform, which is what makes the
+   * turn a recorded run rather than an unlogged model call.
    */
   mintThreadId: () => string;
   /**
@@ -110,6 +158,8 @@ export function createHandoffDelivery(options: {
     threadId: string;
     agentId: string;
     text: string;
+    /** The Bot whose words these are, when they are not the thread's own Bot's. */
+    answeredBy?: string;
   }) => Promise<void>;
   /**
    * Show the asking conversation as working while a FORWARD hop runs, and stop when it is over.
@@ -133,6 +183,11 @@ export function createHandoffDelivery(options: {
    * conversation it was asked in locked against them for as long as the process lives.
    */
   deadlineMs?: number;
+  /**
+   * How long a hop waits for the conversation it speaks in to be free before handing the hop back to
+   * the queue. Overridden by tests; see `BUSY_WAIT_MS`.
+   */
+  busyWaitMs?: number;
   /** How often the lock is renewed while the Bot works. Overridden by tests; see `LOCK_RENEW_EVERY_MS`. */
   renewEveryMs?: number;
   /**
@@ -145,6 +200,13 @@ export function createHandoffDelivery(options: {
    * `serverTurnAdmission` in turn-admission.ts.
    */
   admission: TurnAdmission;
+  /**
+   * The display names of these Bots, by id, for another Bot's answer in the conversation a forward
+   * hop quotes. A Bot missing from the answer is quoted as another Bot. Absent, every one is.
+   */
+  botNames?: (
+    botIds: readonly string[],
+  ) => Promise<ReadonlyMap<string, string>>;
 }): HandoffDelivery {
   const {
     admission,
@@ -156,7 +218,9 @@ export function createHandoffDelivery(options: {
     announce,
     setBusy,
     newRunId,
+    botNames,
     deadlineMs = DEFAULT_DELIVERY_DEADLINE_MS,
+    busyWaitMs = BUSY_WAIT_MS,
     renewEveryMs = LOCK_RENEW_EVERY_MS,
     lockLifetimeMs = THREAD_LOCK_TTL_SECONDS * 1000,
   } = options;
@@ -175,13 +239,29 @@ export function createHandoffDelivery(options: {
       const paused = await admission({
         ownerUserId: work.actorId,
         agentId: work.toBotId,
+        threadId: work.answerIn ?? undefined,
       });
-      const agent = await agentFor({
-        actorId: work.actorId,
-        botId: work.toBotId,
-        fromBotId: work.fromBotId,
-        ...(work.initiator ? { initiator: work.initiator } : {}),
-      });
+      /*
+       * An answer going home is said, not generated. The Bot that was asked has already answered;
+       * what is left is putting its words in the person's conversation under its name, which needs
+       * the conversation's lock and its recorder and no model at all.
+       */
+      const spoken =
+        work.answerIn && typeof work.answer === "string" && work.answer.trim()
+          ? work.answer
+          : null;
+      const agent: AbstractAgent | null = spoken
+        ? new SpokenAnswer({
+            botId: work.fromBotId,
+            name: work.fromName ?? work.fromBotId,
+            text: spoken,
+          })
+        : await agentFor({
+            actorId: work.actorId,
+            botId: work.toBotId,
+            fromBotId: work.fromBotId,
+            ...(work.initiator ? { initiator: work.initiator } : {}),
+          });
       if (!agent) {
         /*
          * Thrown rather than swallowed, so the hop is released and tried again. A Bot that cannot be
@@ -282,9 +362,27 @@ export function createHandoffDelivery(options: {
          * until the TTL: on a relay that lock is the asking conversation itself, so the person could
          * not type for two minutes and the retry would collide with the hop's own leftover hold.
          */
-        const prior = conversationOnly(
-          await history({ threadId: work.threadId, actorId: work.actorId }),
-        );
+        const prior = spoken
+          ? []
+          : conversationOnly(
+              await history({ threadId: work.threadId, actorId: work.actorId }),
+            );
+        /*
+         * Whose answer each handed-over answer in it is, for a forward hop, which quotes the
+         * conversation by speaker. Read here, before the lock, for the reason the history is. A
+         * failed read costs the names, not the hop.
+         */
+        const answerers = [
+          ...new Set(
+            prior
+              .map((turn) => answeredBy(String((turn as { id?: unknown }).id)))
+              .filter((botId): botId is string => botId !== null),
+          ),
+        ];
+        const names =
+          !work.answerIn && answerers.length > 0 && botNames
+            ? await botNames(answerers).catch(() => new Map<string, string>())
+            : new Map<string, string>();
 
         /*
          * The conversation's lock, before a single event is streamed.
@@ -293,17 +391,40 @@ export function createHandoffDelivery(options: {
          * gateway will check every streamed event against, so using the local one would be claiming to
          * be a run that does not exist.
          */
-        const held = await lock.acquire({
-          threadId: where.threadId,
-          runId: newRunId(),
-          userId: work.actorId,
-          agentId: work.toBotId,
-        });
+        const requested = { threadId: where.threadId, runId: newRunId() };
+        const analyticsContext = await options
+          .analyticsContextFor?.(requested, work)
+          .catch(() => {
+            console.warn(
+              JSON.stringify({
+                type: "product-telemetry",
+                reason: "handoff_context_failed",
+              }),
+            );
+            return undefined;
+          });
+        /*
+         * Waited for, a little, when somebody else is running in it. An answer going home usually
+         * lands while the Bot that asked is still finishing the sentence that said it had asked,
+         * which is seconds: taking the lock the moment it is free puts the answer on screen then,
+         * rather than after a trip round the queue, and keeps the platform's refusal what it is, an
+         * ordinary "not yet" (IntelligenceKnowingANewThread does not print it).
+         */
+        const held = await acquireWhenFree(
+          () =>
+            lock.acquire({
+              ...requested,
+              userId: work.actorId,
+              agentId: work.toBotId,
+              ...(analyticsContext ? { analyticsContext } : {}),
+            }),
+          busyWaitMs,
+          paused,
+        );
         if (!held) {
           /*
-           * Somebody else is running in this conversation. Thrown so the hop goes back on the queue
-           * and is tried again: a person mid-question, or the Bot that asked still finishing its own
-           * sentence, is a wait rather than a failure.
+           * Still somebody else's after the wait: a person mid-question, most likely. Thrown so the
+           * hop goes back on the queue and is tried again, which is a wait rather than a failure.
            */
           throw new ThreadBusyError(
             `${where.threadId} is busy with another run; the hop will be tried again`,
@@ -322,17 +443,34 @@ export function createHandoffDelivery(options: {
          * answered "how can I help?" to a question it had never been shown, in a transcript that
          * displayed the question directly above the answer.
          */
-        const asked = [
-          /*
-           * A backwards hop gets the tail, not the whole. Its task already carries everything it has
-           * to say — the answer, or the failure — and the person is waiting through this run's
-           * time-to-first-token: a long channel read in full would make relaying an answer slower
-           * the longer the conversation that wanted it. A few recent turns keep the voice and the
-           * pronouns right; the rest is weight.
-           */
-          ...(work.answerIn ? prior.slice(-RELAY_CONTEXT_MESSAGES) : prior),
-          { id: `handoff-${runId}`, role: "user", content: message },
-        ];
+        const asked = spoken
+          ? []
+          : work.answerIn
+            ? [
+                /*
+                 * A backwards hop gets the tail, not the whole. Its task already carries everything
+                 * it has to say — the failure — and the person is waiting through this run's
+                 * time-to-first-token: a long channel read in full would make it slower the longer
+                 * the conversation. A few recent turns keep the voice and the pronouns right; the
+                 * rest is weight. It is the asking Bot's own conversation, so its turns are its own.
+                 */
+                ...prior.slice(-RELAY_CONTEXT_MESSAGES),
+                { id: `handoff-${runId}`, role: "user", content: message },
+              ]
+            : [
+                /*
+                 * A forward hop gets the conversation INSIDE the ask, attributed, and never as turns
+                 * of its own. Every word in it was said to the asking Bot: handed over as this Bot's
+                 * own history, the person's "ask Knowledge, do not answer it yourself" is an
+                 * instruction to Knowledge not to answer, and the asking Bot's replies are things
+                 * Knowledge remembers saying.
+                 */
+                {
+                  id: `handoff-${runId}`,
+                  role: "user",
+                  content: inConversation(prior, work, message, names),
+                },
+              ];
         agent.threadId = where.threadId;
         // The platform's own message type rather than AG-UI's, which is what `history` returns: the
         // two agree where it matters, and converting between them is a place to lose a message.
@@ -355,9 +493,33 @@ export function createHandoffDelivery(options: {
           onLost: (error) => lockLost.abort(error),
         });
 
+        let stoppingHere = false;
+        const knownStop = () => {
+          void options
+            .onKnownStop?.(work.actorId, runId, "cancelled")
+            .catch(() => {
+              console.warn(
+                JSON.stringify({
+                  type: "product-telemetry",
+                  reason: "stop_observation_failed",
+                }),
+              );
+            });
+        };
+        observeDetachedRun(agent, () => stoppingHere, knownStop);
+        const recordStop = options.recordStopFor?.(
+          {
+            threadId: where.threadId,
+            runId,
+            userId: work.actorId,
+            agentId: work.toBotId,
+          },
+          () => !lockLost.signal.aborted,
+        );
         try {
           await settled(
             runner.run({
+              ...(recordStop ? { recordStop } : {}),
               threadId: where.threadId,
               agent,
               /*
@@ -385,29 +547,37 @@ export function createHandoffDelivery(options: {
                * What makes this run legitimate is the lock itself: the gateway compares the run id on
                * every event to the one the lock holds. Taking the lock is the whole of the ceremony.
                */
-              input: {
-                threadId: where.threadId,
-                runId,
-                /*
-                 * The same conversation the agent was given, so the run's own record of what it was
-                 * asked agrees with what it read.
-                 */
-                messages: asked,
-                tools: [],
-                context: [],
-                state: {},
-                /*
-                 * The deployment's own statement of what this run is, carrying how deep the chain has
-                 * gone. It is what stops the addressed Bot handing the work on for ever, and it is
-                 * signed, so the Bot cannot edit its own depth on the way past.
-                 */
-                forwardedProps: { openbotRun: assertion },
-              },
+              input: await (
+                options.prepareRunInput ?? (async (input) => input)
+              )(
+                {
+                  threadId: where.threadId,
+                  runId,
+                  /*
+                   * The same conversation the agent was given, so the run's own record of what it was
+                   * asked agrees with what it read.
+                   */
+                  messages: asked,
+                  tools: [],
+                  context: [],
+                  state: {},
+                  /*
+                   * The deployment's own statement of what this run is, carrying how deep the chain has
+                   * gone. It is what stops the addressed Bot handing the work on for ever, and it is
+                   * signed, so the Bot cannot edit its own depth on the way past.
+                   */
+                  forwardedProps: { openbotRun: assertion },
+                },
+                work,
+              ),
             }),
             deadlineMs,
             AbortSignal.any([paused, lockLost.signal]),
             () => {
-              void runner
+              stoppingHere = true;
+              // A pause is a cancel. A lost lock is a failure, and is not reported as a stop.
+              if (!lockLost.signal.aborted) knownStop();
+              return runner
                 .stop?.({ threadId: where.threadId, runId })
                 .catch(() => undefined);
             },
@@ -429,6 +599,7 @@ export function createHandoffDelivery(options: {
               threadId: where.threadId,
               agentId: work.toBotId,
               text: said.join("\n\n"),
+              ...(spoken ? { answeredBy: work.fromBotId } : {}),
             }).catch(() => {
               // The turn happened. A roster that has not caught up is worth less than a hop reported
               // as failed and run a second time.
@@ -495,6 +666,121 @@ function conversationOnly(messages: readonly unknown[]): readonly unknown[] {
 }
 
 /**
+ * The ask, with the conversation it was asked from set out above it as context.
+ *
+ * Each turn says who said it, because none of it was said to the Bot reading it: the person was
+ * talking to the asking Bot, and the asking Bot's replies are its own. The ask comes last, so the
+ * most recent thing the model reads is what it is being asked to do, not the person's instruction
+ * to somebody else.
+ *
+ * A turn's text is quoted; anything else in it (an image the person attached) is passed on as it
+ * was, after the line it belongs to, so the Bot still sees what the person showed. Plain text when
+ * there is nothing but text, which is every conversation without an attachment.
+ */
+function inConversation(
+  prior: readonly unknown[],
+  work: HandoffWork,
+  message: string,
+  /** Display names by Bot id, for another Bot's answer in the conversation. */
+  names: ReadonlyMap<string, string> = new Map(),
+): string | unknown[] {
+  if (prior.length === 0) return message;
+  const asker = work.fromName ?? work.fromBotId;
+  const self = work.toName ?? work.toBotId;
+  /*
+   * An assistant turn is the asking Bot's, unless it is an answer another Bot handed back, which the
+   * id says (`answerMessageId`). Said as the asking Bot's, an earlier answer from the Bot now being
+   * asked read to it as something the asking Bot had said.
+   */
+  const speakerOf = (turn: { id?: unknown; role?: unknown }) => {
+    if (turn.role === "user") return "The person";
+    const answerer = answeredBy(String(turn.id));
+    if (answerer === null) return asker;
+    if (answerer === work.toBotId) return `You (${self}), answering ${asker}`;
+    const name = names.get(answerer);
+    return name
+      ? `${name}, another Bot, answering ${asker}`
+      : `Another Bot, answering ${asker}`;
+  };
+  const parts: unknown[] = [
+    {
+      type: "text",
+      text: `The conversation so far, between the person and ${asker}, for context. The person was talking to ${asker}, not to you: where it asks for ${self}, that is the request below, and you are the one answering it.`,
+    },
+  ];
+  for (const turn of prior) {
+    const { id, role, content } = turn as {
+      id?: unknown;
+      role?: unknown;
+      content?: unknown;
+    };
+    parts.push({
+      type: "text",
+      text: `${speakerOf({ id, role })}: ${textOf(content)}`,
+    });
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          (part as { type?: unknown }).type !== "text"
+        )
+          parts.push(part);
+      }
+    }
+  }
+  parts.push({ type: "text", text: message });
+  return parts.every((part) => (part as { type?: unknown }).type === "text")
+    ? parts.map((part) => (part as { text: string }).text).join("\n\n")
+    : parts;
+}
+
+/**
+ * The Bot that was asked, saying the answer it already gave, in the conversation that asked.
+ *
+ * An agent that calls no model: it emits one assistant message with the answer in it and stops.
+ * Run through the same runner, lock and recorder as any turn, so the message is a recorded part of
+ * the thread — in its history, in the next run's context, and in a reload — rather than a row
+ * written past the platform. The id names the Bot that said it, which is how the transcript draws
+ * it under that Bot's name; AG-UI's `name` says the same for any reader that keeps it.
+ */
+class SpokenAnswer extends AbstractAgent {
+  constructor(
+    private readonly answer: { botId: string; name: string; text: string },
+  ) {
+    super();
+  }
+
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    const messageId = answerMessageId(this.answer.botId, input.runId);
+    return from([
+      {
+        type: EventType.RUN_STARTED,
+        threadId: input.threadId,
+        runId: input.runId,
+      },
+      {
+        type: EventType.TEXT_MESSAGE_START,
+        messageId,
+        role: "assistant",
+        name: this.answer.name,
+      },
+      {
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId,
+        delta: this.answer.text,
+      },
+      { type: EventType.TEXT_MESSAGE_END, messageId },
+      {
+        type: EventType.RUN_FINISHED,
+        threadId: input.threadId,
+        runId: input.runId,
+      },
+    ] as BaseEvent[]);
+  }
+}
+
+/**
  * How much of the asking conversation a backwards hop reads.
  *
  * Six messages is about three exchanges: enough for the relaying Bot to keep its footing in the
@@ -509,6 +795,51 @@ const RELAY_CONTEXT_MESSAGES = 6;
  * a renewal: the conversation is already free and something else may be in it.
  */
 const LOCK_RENEW_EVERY_MS = 30_000;
+
+/**
+ * How long a hop waits for its conversation to be free before going back on the queue.
+ *
+ * Sized for the common case, the Bot that asked finishing its own reply, with room to spare. Not
+ * longer, because this replica delivers its hops one at a time and a hop waiting here holds up the
+ * next; a conversation busy for longer than this is a person's own run, and the queue's retry is
+ * the right wait for that.
+ */
+const BUSY_WAIT_MS = 30_000;
+/** The first look again, doubled each time up to the second figure. */
+const BUSY_RETRY_FIRST_MS = 250;
+const BUSY_RETRY_MAX_MS = 2_000;
+
+/**
+ * The lock, taken as soon as the conversation is free, or null if it is still busy after `waitMs`.
+ *
+ * Gives up at once, with the pause's own reason, when the person pauses the Bot while it waits: the
+ * same way a paused run ends.
+ */
+async function acquireWhenFree(
+  acquire: () => Promise<{ runId: string } | null>,
+  waitMs: number,
+  paused: AbortSignal,
+): Promise<{ runId: string } | null> {
+  const giveUpAt = Date.now() + waitMs;
+  let delayMs = BUSY_RETRY_FIRST_MS;
+  for (;;) {
+    paused.throwIfAborted();
+    const held = await acquire();
+    if (held) return held;
+    const left = giveUpAt - Date.now();
+    if (left <= 0) return null;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        paused.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, Math.min(delayMs, left));
+      paused.addEventListener("abort", done, { once: true });
+    });
+    delayMs = Math.min(delayMs * 2, BUSY_RETRY_MAX_MS);
+  }
+}
 
 /**
  * How long one hop may run for by default.
@@ -537,7 +868,8 @@ function settled(
    * the hop fails with the reason.
    */
   paused: AbortSignal,
-  stop: () => void,
+  /** Stop the run; settles once the runner has closed it on the platform. */
+  stop: () => Promise<unknown> | undefined,
   /** Written when the deadline passes, so it can say how far the run had got by then. */
   timedOut: () => string,
 ): Promise<void> {
@@ -555,9 +887,17 @@ function settled(
      * socket open, so a delivery that walked away from a stalled one would leak a connection per
      * attempt and go on paying for a run nobody is reading.
      */
+    /*
+     * Let go of the run only once the runner has closed it. Torn down first, a stopped run never
+     * sends its terminal event, and the platform holds it open with no outcome. The deadline below
+     * still bounds the wait.
+     */
+    let stopping = false;
     const onPause = () => {
-      stop();
-      finish(() => reject(paused.reason));
+      stopping = true;
+      void Promise.resolve(stop()).finally(() =>
+        finish(() => reject(paused.reason)),
+      );
     };
     const finish = (settle: () => void) => {
       if (done) return;
@@ -577,21 +917,28 @@ function settled(
     paused.addEventListener("abort", onPause, { once: true });
     subscription = events.subscribe({
       next: (event) => {
-        // Compared as a string rather than through the enum: `@ag-ui/client` re-exports the types
-        // this file needs and not that value, and adding a second AG-UI package for one constant
-        // would be a dependency to keep in step for no gain.
-        if (event.type === "RUN_ERROR") {
+        if (event.type === EventType.RUN_ERROR) {
           failure = new Error(
             (event as { message?: string }).message ??
               "the run ended in an error",
           );
         }
       },
+      // A run that ends because it was stopped is the pause's outcome, not an answer.
       error: (error: unknown) =>
         finish(() =>
-          reject(error instanceof Error ? error : new Error(String(error))),
+          stopping
+            ? reject(paused.reason)
+            : reject(error instanceof Error ? error : new Error(String(error))),
         ),
-      complete: () => finish(() => (failure ? reject(failure) : resolve())),
+      complete: () =>
+        finish(() =>
+          stopping
+            ? reject(paused.reason)
+            : failure
+              ? reject(failure)
+              : resolve(),
+        ),
     });
     // The stream that finished inside `subscribe`: `finish` had nothing to unsubscribe from at the
     // time, and the subscription it could not reach is this one.

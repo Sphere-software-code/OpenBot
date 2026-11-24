@@ -1,6 +1,12 @@
+import { isOpenBotActor } from "@openbot/shared/openbot-actor";
 import { and, eq, sql } from "drizzle-orm";
 import type { ApprovalGate } from "../../approvals/types";
-import type { AuditStore } from "../../audit";
+import {
+  type AuditInitiator,
+  type AuditStore,
+  DEPLOYMENT_INITIATOR,
+} from "../../audit";
+import type { EntraTokens } from "../../auth/entra-refusal";
 import type { ActionPolicy } from "../../computer/policy";
 import type {
   CredentialSecretReader,
@@ -85,6 +91,14 @@ export type ToolRecord = {
    * of a claim rather than a claim of safety.
    */
   destructive: boolean;
+  /**
+   * Whether the tool says it only reads, which is what a check-in may call and nothing else.
+   *
+   * Not {@link ToolRecord.effect}, which decides whether chat asks first and is unchanged by this.
+   * Here the server's own read-only label counts as well as a broker's and a reviewed list's, and
+   * a destructive label or a reviewed write always wins. See `labelledRead` in `catalogue.ts`.
+   */
+  labelledRead: boolean;
   grantedTo: string[];
 };
 
@@ -152,6 +166,11 @@ export type ServerRecord = {
    */
   accountMode: "personal" | "shared" | null;
   /**
+   * The Entra scope a server added by URL is reached with as the signed-in person, or null where it
+   * is reached on the deployment's own credential. See `mcpServers.entraScope`.
+   */
+  entraScope: string | null;
+  /**
    * Whether a Shared app's deployment-held account is connected yet.
    *
    * ALWAYS FALSE WHILE {@link accountMode} IS NOT `"shared"`, even where a deployment row happens
@@ -159,6 +178,25 @@ export type ServerRecord = {
    * connected would tell the page something that changes nothing a call does.
    */
   sharedVendorConnected: boolean;
+  /**
+   * Whether this app may only hold the deployment's one shared account, never a person's own.
+   *
+   * True for an app connected on this deployment's own OAuth client (a server-to-server grant):
+   * what a person would type is a store subdomain and the credential is the deployment's, so a
+   * personal account would be the organization's access under one person's name. Read off the
+   * recorded scheme by `sharedAccountOnly`, so a screen decides what to offer from this and never
+   * from the app's name. The connect route refuses a personal account here whatever a screen draws.
+   */
+  sharedOnly: boolean;
+  /**
+   * Whether a call to this server goes out on the asking person's own credential: their own grant
+   * at the vendor, or their own account behind a broker. See `ServerAccess.ownCredential`.
+   *
+   * False for a server an admin's key reaches for everybody, a Shared app, an app with no account
+   * at all, a public endpoint and OpenBot's own built-in tools, and for a row this deployment
+   * cannot resolve. A check-in reads only servers where this is true.
+   */
+  ownCredential: boolean;
   /**
    * Who may give this app to a Bot, with the default for its account filled in: any Bot's owner
    * (`any`), or only an administrator (`admin`). See `ownerGrantsOf`.
@@ -253,6 +291,13 @@ export type GrantedPlugins = {
     toolName: string;
     description: string;
     inputSchema: Record<string, unknown>;
+    /** The app marks it destructive (`mcpTools.destructive`): OpenBot always asks before it runs. */
+    destructive: boolean;
+    /**
+     * It only reads, by the rule a call to it is gated with (`classifyTool`). Absent reads as a
+     * write, so a store that does not say never has an action offered as a read.
+     */
+    read?: boolean;
   }[];
   skills: {
     slug: string;
@@ -416,6 +461,14 @@ export type _ProbeOutcomeLeaves = Decides<
   },
   RecordedCheck | "untouched"
 >;
+
+/** A stored-client read failed. Never retains a vault error, parser error, or secret-bearing cause. */
+export class OAuthClientReadError extends Error {
+  constructor() {
+    super("The stored OAuth client could not be read.");
+    this.name = "OAuthClientReadError";
+  }
+}
 
 export class PluginRefusedError extends Error {
   constructor(
@@ -621,6 +674,16 @@ export function storableSchema(
  * reason comes back in `skipped`, once, spelled as the vendor listed it — so the caller can say
  * which actions were not recorded rather than leave their absence for somebody to notice.
  */
+/**
+ * The current reading of a vendor's listing, recorded on an app's row by every refresh that stores
+ * its tools (`mcpServers.listingRevision`). Raise it when what is recorded from the same listing
+ * changes, and every app of the active broker is listed again once at the next start.
+ *
+ * 1: a broker's silence is `unclassified` and not `destructive` (Arcade had recorded it as
+ * destructive), and a Composio action with no label is `unclassified` too.
+ */
+export const LISTING_REVISION = 1;
+
 export function storableTools(
   serverId: string,
   listed: ListedTool[],
@@ -686,6 +749,10 @@ export function storableTools(
        */
       effect: tool.effect ?? null,
       destructive: tool.destructive ?? false,
+      // A broker said nothing about it; see `mcpTools.unclassified`.
+      unclassified: tool.unclassified ?? false,
+      // The server's own read-only label, kept apart from `effect`; see `mcpTools.declaredRead`.
+      declaredRead: tool.declaredRead ?? false,
       version: tool.version?.replaceAll(NUL, "") ?? null,
     });
   }
@@ -702,6 +769,8 @@ export type StorableTool = {
   inputSchema: Record<string, unknown>;
   effect: "read" | "write" | null;
   destructive: boolean;
+  unclassified: boolean;
+  declaredRead: boolean;
   version: string | null;
 };
 
@@ -818,6 +887,9 @@ export function refFromToolName(toolName: string): string | null {
  * the vendor. Naming those would be noise in front of the one case that has no second barrier at all
  * — Notion, whose access is per-page on a consent screen and whose `scopes` are therefore empty.
  *
+ * Nor an entry that names its reads (`readTools`), which is where Notion now is: every advertised
+ * name that list omits is already a write, so there is no silent read for this row to name.
+ *
  * A server with no catalogue entry is not reconciled either, and the two shapes that reach here do
  * so for different reasons. A brokered app's actions are classified from the vendor's own
  * per-action label rather than from a list here, so there is no hand-written under-inclusion to
@@ -830,7 +902,7 @@ export function unlistedAdvertisedTools(
   entry: CatalogueEntry | null,
   advertised: readonly string[],
 ): string[] {
-  if (!entry || entry.writeTools.length === 0) return [];
+  if (!entry || entry.writeTools.length === 0 || entry.readTools) return [];
   if (entry.auth.kind !== "user-oauth" || entry.auth.scopes.length > 0) {
     return [];
   }
@@ -875,6 +947,18 @@ export const iso = (value: Date | string | null): string | null =>
  */
 export const DEPLOYMENT_ACTOR = "deployment";
 export const UNATTRIBUTED_ACTOR = "unattributed";
+
+/**
+ * What started a configuration row, read from the actor it names, to spread into the row.
+ *
+ * A row OpenBot writes for a change nobody made names OpenBot as its actor ({@link DEPLOYMENT_ACTOR},
+ * or `openbot:always-on` and the personal edition's `openbot:personal-defaults`), and is started by
+ * OpenBot. Any other actor is a person, which is what a row with no initiator says. Without this an
+ * upgrade that gave every Bot the goal tools put a row per tool on Activity saying a person did it.
+ */
+export function initiatedBy(actor: string): { initiator?: AuditInitiator } {
+  return isOpenBotActor(actor) ? { initiator: DEPLOYMENT_INITIATOR } : {};
+}
 
 /**
  * Whose account this call went out as, for the trail.
@@ -1114,13 +1198,19 @@ export const CLIENT_REREGISTRATION_BACKOFF_MS = 5 * 60_000;
  * `LINEAR_GET_ME` — and an unanchored match would take `SLACK_PROFILE_SET` for an identity read.
  */
 export const IDENTITY_ACTION =
-  /(_GET_ME|_PROFILE|_CURRENT_USER|_USER_INFO|_WHOAMI)$/;
+  /(_GET_ME|_PROFILE|_CURRENT_USER|_USER_INFO|_WHOAMI|_GET_SHOP_DETAILS)$/;
 
 /**
  * Every broker's id namespace, reserved together. See {@link BROKERED_PROFILE} in `./access` for
  * what a profile holds and why it lives there; this is only the list this file reserves off it.
  */
 export const BROKERED_ID_PREFIXES = Object.values(BROKERED_PROFILE);
+
+/**
+ * The server half of every ref OpenBot's own memory tools carry (`memory/recall_personal_memory`).
+ * No server may be added under it: see `addCustomServer`.
+ */
+export const MEMORY_TOOLS_SERVER = "memory";
 
 /**
  * Every broker's screen name, reserved together, for the reason {@link BROKERED_ID_PREFIXES} is.
@@ -1188,11 +1278,22 @@ export type PluginStoreOptions = {
       token?: string;
       actorId?: string;
       botId?: string;
+      threadId?: string;
+      /** Which of the person's accounts the call runs in; see `VendorTransport.callTool`. */
+      accountId?: string;
     },
     toolName: string,
     args: Record<string, unknown>,
-    /** `accountGone` as `McpCallResult` carries it: the vendor lost the account this call ran in. */
-  ) => Promise<{ text: string; isError: boolean; accountGone?: true }>;
+    /**
+     * `accountGone` and `actionNotAllowed` as `McpCallResult` carries them: the vendor lost the
+     * account this call ran in, or refused it this action.
+     */
+  ) => Promise<{
+    text: string;
+    isError: boolean;
+    accountGone?: true;
+    actionNotAllowed?: true;
+  }>;
   /** Trading a refresh token for a short-lived access token. Defaults to a real HTTP exchange. */
   exchangeRefreshToken?: (input: {
     tokenUrl: string;
@@ -1251,6 +1352,12 @@ export type PluginStoreOptions = {
    * a shared account's vendor identity, read only when an app is switched to Shared.
    */
   deploymentId?: string;
+  /**
+   * Tokens Entra issues for a person on their behalf, for a server an admin marked as reached as
+   * the signed-in person (`auth/entra.ts`). Absent on a deployment with no Microsoft sign-in, where
+   * such a server cannot be added and a call to one already stored is refused.
+   */
+  entra?: EntraTokens;
 };
 
 /** One in-flight Arcade authorization attempt, as the table stores it. */

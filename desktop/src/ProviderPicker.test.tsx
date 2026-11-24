@@ -1,6 +1,14 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, expect, mock, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type {
   HeldConfiguration,
@@ -42,22 +50,38 @@ const cloudProviders = [
   {
     id: "google",
     name: "Google Gemini",
+    // Google's guidelines allow only "Sign in with Google" beside its G.
+    signsInWith: "Google",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
     model: "gemini-3.8-flash",
     keyUrl: "https://aistudio.google.com/apikey",
+    keyLink: "Get a Google Gemini API key",
   },
   {
     id: "xai",
     name: "xAI",
+    signsInWith: "xAI",
     baseUrl: "https://api.x.ai/v1",
     model: "grok-4.7",
     keyUrl: "https://console.x.ai/",
+    // "an", by the sound of the name: the link read "Get a xAI API key".
+    keyLink: "Get an xAI API key",
   },
 ];
 
+/** Signs in through a device authorization that mints an API key, then uses it like a typed one. */
+const unbiased = {
+  id: "unbiased",
+  name: "Unbiased AI",
+  baseUrl: "https://api.unbiased.ai/v1",
+  model: "pareto",
+  keyUrl: "https://platform.unbiased.ai/dashboard/keys",
+  keyLink: "Get an Unbiased AI API key",
+};
+
 const allProviders: Provider[] = [
   ...providers,
-  ...cloudProviders.map(
+  ...[...cloudProviders, unbiased].map(
     (provider): Provider => ({
       id: provider.id,
       name: provider.name,
@@ -90,6 +114,10 @@ mock.module("@tauri-apps/api/event", () => ({
 
 mock.module("./Mark", () => ({
   Mark: ({ name }: { name: string }) => <span>{name}</span>,
+  // The mark a "Sign in with" button carries, by the id it was given. The real one draws that
+  // vendored file, which needs Vite's glob.
+  ButtonMark: ({ id }: { id: string | null }) =>
+    id ? <img alt="" data-mark={id} /> : null,
 }));
 
 const { ProviderPicker } = await import("./ProviderPicker");
@@ -152,6 +180,87 @@ async function renderPickerWithHeld(
   return view;
 }
 
+/** Chooses a provider row, going back to the whole list first when one is already chosen. */
+async function pick(view: ReturnType<typeof render>, name: RegExp) {
+  const change = view.queryByRole("button", {
+    name: "Choose a different provider",
+  });
+  if (change) await userEvent.click(change);
+  await userEvent.click(await view.findByRole("radio", { name }));
+}
+
+/*
+ * Every "Sign in with" button carries the mark of the provider it signs in to, as the web app's
+ * sign-in buttons do. They carried none, and Google's and xAI's rows had no mark to carry.
+ */
+test("every Sign in with button carries its provider's mark", async () => {
+  const marked: Provider[] = [
+    { ...providers[0], mark: "openai" },
+    { ...providers[1], mark: "anthropic" },
+    {
+      id: "google",
+      name: "Google Gemini",
+      summary: "Use an API key or sign in.",
+      logins: ["endpoint", "oauth"],
+      mark: "google-color",
+      caution: null,
+    },
+    {
+      id: "xai",
+      name: "xAI",
+      summary: "Use an API key or sign in.",
+      logins: ["endpoint", "oauth"],
+      mark: "xai",
+      caution: null,
+    },
+  ];
+  invokeHandler = async (command) => {
+    if (command === "providers") return marked;
+    throw new Error(`unexpected command ${command}`);
+  };
+  const view = await renderPickerWithHeld({
+    saved: { modelSessions: { anthropic: true } },
+  });
+
+  for (const provider of marked) {
+    await pick(view, new RegExp(`^${provider.name}`));
+    if (provider.logins.includes("oauth"))
+      await userEvent.click(view.getByRole("tab", { name: "Sign in" }));
+    const name =
+      provider.id === "anthropic"
+        ? "Sign in again with Anthropic"
+        : provider.id === "google"
+          ? "Sign in with Google"
+          : `Sign in with ${provider.name}`;
+    const button = view.getByRole("button", { name });
+    expect(button.querySelector("img")?.getAttribute("data-mark")).toBe(
+      provider.mark,
+    );
+  }
+});
+
+/*
+ * "Any OpenAI-compatible endpoint" was the one row with nothing beside its name. It stands for no one
+ * vendor, so it carries no vendor's mark, and gets a plain icon in the marks' tile instead.
+ */
+test("the OpenAI-compatible endpoint row shows a plain icon in a mark tile", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers") return allProviders;
+    throw new Error(`unexpected command ${command}`);
+  };
+  const view = await renderPicker();
+
+  const row = (
+    await view.findByRole("radio", { name: /^OpenAI-compatible/ })
+  ).closest("label");
+  const tile = row?.querySelector(".mark-tile");
+  expect(tile?.getAttribute("data-icon")).toBe("cloud");
+  expect(tile?.getAttribute("aria-hidden")).toBe("true");
+  expect(tile?.querySelector("svg")).toBeTruthy();
+  // The other rows keep their own marks; only the endpoint row gets the plain icon.
+  expect(view.container.querySelectorAll("[data-icon]").length).toBe(1);
+});
+
 test("a completed plan sign-in enables and submits only its issuing provider", async () => {
   const choices: unknown[] = [];
   invokeHandler = async (command, args) => {
@@ -166,21 +275,52 @@ test("a completed plan sign-in enables and submits only its issuing provider", a
 
   const view = await renderPicker((choice) => choices.push(choice));
 
-  await userEvent.click(await view.findByRole("radio", { name: /OpenAI/ }));
+  await pick(view, /OpenAI/);
   await userEvent.click(
     view.getByRole("button", { name: "Sign in with OpenAI" }),
   );
   await waitFor(() =>
     expect(view.getByText(/Signed in to OpenAI/)).toBeTruthy(),
   );
-  await userEvent.click(view.getByRole("radio", { name: /Anthropic/ }));
+  // The finished sign-in moves on by itself, with its own provider's token.
+  await waitFor(
+    () =>
+      expect(choices).toEqual([
+        { provider: "openai", login: "plan", token: "chatgpt-token" },
+      ]),
+    { timeout: 4000 },
+  );
+  await pick(view, /Anthropic/);
 
   expect(view.queryByText(/Signed in to Anthropic/)).toBeNull();
   const continueButton = view.getByRole("button", { name: "Continue" });
   expect(continueButton).toHaveProperty("disabled", true);
 
   await userEvent.click(continueButton);
+  expect(choices).toHaveLength(1);
+});
+
+test("a finished sign-in shows its tick for a second, and choosing another row then cancels the move", async () => {
+  const choices: unknown[] = [];
+  invokeHandler = async (command) => {
+    if (command === "providers") return providers;
+    if (command === "begin_chatgpt_sign_in") return "https://chatgpt.test";
+    if (command === "finish_chatgpt_sign_in") return "chatgpt-token";
+    throw new Error(`unexpected command ${command}`);
+  };
+  const view = await renderPicker((choice) => choices.push(choice));
+  await pick(view, /OpenAI/);
+  await userEvent.click(
+    view.getByRole("button", { name: "Sign in with OpenAI" }),
+  );
+  const tick = await view.findByText(/✓/);
+  expect(tick.closest("p")?.textContent).toContain("Signed in to OpenAI.");
   expect(choices).toEqual([]);
+  // Another row inside the second: nothing moves on.
+  await pick(view, /Anthropic/);
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 1300)));
+  expect(choices).toEqual([]);
+  expect(view.queryByText(/✓/)).toBeNull();
 });
 
 test("a pending plan sign-in completion is ignored after switching provider rows", async () => {
@@ -192,12 +332,13 @@ test("a pending plan sign-in completion is ignored after switching provider rows
       return "https://chatgpt.test";
     }
     if (command === "finish_chatgpt_sign_in") return chatgpt.promise;
+    if (command === "cancel_chatgpt_sign_in") return null;
     throw new Error(`unexpected command ${command}`);
   };
 
   const view = await renderPicker((choice) => choices.push(choice));
 
-  await userEvent.click(await view.findByRole("radio", { name: /OpenAI/ }));
+  await pick(view, /OpenAI/);
   await userEvent.click(
     view.getByRole("button", { name: "Sign in with OpenAI" }),
   );
@@ -206,7 +347,11 @@ test("a pending plan sign-in completion is ignored after switching provider rows
       invokeCalls.some((call) => call.command === "finish_chatgpt_sign_in"),
     ).toBe(true),
   );
-  await userEvent.click(view.getByRole("radio", { name: /Anthropic/ }));
+  // The wait for the browser is said with a spinner, as every setup row is.
+  const waiting = view.getByRole("status");
+  expect(waiting.textContent).toBe("Waiting for you to approve it…");
+  expect(waiting.querySelector(".step-spinner")).not.toBeNull();
+  await pick(view, /Anthropic/);
 
   await act(async () => {
     chatgpt.resolve("chatgpt-token");
@@ -221,6 +366,115 @@ test("a pending plan sign-in completion is ignored after switching provider rows
   expect(view.queryByText(/Signed in to Anthropic/)).toBeNull();
   expect(choices).toEqual([]);
 });
+
+/*
+ * A ChatGPT sign-in left behind keeps listening for the browser. Its tab can still finish, and the
+ * browser then says "You're signed in" while this screen has moved on and dropped the result. So
+ * leaving it stops it: the tab then gets OpenBot's own page saying the sign-in ended.
+ */
+test("leaving a ChatGPT sign-in that is still waiting stops it", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers") return providers;
+    if (command === "begin_chatgpt_sign_in") return "https://chatgpt.test";
+    if (command === "finish_chatgpt_sign_in") return new Promise(() => {});
+    if (command === "cancel_chatgpt_sign_in") return null;
+    throw new Error(`unexpected command ${command}`);
+  };
+  const cancelled = () =>
+    invokeCalls.filter((call) => call.command === "cancel_chatgpt_sign_in")
+      .length;
+
+  const view = await renderPicker();
+  await pick(view, /OpenAI/);
+  await userEvent.click(
+    view.getByRole("button", { name: "Sign in with OpenAI" }),
+  );
+  await waitFor(() =>
+    expect(
+      invokeCalls.some((call) => call.command === "finish_chatgpt_sign_in"),
+    ).toBe(true),
+  );
+  expect(cancelled()).toBe(0);
+
+  await pick(view, /Anthropic/);
+  await waitFor(() => expect(cancelled()).toBe(1));
+
+  // And when the screen goes away mid-wait, as Back does.
+  await pick(view, /OpenAI/);
+  await userEvent.click(
+    view.getByRole("button", { name: "Sign in with OpenAI" }),
+  );
+  await waitFor(() =>
+    expect(
+      invokeCalls.filter((call) => call.command === "finish_chatgpt_sign_in")
+        .length,
+    ).toBe(2),
+  );
+  view.unmount();
+  await waitFor(() => expect(cancelled()).toBe(2));
+});
+
+test("a ChatGPT sign-in that finished is not cancelled when the screen moves on", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers") return providers;
+    if (command === "begin_chatgpt_sign_in") return "https://chatgpt.test";
+    if (command === "finish_chatgpt_sign_in") return "chatgpt-token";
+    if (command === "cancel_chatgpt_sign_in") return null;
+    throw new Error(`unexpected command ${command}`);
+  };
+
+  const view = await renderPicker();
+  await pick(view, /OpenAI/);
+  await userEvent.click(
+    view.getByRole("button", { name: "Sign in with OpenAI" }),
+  );
+  await view.findByText(/Signed in to OpenAI/);
+  view.unmount();
+  expect(
+    invokeCalls.some((call) => call.command === "cancel_chatgpt_sign_in"),
+  ).toBe(false);
+});
+
+test.each([
+  {
+    name: "Anthropic",
+    signIn: "claude",
+    says: "Anthropic opens in your browser. Approve the request there, then paste the code it shows you back here. You won't need an API key.",
+    asksForCode: true,
+  },
+  {
+    name: "OpenAI",
+    signIn: "chatgpt",
+    says: "OpenAI opens in your browser. You won't type anything here or need an API key.",
+    asksForCode: false,
+  },
+])(
+  "$name's plan sign-in says beforehand whether it will ask for a code",
+  async ({ name, signIn, says, asksForCode }) => {
+    const finished = deferred<string>();
+    invokeHandler = async (command) => {
+      if (command === "providers") return providers;
+      if (command === `begin_${signIn}_sign_in`)
+        return "https://sign-in.example";
+      if (command === `finish_${signIn}_sign_in`) return finished.promise;
+      if (command === `cancel_${signIn}_sign_in`) return null;
+      throw new Error(`unexpected command ${command}`);
+    };
+    const view = await renderPicker();
+    await pick(view, new RegExp(name));
+
+    const promise = view.getByText(/in your browser\./);
+    expect(promise.textContent).toBe(says);
+
+    await userEvent.click(
+      view.getByRole("button", { name: `Sign in with ${name}` }),
+    );
+    await view.findByText("Open the sign-in page");
+    expect(Boolean(view.queryByLabelText("Code from your browser"))).toBe(
+      asksForCode,
+    );
+  },
+);
 
 test("a saved provider-scoped plan session enables continue without exposing a token", async () => {
   const choices: unknown[] = [];
@@ -241,8 +495,9 @@ test("a saved provider-scoped plan session enables continue without exposing a t
     (choice) => choices.push(choice),
   );
 
-  await userEvent.click(await view.findByRole("radio", { name: /OpenAI/ }));
+  await pick(view, /OpenAI/);
   expect(view.getByText(/A saved OpenAI sign-in will be checked/)).toBeTruthy();
+  expect(view.getByText(/Your Bot will use LangChain/)).toBeTruthy();
   await userEvent.click(view.getByRole("button", { name: "Continue" }));
 
   expect(choices).toEqual([
@@ -277,9 +532,7 @@ for (const provider of providers) {
         (choice) => choices.push(choice),
       );
 
-      await userEvent.click(
-        await view.findByRole("radio", { name: new RegExp(provider.name) }),
-      );
+      await pick(view, new RegExp(provider.name));
       await userEvent.click(view.getByRole("tab", { name: "Use an API key" }));
       await userEvent.type(
         view.getByLabelText(`${provider.name} API key`),
@@ -310,7 +563,14 @@ for (const provider of providers) {
         ),
       );
       expect(view.queryByLabelText(`${provider.name} API key`)).toBeNull();
-      await userEvent.click(view.getByRole("button", { name: "Continue" }));
+      // A fresh sign-in moves on by itself; a saved one is only offered, so it waits for Continue.
+      if (session === "saved") {
+        await userEvent.click(view.getByRole("button", { name: "Continue" }));
+      } else {
+        await waitFor(() => expect(choices).toHaveLength(1), {
+          timeout: 4000,
+        });
+      }
 
       expect(choices).toHaveLength(1);
       expect(choices[0]).not.toHaveProperty("apiKey");
@@ -329,9 +589,7 @@ for (const provider of providers) {
       throw new Error(`unexpected command ${command}`);
     };
     const view = await renderPicker((choice) => choices.push(choice));
-    await userEvent.click(
-      await view.findByRole("radio", { name: new RegExp(provider.name) }),
-    );
+    await pick(view, new RegExp(provider.name));
     await userEvent.click(view.getByRole("tab", { name: "Use an API key" }));
     await userEvent.type(
       view.getByLabelText(`${provider.name} API key`),
@@ -369,9 +627,7 @@ test("a compatible endpoint does not inherit a saved OpenAI API key", async () =
     (choice) => choices.push(choice),
   );
 
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(
     view.getByLabelText("Base URL"),
     "https://models.example/v1",
@@ -409,9 +665,7 @@ test("a compatible endpoint submits the key typed into its endpoint key field", 
     (choice) => choices.push(choice),
   );
 
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(
     view.getByLabelText("Base URL"),
     "https://models.example/v1",
@@ -441,9 +695,7 @@ test("a compatible endpoint carries an optional container-only URL", async () =>
   };
 
   const view = await renderPickerWithHeld({}, (choice) => choices.push(choice));
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(
     view.getByLabelText("Base URL"),
     "http://127.0.0.1:11434/v1",
@@ -474,9 +726,7 @@ test("a compatible endpoint uses the host URL for containers when no override is
   };
 
   const view = await renderPickerWithHeld({}, (choice) => choices.push(choice));
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(
     view.getByLabelText("Base URL"),
     "https://models.example/v1",
@@ -507,9 +757,7 @@ test("a compatible endpoint refuses an invalid container-only URL", async () => 
   };
 
   const view = await renderPickerWithHeld({}, (choice) => choices.push(choice));
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(
     view.getByLabelText("Base URL"),
     "http://127.0.0.1:11434/v1",
@@ -540,9 +788,7 @@ test.each([
   };
 
   const view = await renderPicker((choice) => choices.push(choice));
-  await userEvent.click(
-    await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-  );
+  await pick(view, /OpenAI-compatible/);
   await userEvent.type(view.getByLabelText("Base URL"), baseUrl);
   await userEvent.type(view.getByLabelText("Model name"), "local-model");
 
@@ -564,9 +810,7 @@ test("a compatible endpoint accepts local http and external https URLs", async (
     "https://models.example/v1",
   ]) {
     const view = await renderPicker((choice) => choices.push(choice));
-    await userEvent.click(
-      await view.findByRole("radio", { name: /OpenAI-compatible/ }),
-    );
+    await pick(view, /OpenAI-compatible/);
     await userEvent.type(view.getByLabelText("Base URL"), baseUrl);
     await userEvent.type(view.getByLabelText("Model name"), "local-model");
 
@@ -601,9 +845,7 @@ for (const provider of providers) {
         throw new Error(`unexpected protected command ${command}`);
       };
       const view = await renderPicker((choice) => choices.push(choice));
-      await userEvent.click(
-        await view.findByRole("radio", { name: new RegExp(provider.name) }),
-      );
+      await pick(view, new RegExp(provider.name));
       if (login === "api-key")
         await userEvent.click(
           view.getByRole("tab", { name: "Use an API key" }),
@@ -628,9 +870,7 @@ for (const provider of providers) {
       await userEvent.click(view.getByRole("button", { name: "Continue" }));
       expect(choices).toEqual([{ provider: provider.id, login, saved: true }]);
       const other = providers.find((item) => item.id !== provider.id)!;
-      await userEvent.click(
-        view.getByRole("radio", { name: new RegExp(other.name) }),
-      );
+      await pick(view, new RegExp(other.name));
       expect(view.getByRole("button", { name: "Continue" })).toHaveProperty(
         "disabled",
         true,
@@ -878,10 +1118,13 @@ for (const provider of cloudProviders) {
     );
     await user.click(view.getByRole("tab", { name: "Sign in" }));
     await user.click(
-      view.getByRole("button", { name: `Sign in with ${provider.name}` }),
+      view.getByRole("button", {
+        name: `Sign in with ${provider.signsInWith}`,
+      }),
     );
     await view.findByText(`Signed in to ${provider.name}.`);
-    await user.click(view.getByRole("button", { name: "Continue" }));
+    // Signed in with a model already named: on by itself, no Continue.
+    await waitFor(() => expect(choices).toHaveLength(1), { timeout: 4000 });
     expect(choices).toEqual([
       {
         provider: provider.id,
@@ -899,7 +1142,9 @@ for (const provider of cloudProviders) {
       args: { attemptId: "synthetic-attempt" },
     });
   });
+}
 
+for (const provider of [...cloudProviders, unbiased]) {
   test(`${provider.name} opens its API key page externally without sending entered credentials`, async () => {
     invokeHandler = async (command) => {
       if (command === "providers") return allProviders;
@@ -916,9 +1161,7 @@ for (const provider of cloudProviders) {
       "synthetic-private-api-key",
     );
     expect(invokeCalls.map((call) => call.command)).toEqual(["providers"]);
-    await user.click(
-      view.getByRole("link", { name: `Get a ${provider.name} API key` }),
-    );
+    await user.click(view.getByRole("link", { name: provider.keyLink }));
     expect(invokeCalls).toEqual([
       { command: "providers", args: undefined },
       { command: "plugin:opener|open_url", args: { url: provider.keyUrl } },
@@ -1061,9 +1304,7 @@ for (const provider of cloudProviders) {
     const other = cloudProviders.find(
       (candidate) => candidate.id !== provider.id,
     )!;
-    await userEvent.click(
-      view.getByRole("radio", { name: new RegExp(other.name) }),
-    );
+    await pick(view, new RegExp(other.name));
     expect(view.getByLabelText(`${other.name} API key`)).toHaveProperty(
       "value",
       "",
@@ -1087,3 +1328,183 @@ for (const provider of cloudProviders) {
     });
   });
 }
+
+test("an Unbiased AI sign-in mints an API key that goes on as its endpoint credential", async () => {
+  const finish = deferred<string>();
+  invokeHandler = async (command) => {
+    if (command === "providers")
+      return allProviders.map((row) =>
+        row.id === "unbiased" ? { ...row, logins: ["oauth", "endpoint"] } : row,
+      );
+    if (command === "begin_model_oauth")
+      return {
+        attemptId: "unbiased-attempt",
+        url: "https://platform.unbiased.ai/activate?user_code=BCDF-GHJK",
+        userCode: "BCDF-GHJK",
+      };
+    if (command === "plugin:opener|open_url") return null;
+    if (command === "finish_model_oauth") return finish.promise;
+    throw new Error(`unexpected command ${command}`);
+  };
+  const choices: unknown[] = [];
+  const view = await renderPicker((choice) => choices.push(choice));
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.click(await view.findByRole("radio", { name: /Unbiased AI/ }));
+  // Sign-in is the way in by default, with the gateway's model already named.
+  expect(
+    view.getByRole("tab", { name: "Sign in" }).getAttribute("aria-selected"),
+  ).toBe("true");
+  expect(view.getByLabelText("Model name")).toHaveProperty("value", "pareto");
+  await user.click(
+    view.getByRole("button", { name: "Sign in with Unbiased AI" }),
+  );
+  // The code is on screen for matching against the approval page, beside the link to it.
+  await view.findByText("BCDF-GHJK");
+  expect(invokeCalls).toContainEqual({
+    command: "plugin:opener|open_url",
+    args: { url: "https://platform.unbiased.ai/activate?user_code=BCDF-GHJK" },
+  });
+  await act(async () => {
+    finish.resolve("sk_pareto_synthetic");
+  });
+  await view.findByText("Signed in to Unbiased AI.");
+  await waitFor(() => expect(choices).toHaveLength(1), { timeout: 4000 });
+  expect(choices).toEqual([
+    {
+      provider: "openai-compatible",
+      login: "endpoint",
+      apiKey: "sk_pareto_synthetic",
+      baseUrl: "https://api.unbiased.ai/v1",
+      model: "pareto",
+    },
+  ]);
+  // Held, never shown.
+  expect(view.container.textContent).not.toContain("sk_pareto_synthetic");
+});
+
+test("a refused Unbiased AI sign-in shows why, submits nothing and keeps no key", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers")
+      return allProviders.map((row) =>
+        row.id === "unbiased" ? { ...row, logins: ["oauth", "endpoint"] } : row,
+      );
+    if (command === "begin_model_oauth")
+      return {
+        attemptId: "unbiased-attempt",
+        url: "https://platform.unbiased.ai/activate?user_code=BCDF-GHJK",
+        userCode: "BCDF-GHJK",
+      };
+    if (command === "plugin:opener|open_url") return null;
+    if (command === "finish_model_oauth")
+      throw new Error(
+        "Unbiased AI sign-in was not approved: the user denied this authorization.",
+      );
+    throw new Error(`unexpected command ${command}`);
+  };
+  const choices: unknown[] = [];
+  const view = await renderPicker((choice) => choices.push(choice));
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.click(await view.findByRole("radio", { name: /Unbiased AI/ }));
+  await user.click(
+    view.getByRole("button", { name: "Sign in with Unbiased AI" }),
+  );
+  await view.findByText(/not approved: the user denied this authorization/);
+  // The wait is over: no code, no link, and the button offers a fresh start, not "again".
+  expect(view.queryByText("BCDF-GHJK")).toBeNull();
+  expect(view.queryByText("Signed in to Unbiased AI.")).toBeNull();
+  expect(
+    view.getByRole("button", { name: "Sign in with Unbiased AI" }),
+  ).toBeTruthy();
+  expect(view.getByRole("button", { name: "Continue" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  await new Promise((settle) => setTimeout(settle, 1200));
+  expect(choices).toEqual([]);
+});
+
+test("a chosen provider stands alone, and Change or Escape shows them all again", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers") return providers;
+    return null;
+  };
+  const view = await renderPicker();
+  const everyRow = (await view.findAllByRole("radio")).length;
+  expect(everyRow).toBeGreaterThan(1);
+
+  await userEvent.click(view.getByRole("radio", { name: /Anthropic/ }));
+  expect(view.getAllByRole("radio")).toHaveLength(1);
+  await userEvent.click(
+    view.getByRole("button", { name: "Choose a different provider" }),
+  );
+  expect(view.getAllByRole("radio")).toHaveLength(everyRow);
+  expect(
+    view.queryByRole("button", { name: "Choose a different provider" }),
+  ).toBeNull();
+
+  await userEvent.click(view.getByRole("radio", { name: /OpenAI$|^OpenAI/ }));
+  expect(view.getAllByRole("radio")).toHaveLength(1);
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(view.getAllByRole("radio")).toHaveLength(everyRow);
+});
+
+/**
+ * The chosen row's own text ran under Change: "…vLLM or your own." sat behind the button on the
+ * compatible endpoint's row. The lone row keeps the room Change takes at its right.
+ */
+test("a chosen provider's text leaves room for Change", async () => {
+  invokeHandler = async (command) => {
+    if (command === "providers") return providers;
+    return null;
+  };
+  const view = await renderPicker();
+  await view.findAllByRole("radio");
+  await userEvent.click(view.getByRole("radio", { name: /Anthropic/ }));
+  const row = view.getByRole("radio").closest("label");
+  expect(row?.className).toContain("beside-change");
+  const styles = readFileSync(join(import.meta.dir, "styles.css"), "utf8");
+  const rule = styles.match(/\.tile\.beside-change\s*\{([^}]*)\}/)?.[1] ?? "";
+  const room = Number(rule.match(/padding-right:\s*(\d+)px/)?.[1] ?? 0);
+  // Change is about 50px wide, 16px in from the edge, with a gap before the text.
+  expect(room).toBeGreaterThanOrEqual(80);
+});
+
+/*
+ * Windows G: under "Anthropic API key" the window said "A Claude plan carries a separate monthly
+ * pool of Agent SDK credits...". That is about signing in with a plan, and an API key has no such
+ * pool. It is said with the plan sign-in only.
+ */
+test("the Claude plan's caution is said with the plan sign-in, not under the API key", async () => {
+  const cautioned: Provider[] = [
+    {
+      ...providers[1],
+      caution: {
+        says: "A Claude plan carries a separate monthly pool of Agent SDK credits. When that pool is empty, Bots stop until it renews or you add API credits.",
+        reads_more_at:
+          "https://support.anthropic.com/en/articles/11145838-using-claude-code-with-your-pro-or-max-plan",
+      },
+    },
+  ];
+  invokeHandler = async (command) => {
+    if (command === "providers") return cautioned;
+    if (command === "cancel_chatgpt_sign_in") return null;
+    throw new Error(`unexpected command ${command}`);
+  };
+  const view = await renderPicker();
+  await pick(view, /^Anthropic/);
+  expect(view.getByRole("tab", { selected: true }).textContent).toBe(
+    "Sign in with my plan",
+  );
+  expect(view.getByText(/separate monthly pool/)).toBeTruthy();
+  expect(view.getByRole("link", { name: "What this means" })).toBeTruthy();
+
+  await userEvent.click(view.getByRole("tab", { name: "Use an API key" }));
+  expect(view.getByLabelText("Anthropic API key")).toBeTruthy();
+  expect(view.queryByText(/separate monthly pool/)).toBeNull();
+  expect(view.queryByRole("link", { name: "What this means" })).toBeNull();
+
+  await userEvent.click(
+    view.getByRole("tab", { name: "Sign in with my plan" }),
+  );
+  expect(view.getByText(/separate monthly pool/)).toBeTruthy();
+});

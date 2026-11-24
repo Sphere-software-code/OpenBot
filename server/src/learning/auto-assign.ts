@@ -2,19 +2,31 @@ import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import {
   AUTOMATIC_LEARNING_CONTAINER_ID,
   type LearningAutoAssignState,
+  type LearningTarget,
 } from "@openbot/shared/learning";
 import {
   type AuditStore,
   DEPLOYMENT_INITIATOR,
   recordAuditEvent,
 } from "../audit";
-import type { LearningSettingsStore } from "./settings";
+import {
+  askWhileIntelligenceStarts,
+  type StartupClock,
+} from "../intelligence-startup";
+import type {
+  ConfiguredLearningContainer,
+  LearningSettingsStore,
+} from "./settings";
 
-/** What asking Intelligence about one container found. */
+/**
+ * What asking Intelligence about one container found. `learning_off`: Intelligence answered and has
+ * no Learning routes at all, which is Learning switched off in its deployment, not a failure to reach it.
+ */
 export type ContainerProbe =
   | "present"
   | "absent"
   | "not_entitled"
+  | "learning_off"
   | "unavailable";
 
 /**
@@ -42,9 +54,54 @@ export function classifyProbeError(error: unknown): ContainerProbe {
   return "unavailable";
 }
 
-/** Ask whether `containerId` exists in the project the runtime key belongs to. */
+/** The HTTP status and Intelligence error code a project-key Learning request failed with. */
+function requestFailure(error: unknown): { status?: number; code?: string } {
+  if (error === null || typeof error !== "object") return {};
+  const { status, code } = error as { status?: unknown; code?: unknown };
+  return {
+    ...(typeof status === "number" ? { status } : {}),
+    ...(typeof code === "string" ? { code } : {}),
+  };
+}
+
+/**
+ * Read a refusal from Intelligence's project-key Learning routes (`/api/v1/learning/containers/...`).
+ *
+ * Intelligence with Learning switched off registers none of them, so it answers 404 with its
+ * catch-all `ROUTE_NOT_FOUND`: Learning is off there, which the person who can turn it on needs to
+ * hear, rather than that Intelligence could not be reached.
+ */
+export function classifyLearningRouteError(error: unknown): ContainerProbe {
+  const { status, code } = requestFailure(error);
+  if (status === 404 && code === "ROUTE_NOT_FOUND") return "learning_off";
+  if (code === "LEARNING_CONTAINER_NOT_FOUND") return "absent";
+  if (code === "LEARNING_NOT_ENABLED") return "not_entitled";
+  return "unavailable";
+}
+
+/** The runtime client's catch-alls: a refusal it has no code for, which the read below can name. */
+const UNNAMED_REFUSALS = new Set([
+  "UNSUPPORTED_SERVER",
+  "AUTHORIZATION_FAILED",
+]);
+
+/**
+ * Ask whether `containerId` exists in the project the runtime key belongs to.
+ *
+ * The published-Skills read answers it on every Intelligence. When that read fails with a code the
+ * runtime client does not know (it reports any such refusal as `UNSUPPORTED_SERVER`, or a 403 as
+ * `AUTHORIZATION_FAILED`), the container itself is read on the same key, whose refusal carries
+ * Intelligence's own code: Learning switched off, a missing container, or Learning not licensed.
+ */
 export async function probeLearningContainer(
-  client: Pick<CopilotKitIntelligence, "getLearnedSkillsSnapshot">,
+  client: Pick<CopilotKitIntelligence, "getLearnedSkillsSnapshot"> & {
+    experimental?: {
+      learning: Pick<
+        CopilotKitIntelligence["experimental"]["learning"],
+        "getLearningContainer"
+      >;
+    };
+  },
   containerId: string,
   timeoutMs = 5_000,
 ): Promise<ContainerProbe> {
@@ -55,7 +112,24 @@ export async function probeLearningContainer(
     });
     return "present";
   } catch (error) {
-    return classifyProbeError(error);
+    const found = classifyProbeError(error);
+    const { code } = requestFailure(error);
+    if (
+      found !== "unavailable" ||
+      !client.experimental ||
+      !code ||
+      !UNNAMED_REFUSALS.has(code)
+    )
+      return found;
+    try {
+      await client.experimental.learning.getLearningContainer({
+        containerId,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      return "present";
+    } catch (named) {
+      return classifyLearningRouteError(named);
+    }
   }
 }
 
@@ -182,7 +256,10 @@ export type LearningAutoAssign = {
   kick(): void;
   /** The last answer, without asking. */
   state(): LearningAutoAssignState;
-  /** Check at boot, then keep checking every `retryMs` until there is nothing left to do. */
+  /**
+   * Check at boot, asking again while Intelligence is still starting (see intelligence-startup.ts),
+   * then keep checking every `retryMs` until there is nothing left to do.
+   */
   start(): void;
   stop(): void;
 };
@@ -200,19 +277,36 @@ const MIN_INTERVAL_MS = 60_000;
  * for every deployment whose Intelligence project already has the container:
  *
  * - It never overrides a choice. A saved Admin setting of any kind, including a saved off, and a
- *   container named in the environment both mean there is nothing to do.
- * - It creates the container only through `create`, with a credential that can (a service token on
- *   a local evaluation install, or a CopilotKit CLI login on this machine; see
- *   learning/ensure-container.ts), once per process unless Admin asks again. The runtime key cannot.
- *   With no such credential it says exactly what to run, once, in the log and on the Admin page.
+ *   container named in the environment both mean there is nothing to do, once Intelligence says it
+ *   has the container named. One it does not have is a stale name, not a choice: it is logged,
+ *   forgotten, and assignment goes ahead as though nothing was named (see `configured`). A saved
+ *   default container it does not have is logged and set aside the same way, but stays saved, for
+ *   the Intelligence it was chosen on: what assignment finds is used in its place, here only.
+ * - It creates the container only through `create`, with a credential that can (the runtime key on
+ *   an Intelligence that allows it, a service token on a local evaluation install, or a CopilotKit
+ *   CLI login on this machine; see learning/ensure-container.ts), once per process unless Admin asks
+ *   again. With none of them it says exactly what to run, once, in the log and on the Admin page.
  * - It is safe on many replicas: the write is a conditional insert, so the first one wins and the
  *   rest see a saved setting. Only the winner writes the audit row.
  * - It never blocks startup or a turn. Every failure is logged once per kind and tried again later.
+ * - It waits out an Intelligence that is still starting at boot: while the boot check finds it
+ *   unavailable it asks again, quietly, and says it could not be asked only if that is still so
+ *   when the startup window closes.
  */
 export function createLearningAutoAssign(options: {
-  /** False when the operator switched this off or the environment names a container. */
+  /** False when the operator switched this off (`OPENBOT_LEARNING_AUTO_ASSIGN`). */
   enabled: boolean;
-  store: Pick<LearningSettingsStore, "saved" | "adoptDefault">;
+  /**
+   * The container the environment names, checked first. There, and there is nothing to assign.
+   * Absent on this Intelligence, and it is forgotten and assignment runs as though it was never
+   * named. The Intelligence a server talks to is fixed for its life, and pointing it at another one
+   * restarts it, so a check per process is a check per Intelligence.
+   */
+  configured?: ConfiguredLearningContainer;
+  store: Pick<LearningSettingsStore, "saved" | "adoptDefault"> &
+    Partial<
+      Pick<LearningSettingsStore, "savedDefault" | "setAside" | "restore">
+    >;
   probe: (containerId: string) => Promise<ContainerProbe>;
   /** Create the container with a credential that can. Absent when this deployment holds none. */
   create?: () => Promise<ContainerCreation>;
@@ -224,18 +318,28 @@ export function createLearningAutoAssign(options: {
   minIntervalMs?: number;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
+  /** How long the boot check gives a starting Intelligence, and the clock it waits on. */
+  startup?: StartupClock;
 }): LearningAutoAssign {
   const containerId = options.containerId ?? AUTOMATIC_LEARNING_CONTAINER_ID;
   const now = options.now ?? Date.now;
   const minIntervalMs = options.minIntervalMs ?? MIN_INTERVAL_MS;
   const log = options.log ?? ((entry) => console.warn(JSON.stringify(entry)));
-  let current: LearningAutoAssignState = options.enabled
+  /** Whether there is anything to check: assignment, or a container the environment names. */
+  const active = () =>
+    options.enabled || options.configured?.target() !== undefined;
+  let current: LearningAutoAssignState = active()
     ? { state: "pending" }
     : { state: "off" };
   let running: Promise<LearningAutoAssignState> | undefined;
   let lastStartedAt = Number.NEGATIVE_INFINITY;
   let timer: ReturnType<typeof setInterval> | undefined;
   const logged = new Set<string>();
+  /** The boot check is waiting for Intelligence to finish starting: "unavailable" is expected, so not logged. */
+  let starting = false;
+  /** The last check found Intelligence unavailable while that went unsaid, for the boot check to say if it stays so. */
+  let unsaid = false;
+  let stopped = false;
 
   const settled = (state: LearningAutoAssignState) =>
     state.state === "off" ||
@@ -249,19 +353,29 @@ export function createLearningAutoAssign(options: {
 
   const instructions =
     options.instructions ??
-    `Run bun scripts/setup-learning.ts, or create a container with ID "${containerId}" in Intelligence; OpenBot assigns it within ${Math.round((options.retryMs ?? RETRY_MS) / 60_000)} minutes.`;
+    `Run bun scripts/setup-learning.ts, or create a container with ID "${containerId}" in the backend dashboard; OpenBot assigns it within ${Math.round((options.retryMs ?? RETRY_MS) / 60_000)} minutes.`;
   /** Whether this process already tried `create`: once at boot, again only when Admin asks. */
   let createTried = false;
   let createError: string | undefined;
+  /**
+   * Whether the last attempt found nothing here that could create it (an Intelligence that does not
+   * let the runtime key, and no other credential). Admin then shows the steps, not a button.
+   */
+  let createSkipped = false;
 
-  /** Create it with the configured credential, once. True when it is there now. */
-  const tryCreate = async (): Promise<boolean> => {
+  /**
+   * Create it with the configured credential, once. True when it is there now. `unavailable` when
+   * Intelligence could not answer just then (a 5xx, nothing answering), which is not this
+   * credential's one try: the next check tries again.
+   */
+  const tryCreate = async (): Promise<boolean | "unavailable"> => {
     if (!options.create || createTried) return false;
     createTried = true;
     try {
       const result = await options.create();
       createError = undefined;
-      if (result === "skipped") return false;
+      createSkipped = result === "skipped";
+      if (createSkipped) return false;
       log({
         type: "learning-auto-assign",
         outcome: result === "created" ? "container_created" : "container_found",
@@ -273,6 +387,15 @@ export function createLearningAutoAssign(options: {
       });
       return true;
     } catch (error) {
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "retryable" in error &&
+        error.retryable === true
+      ) {
+        createTried = false;
+        return "unavailable";
+      }
       createError =
         error instanceof Error
           ? error.message.slice(0, 500)
@@ -282,20 +405,99 @@ export function createLearningAutoAssign(options: {
     }
   };
 
+  const sayUnavailable = () =>
+    once("unavailable", {
+      message:
+        "Intelligence could not be asked about the Learning container. OpenBot tries again.",
+    });
+
   const absent = (): LearningAutoAssignState => ({
     state: "absent",
     containerId,
     instructions,
-    canCreate: Boolean(options.create),
+    canCreate: Boolean(options.create) && !createSkipped,
     ...(createError ? { createError } : {}),
   });
 
+  /**
+   * Whether the environment's container is there. "stands": it is, or Intelligence answered without
+   * saying it is not (Learning off, or not licensed), so the choice stands as it always did.
+   * "forgotten": Intelligence says it has no such container, so it no longer names the default.
+   */
+  const checkConfigured = async (
+    target: LearningTarget,
+  ): Promise<"stands" | "forgotten" | "unavailable"> => {
+    const found = await options.probe(target.containerId);
+    if (found === "unavailable") return "unavailable";
+    if (found !== "absent") return "stands";
+    options.configured?.forget();
+    once("configured_absent", {
+      containerId: target.containerId,
+      variable: "CPK_INTELLIGENCE_LEARNING_CONTAINER_ID",
+      message: `CPK_INTELLIGENCE_LEARNING_CONTAINER_ID is "${target.containerId}", but this Intelligence has no Learning container with that ID, so OpenBot ignores it${options.enabled ? ` and assigns "${containerId}" instead` : ""}. Remove it from the environment, or set it to a container this Intelligence has.`,
+    });
+    return "forgotten";
+  };
+
+  /**
+   * Whether the saved default container is there. "stands": it is, none is saved, or Intelligence
+   * answered without saying it is not. "set_aside": Intelligence says it has no such container. The
+   * saved choice is kept (switching back to the Intelligence it was made on brings it back), but it
+   * no longer names the default here (`LearningSettingsStore.setAside`).
+   */
+  const checkSaved = async (): Promise<
+    | { checked: "stands" }
+    | { checked: "unavailable" }
+    | { checked: "set_aside"; containerId: string }
+  > => {
+    const saved = await options.store.savedDefault?.();
+    if (!saved || !options.store.setAside) return { checked: "stands" };
+    const found = await options.probe(saved.containerId);
+    if (found === "unavailable") return { checked: "unavailable" };
+    if (found !== "absent") {
+      options.store.restore?.();
+      return { checked: "stands" };
+    }
+    options.store.setAside(saved.containerId);
+    once("saved_absent", {
+      containerId: saved.containerId,
+      message: `The saved default Learning container is "${saved.containerId}", but this Intelligence has no Learning container with that ID, so OpenBot ignores it here${options.enabled ? ` and uses "${containerId}" instead` : ""}. The saved choice is kept, for an Intelligence that has it. Saving another default container replaces it.`,
+    });
+    return { checked: "set_aside", containerId: saved.containerId };
+  };
+
   const run = async (): Promise<LearningAutoAssignState> => {
-    if (!options.enabled) return { state: "off" };
-    if (await options.store.saved()) return { state: "saved" };
+    unsaid = false;
+    if (!active()) return { state: "off" };
+    /** The saved default this Intelligence does not have: what is found is used in its place, not saved. */
+    let setAside: string | undefined;
+    if (await options.store.saved()) {
+      const saved = await checkSaved();
+      if (saved.checked === "unavailable") {
+        if (starting) unsaid = true;
+        else sayUnavailable();
+        return { state: "unavailable" };
+      }
+      if (saved.checked === "stands") return { state: "saved" };
+      if (!options.enabled) return { state: "off" };
+      setAside = saved.containerId;
+    }
+    const configured = setAside ? undefined : options.configured?.target();
+    if (configured) {
+      const checked = await checkConfigured(configured);
+      if (checked === "unavailable") {
+        if (starting) unsaid = true;
+        else sayUnavailable();
+        return { state: "unavailable" };
+      }
+      if (checked === "stands" || !options.enabled) return { state: "off" };
+    }
     let found = await options.probe(containerId);
-    if (found === "absent" && (await tryCreate()))
-      found = await options.probe(containerId);
+    if (found === "absent") {
+      const created = await tryCreate();
+      if (created === "unavailable") found = "unavailable";
+      else if (created) found = await options.probe(containerId);
+    }
     if (found === "absent") {
       once("absent", {
         message: `This Intelligence project has no "${containerId}" Learning container, so Automatic Learning collects nothing yet. ${instructions}`,
@@ -309,12 +511,27 @@ export function createLearningAutoAssign(options: {
       });
       return { state: "not_entitled" };
     }
-    if (found === "unavailable") {
-      once("unavailable", {
+    if (found === "learning_off") {
+      once("learning_off", {
         message:
-          "Intelligence could not be asked about the Learning container. OpenBot tries again.",
+          "Learning is switched off in this Intelligence, so Automatic Learning collects nothing. Turn it on in Intelligence (learning.enabled in its Helm chart); OpenBot checks again.",
       });
+      return { state: "learning_off" };
+    }
+    if (found === "unavailable") {
+      if (starting) unsaid = true;
+      else sayUnavailable();
       return { state: "unavailable" };
+    }
+    if (setAside) {
+      options.store.setAside?.(setAside, { containerId });
+      log({
+        type: "learning-auto-assign",
+        outcome: "assigned",
+        containerId,
+        message: `Uses the "${containerId}" Learning container on this Intelligence in place of the saved "${setAside}", which it does not have. The saved choice is kept.`,
+      });
+      return { state: "assigned", containerId };
     }
     if (!(await options.store.adoptDefault({ containerId })))
       return { state: "saved" };
@@ -368,6 +585,21 @@ export function createLearningAutoAssign(options: {
     timer = undefined;
   };
 
+  /** The boot check: ask until Intelligence answers or the startup window closes, then say what is still so. */
+  const startup = async () => {
+    starting = true;
+    try {
+      await askWhileIntelligenceStarts(
+        check,
+        (state) => !stopped && state.state === "unavailable",
+        options.startup,
+      );
+    } finally {
+      starting = false;
+    }
+    if (unsaid && current.state === "unavailable") sayUnavailable();
+  };
+
   return {
     check,
     async createNow() {
@@ -385,13 +617,16 @@ export function createLearningAutoAssign(options: {
     },
     state: () => current,
     start() {
-      if (!options.enabled) return;
-      void check();
+      if (!active()) return;
+      void startup();
       timer = setInterval(() => void check(), options.retryMs ?? RETRY_MS);
       // Never keep the process alive for this alone.
       timer.unref?.();
     },
-    stop: stopTimer,
+    stop() {
+      stopped = true;
+      stopTimer();
+    },
   };
 }
 
@@ -411,8 +646,9 @@ export function withLearningAutoAssign<T extends LearningSettingsStore>(
     ...store,
     async read() {
       const settings = await store.read();
-      if (settings.enabled && settings.defaultTarget === null)
-        autoAssign.kick();
+      // With a default too, until the check settles: that default may be the environment's
+      // container, not yet confirmed on this Intelligence. Once settled, `kick` does nothing.
+      if (settings.enabled) autoAssign.kick();
       return settings;
     },
   };

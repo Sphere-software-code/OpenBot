@@ -96,6 +96,15 @@ beforeAll(() => {
         return NativeResponse.json({ agents: [] });
       if (url.pathname === "/api/plugins/for/refresh-bot")
         return NativeResponse.json({ skills: [], tools: [] });
+      // What the Bot's runs are offered is read from these, as the server answers them.
+      if (url.pathname === "/api/agents/refresh-bot")
+        return NativeResponse.json({
+          agent: { id: "refresh-bot", visibility: "public", canManage: true },
+        });
+      if (url.pathname === "/api/components/for-agent/refresh-bot")
+        return NativeResponse.json({ components: [] });
+      if (url.pathname === "/api/admin/enterprise/me")
+        return NativeResponse.json({ capabilities: {}, enforced: false });
       if (url.pathname.endsWith("/info"))
         return NativeResponse.json({
           version: "fixture",
@@ -217,8 +226,12 @@ async function mounted() {
   return view;
 }
 
-test("generated UI actions run the actual channel agent and thread with edited values", async () => {
-  const activity = {
+/**
+ * A trip form a Bot drew, as its conversation stores it: a committed surface activity whose operations
+ * carry the A2UI version they were written in.
+ */
+function tripForm(version: string) {
+  return {
     id: "channel-trip-form",
     role: "activity",
     activityType: "generative-ui-surface",
@@ -230,7 +243,7 @@ test("generated UI actions run the actual channel agent and thread with edited v
       rejected: [],
       operations: [
         {
-          version: "v1.0",
+          version,
           createSurface: {
             surfaceId: "trip",
             catalogId: OPENBOT_UI.id,
@@ -238,7 +251,7 @@ test("generated UI actions run the actual channel agent and thread with edited v
           },
         },
         {
-          version: "v1.0",
+          version,
           updateComponents: {
             surfaceId: "trip",
             components: [
@@ -270,6 +283,10 @@ test("generated UI actions run the actual channel agent and thread with edited v
       ],
     },
   } satisfies Message;
+}
+
+test("generated UI actions run the actual channel agent and thread with edited values", async () => {
+  const activity = tripForm("1.0");
   const view = mounting(async () => stored([activity]), [activity], null, true);
   const user = userEvent.setup({ document: view.container.ownerDocument });
   const destination = await view.findByRole("textbox", { name: "Destination" });
@@ -302,6 +319,26 @@ test("generated UI actions run the actual channel agent and thread with edited v
       },
     },
   });
+});
+/*
+ * CopilotKit 1.83 wrote A2UI 1.0's version as "v1.0", and every interface a Bot drew on it is stored
+ * that way. 1.84 reads only "1.0" (CopilotKit #8155), so a conversation from before the upgrade lost
+ * its interfaces when it was reopened, and the next run in it took them away again.
+ */
+test("an interface a Bot drew before the upgrade draws when its conversation is reopened, and stays through the next run", async () => {
+  const activity = tripForm("v1.0");
+  const view = mounting(async () => stored([activity]), [activity], null, true);
+  const destination = await view.findByRole("textbox", { name: "Destination" });
+  expect((destination as HTMLInputElement).value).toBe("Paris");
+
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.click(view.getByRole("button", { name: "Confirm trip" }));
+  await waitFor(() => expect(runRequests).toHaveLength(1));
+  await waitFor(() => expect(currentAgent().isRunning).toBe(false));
+  expect(
+    (view.getByRole("textbox", { name: "Destination" }) as HTMLInputElement)
+      .value,
+  ).toBe("Paris");
 });
 function currentAgent(selected = channel) {
   const agent = core?.getAgent(`channel:${selected.id}`);
@@ -835,16 +872,31 @@ test("a successful same-message refresh is not overwritten by later unavailable 
   await act(async () => currentAgent().addMessage(local));
   const beforeRefresh = historyReads.length;
   let refreshReads = 0;
+  const lastRetry = delayedResponse();
   history = async () => {
     refreshReads += 1;
-    return refreshReads === 1
-      ? stored([initial, broken])
-      : new NativeResponse("failed", { status: 500 });
+    if (refreshReads === 1) return stored([initial, broken]);
+    if (refreshReads === 2)
+      return new NativeResponse("failed", { status: 500 });
+    return lastRetry.promise;
   };
 
   await announce(1);
   await view.findByText(oneHole);
-  await new Promise((resolve) => setTimeout(resolve, 2300));
+  /*
+   * The refresh retries at 0, 750 and 1500 ms after each read, so its last read lands about 2250 ms
+   * after the first. This used to sleep 2300 ms and then count, a margin of about 45 ms: on a busy
+   * runner the retry timers fire late, the sleep ended before the third read, and the count came out
+   * 2. So it waits for the third read itself, then answers it here, inside act, so the failure that
+   * read reports has been handled before the notice is checked.
+   */
+  await waitFor(() => expect(historyReads.length - beforeRefresh).toBe(3), {
+    timeout: 4000,
+  });
+  await act(async () => {
+    lastRetry.resolve(new NativeResponse("failed", { status: 500 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 
   expect(historyReads.length - beforeRefresh).toBe(3);
   expect(view.getByText(oneHole)).toBeTruthy();

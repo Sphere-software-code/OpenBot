@@ -36,10 +36,12 @@ const candidate = (
 ): ApprovalCandidate => ({
   actorId: "owner",
   botId: "bot",
-  toolRef: "mcp/gmail/send_email",
+  // An ordinary change. Sending, deleting, sharing and publishing ask whatever the rules say
+  // (see "consequential actions" below), so the rule layers are shown on one that does not.
+  toolRef: "mcp/gmail/create_label",
   effect: "write",
   scope: "gmail",
-  args: { to: "sam@example.com", subject: "Notes" },
+  args: { name: "Notes" },
   ...over,
 });
 const rule = (
@@ -182,9 +184,24 @@ describe("custom rules", () => {
 });
 
 describe("built-in safety requirements", () => {
-  test("credentials, security settings and payments always go to the person, whatever the rules say", async () => {
+  test("credentials, security settings and payments ask, open by default; a credential typed on a website is the person's", async () => {
+    // A password typed into a form: only the person has it, so no answer of theirs can stand in.
+    const typed = candidate({
+      toolRef: "computer_type",
+      args: { ref: "e3", text: "hunter2", field: "New password" },
+    });
+    expect(safetyRequirement(typed)).toMatchObject({
+      id: "credentials",
+      behaviour: "hand_off",
+    });
+    expect(
+      await decideAction({
+        ...base,
+        candidate: typed,
+        personal: [rule("allow", { toolRef: "*", kind: "credentials" })],
+      }),
+    ).toMatchObject({ behaviour: "hand_off", source: "safety" });
     for (const [args, id] of [
-      [{ ref: "e3", text: "hunter2", field: "New password" }, "credentials"],
       [{ url: "https://github.com/settings/security" }, "security_settings"],
       [
         { button: "Place order", url: "https://shop.example/checkout" },
@@ -192,17 +209,40 @@ describe("built-in safety requirements", () => {
       ],
     ] as const) {
       const action = candidate({ toolRef: "computer_type", args });
-      expect(safetyRequirement(action)?.id).toBe(id);
-      const outcome = await decideAction({
-        ...base,
-        candidate: action,
-        team: [team("allow", { toolRef: "*" })],
-        personal: [rule("allow", { toolRef: "*" })],
-      });
-      expect(outcome).toMatchObject({
-        behaviour: "hand_off",
-        source: "safety",
-      });
+      expect(safetyRequirement(action)).toMatchObject({ id, behaviour: "ask" });
+      // A broad allow typed in Settings, or the team's, was written about something else.
+      expect(
+        await decideAction({
+          ...base,
+          candidate: action,
+          team: [team("allow", { toolRef: "*" })],
+          personal: [rule("allow", { toolRef: "*" })],
+        }),
+      ).toMatchObject({ behaviour: "ask", source: "safety", kind: id });
+      // "Always allow here" on this kind's own card reaches it.
+      expect(
+        await decideAction({
+          ...base,
+          candidate: action,
+          personal: [rule("allow", { toolRef: "*", kind: id })],
+        }),
+      ).toMatchObject({ behaviour: "allow", source: "personal_rule" });
+      // The admin closes it: then it asks every time, whatever the person allowed.
+      expect(
+        await decideAction({
+          ...base,
+          candidate: action,
+          personal: [rule("allow", { toolRef: "*", kind: id })],
+          actionKinds: { [id]: "ask" },
+        }),
+      ).toMatchObject({ behaviour: "ask", source: "safety", closed: true });
+      expect(
+        await decideAction({
+          ...base,
+          candidate: action,
+          actionKinds: { [id]: "hand_off" },
+        }),
+      ).toMatchObject({ behaviour: "hand_off", source: "safety", kind: id });
     }
     // The Bot's own workspace is not an account.
     expect(
@@ -271,6 +311,75 @@ describe("built-in safety requirements", () => {
     ).toBe("payments");
   });
 
+  test("archive as an app tool's action deletes, and so does a tool its app marks destructive", async () => {
+    const asked = (toolRef: string, over: Partial<ApprovalCandidate> = {}) =>
+      safetyRequirement(candidate({ toolRef, args: { id: "51" }, ...over }));
+    for (const toolRef of [
+      // HubSpot's delete is called archive. Seen on a Mac: "delete that HubSpot contact" ran unasked.
+      "composio-hubspot/HUBSPOT_ARCHIVE_CONTACT",
+      "composio-hubspot/HUBSPOT_ARCHIVE_BATCH_OF_FEEDBACK_SUBMISSIONS",
+      "composio-hubspot/HUBSPOT_BATCH_ARCHIVE_ASSOCIATION_LABELS",
+      "composio-slack/SLACK_ARCHIVE_CONVERSATION",
+      // Gmail's archive, as Gmail MCP servers name it, and in a broker's CamelCase.
+      "mcp/gmail/gmail_archive",
+      "mcp/gmail/archive-email",
+      "mcp/gmail/archive",
+      "arcade-Gmail/ArchiveEmail",
+      // The delete words, as before.
+      "composio-googledrive/GOOGLEDRIVE_DELETE_FILE",
+      "composio-gmail/GMAIL_MOVE_TO_TRASH",
+      "arcade-Linear/RemoveAttachment",
+    ])
+      expect({ toolRef, asked: asked(toolRef) }).toEqual({
+        toolRef,
+        asked: {
+          id: "deleting",
+          reason: "Deleting something asks you first.",
+          behaviour: "ask",
+        },
+      });
+    // Archive counts only as the action, the name's first verb.
+    for (const toolRef of [
+      "mcp/gmail/list_archived_emails",
+      "mcp/gmail/get_archive_settings",
+      "composio-slack/SLACK_UNARCHIVE_CHANNEL",
+      "composio-github/GITHUB_DOWNLOAD_A_REPOSITORY_ARCHIVE_ZIP",
+      "composio-hubspot/HUBSPOT_SEARCH_ARCHIVED_CONTACTS",
+    ])
+      expect({ toolRef, asked: asked(toolRef) ?? "nothing" }).toEqual({
+        toolRef,
+        asked: "nothing",
+      });
+
+    // A name that says nothing, from an app that marks the tool destructive.
+    const destructive = candidate({
+      toolRef: "mcp/acme/reset_workspace",
+      args: { workspace: "w1" },
+      destructive: true,
+    });
+    expect(safetyRequirement(destructive)).toEqual({
+      id: "deleting",
+      reason:
+        "The app marks this as deleting or overwriting something, so it asks you first.",
+      behaviour: "ask",
+    });
+    // An allow typed in Settings, the person's or the team's, doesn't answer it.
+    expect(
+      await decideAction({
+        ...base,
+        candidate: destructive,
+        team: [team("allow", { toolRef: "*" })],
+        personal: [rule("allow", { toolRef: "*" })],
+      }),
+    ).toMatchObject({ behaviour: "ask", source: "safety" });
+    // The same tool unmarked is an ordinary change; a read is never asked about here.
+    const { destructive: _marked, ...unmarked } = destructive;
+    expect(safetyRequirement(unmarked)).toBeUndefined();
+    expect(
+      safetyRequirement({ ...destructive, effect: "read" }),
+    ).toBeUndefined();
+  });
+
   test("what a Bot types into a field is content: the field and the page say what the action is", () => {
     // As the computer describes a typing action: the field it types into and the page it is on.
     const typing = (text: string, field: string, pageUrl: string) =>
@@ -314,6 +423,116 @@ describe("built-in safety requirements", () => {
     expect(
       typing("hunter2", "New password", "https://mail.example/settings"),
     ).toBe("credentials");
+  });
+
+  test("an address that carries credential words in its query string is not a credentials page", () => {
+    // As the computer describes an action on a page: the element acted on and the page it is on.
+    const acting = (
+      toolRef: "computer_type" | "computer_click",
+      element: { name: string; role: string; type?: string },
+      pageUrl: string,
+    ) =>
+      safetyRequirement(
+        candidate({
+          toolRef,
+          scope: new URL(pageUrl).host,
+          args:
+            toolRef === "computer_type"
+              ? { ref: "e5", text: "Test Robot", snapshotId: 4 }
+              : { ref: "e5", snapshotId: 4 },
+          target: {
+            element: { ref: "e5", ...element },
+            pageUrl,
+            snapshotId: 4,
+          },
+        }),
+      )?.id;
+    // A page served from a link signed for one download, as S3 signs it: the signature's
+    // credential and session token ride in the query string of an ordinary sign-up form.
+    const presigned =
+      "https://garden-club-example.s3.us-east-2.amazonaws.com/f4/garden-signup.html?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=EXAMPLEKEYID%2F20261107%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261107T043445Z&X-Amz-Expires=21600&X-Amz-SignedHeaders=host&X-Amz-Security-Token=EXAMPLE-SESSION-TOKEN&X-Amz-Signature=0123456789abcdef";
+    for (const field of ["Full name", "Email", "Note"])
+      expect(
+        acting("computer_type", { name: field, role: "textbox" }, presigned),
+      ).toBeUndefined();
+    expect(
+      acting(
+        "computer_type",
+        { name: "Favourite plant", role: "combobox" },
+        presigned,
+      ),
+    ).toBeUndefined();
+    expect(
+      acting("computer_click", { name: "Sign up", role: "button" }, presigned),
+    ).toBeUndefined();
+    // A sign-in's return address, with its token in the query string or the fragment.
+    expect(
+      acting(
+        "computer_type",
+        { name: "Display name", role: "textbox" },
+        "https://app.example/welcome?code=4%2F0AY&state=xyz&access_token=ya29.a0Af#access_token=ya29.a0Af&token_type=Bearer",
+      ),
+    ).toBeUndefined();
+    expect(
+      acting(
+        "computer_type",
+        { name: "Company", role: "textbox" },
+        "https://crm.example/accounts/new?api_key=sk_live_123&credential=abc",
+      ),
+    ).toBeUndefined();
+
+    // A credential field, button or page still goes to the person, on any address.
+    expect(
+      acting(
+        "computer_type",
+        { name: "New password", role: "textbox" },
+        presigned,
+      ),
+    ).toBe("credentials");
+    expect(
+      acting(
+        "computer_type",
+        { name: "PIN", role: "textbox", type: "password" },
+        presigned,
+      ),
+    ).toBe("credentials");
+    expect(
+      acting(
+        "computer_click",
+        { name: "Change password", role: "button" },
+        "https://mail.example/settings?tab=general",
+      ),
+    ).toBe("credentials");
+    expect(
+      acting(
+        "computer_type",
+        { name: "Phone number", role: "textbox" },
+        "https://accounts.example/security/2fa?step=1",
+      ),
+    ).toBe("credentials");
+    expect(
+      acting(
+        "computer_type",
+        { name: "Name", role: "textbox" },
+        "https://platform.example/settings/api-keys",
+      ),
+    ).toBe("credentials");
+    expect(
+      acting(
+        "computer_click",
+        { name: "Create", role: "button" },
+        "https://console.cloud.example/apis/credentials?project=demo",
+      ),
+    ).toBe("credentials");
+    // Only the credentials rule reads the page without its query string: a checkout reached by
+    // its query string is still paying.
+    expect(
+      acting(
+        "computer_type",
+        { name: "Quantity", role: "textbox" },
+        "https://shop.example/cart?step=checkout",
+      ),
+    ).toBe("payments");
   });
 
   test("a news wire is not a wire of money", () => {
@@ -361,6 +580,52 @@ describe("built-in safety requirements", () => {
     expect(
       shopify("SHOPIFY_UPDATE_ORDER", { id: 123, note: "gift wrap" }),
     ).toBeUndefined();
+    // A field left empty is not an argument sent: the billing_address the Bot did not
+    // fill in must not hand the note off as money-moving (#890).
+    expect(
+      shopify("SHOPIFY_UPDATE_ORDER", {
+        id: 123,
+        billing_address: null,
+        note: "gift wrap",
+      }),
+    ).toBeUndefined();
+    expect(
+      shopify("SHOPIFY_UPDATE_ORDER", {
+        id: 123,
+        billing_address: {},
+        note: "",
+      }),
+    ).toBeUndefined();
+  });
+
+  test("a field nested past the depth cap still counts by its name", () => {
+    // Values deeper than the cap are not read, so a field there flattens to nothing whether or not
+    // it holds anything. Its name is all the rule gets to see of it, and an unread value is not an
+    // empty one: dropping the name too let a money field through just by nesting it deep enough.
+    const sent = (args: Record<string, unknown>) =>
+      safetyRequirement(
+        candidate({
+          toolRef: "composio-shopify/SHOPIFY_GRAPHQL_MUTATION",
+          scope: "composio-shopify",
+          args,
+          target: {
+            serverId: "composio-shopify",
+            toolName: "SHOPIFY_GRAPHQL_MUTATION",
+            url: "https://mcp.composio.dev/shopify",
+            effect: "write",
+          },
+        }),
+      )?.id;
+    const nested = (leaf: Record<string, unknown>) =>
+      sent({ a: { b: { c: { d: { e: { f: leaf } } } } } });
+    expect(nested({ payment_method: { card: "tok_123" } })).toBe("payments");
+    expect(nested({ billing: [{ line: 1 }] })).toBe("payments");
+    // A list read at the cap whose entries are past it is not empty either.
+    expect(
+      sent({ a: { b: { c: { d: { e: { refund_lines: [{ id: 1 }] } } } } } }),
+    ).toBe("payments");
+    // Past the cap as well, but genuinely empty: still nothing sent.
+    expect(nested({ billing_address: {}, refund: [] })).toBeUndefined();
   });
 });
 
@@ -381,7 +646,7 @@ describe("the reviewer's safety classification", () => {
       model: model(answer),
     });
 
-  test("adds a hand-off the keywords missed, even over an allow rule", async () => {
+  test("asks about a kind the keywords missed, even over an allow typed in Settings", async () => {
     expect(
       await decide({
         verdict: "proceed",
@@ -389,7 +654,27 @@ describe("the reviewer's safety classification", () => {
         safety: "payments",
         reason: "This submits a transfer.",
       }),
-    ).toMatchObject({ behaviour: "hand_off", source: "safety" });
+    ).toMatchObject({ behaviour: "ask", source: "safety", kind: "payments" });
+  });
+
+  test("hands off a kind the keywords missed, where the admin leaves that kind to the person", async () => {
+    const outcome = await decideAction({
+      ...base,
+      candidate: candidate({
+        toolRef: "mcp/bank/submit_form",
+        args: { form: "f1" },
+      }),
+      autoReview: true,
+      personal: [rule("allow", { toolRef: "*", kind: "payments" })],
+      actionKinds: { payments: "hand_off" },
+      model: model({
+        verdict: "proceed",
+        preApproved: true,
+        safety: "payments",
+        reason: "This submits a transfer.",
+      }),
+    });
+    expect(outcome).toMatchObject({ behaviour: "hand_off", source: "safety" });
   });
 
   test("cannot remove the keyword floor", async () => {
@@ -542,7 +827,7 @@ describe("auto-review", () => {
       ),
     });
     expect(calls[0]).toContain("<request>\nSend Sam my notes\n</request>");
-    expect(calls[0]).toContain('"tool": "mcp/gmail/send_email"');
+    expect(calls[0]).toContain('"tool": "mcp/gmail/create_label"');
   });
 });
 
@@ -618,6 +903,7 @@ function memoryStore(options: {
         enforceAutoReview: false,
         customRulesEnabled: true,
         hostCommandsCap: "allow",
+        actionKinds: {},
         ...options.team,
       }),
       setTeamSettings: async () => {
@@ -708,9 +994,10 @@ describe("the approval gate", () => {
   test("a hand-off is marked done by the person and is never executed for them", async () => {
     const { store, requests } = memoryStore({});
     const service = createApprovalService(store);
+    // A password typed on a website: the one thing always handed to the person.
     const paying = candidate({
-      toolRef: "computer_click",
-      args: { button: "Pay now" },
+      toolRef: "computer_type",
+      args: { field: "New password", text: "x" },
     });
     const suspended = await withApprovalContext(context, () =>
       service.gate(paying),

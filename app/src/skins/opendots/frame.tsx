@@ -18,7 +18,10 @@ import {
 import { type ReactNode, useEffect, useState } from "react";
 import AgentOrb from "@/components/agents/orb/agent-orb";
 import { BotsNavBadge } from "@/components/bot-profile/attention";
+import { NavigationTarget } from "@/components/edition/team-features-dialog";
+import { OpenBotVersion } from "@/components/layout/openbot-version";
 import { SelfHostBanner } from "@/components/layout/self-host-banner";
+import { UpdateBanner } from "@/components/layout/update-banner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,6 +41,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import { signOutMutationOptions } from "@/lib/auth/mutations";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { useSignOutOffered } from "@/lib/auth/sign-out-offered";
 import { setBotPausedMutationOptions } from "@/lib/bot-lifecycle/mutations";
 import { botLifecycleQueryOptions } from "@/lib/bot-lifecycle/queries";
 import { useChannelEvents } from "@/lib/channels/use-channel-events";
@@ -74,6 +78,7 @@ function RailUserMenu() {
   const user = useQuery(currentUserQueryOptions());
   const navigate = useNavigate();
   const signOut = useMutation(signOutMutationOptions(queryClient));
+  const signOutOffered = useSignOutOffered();
   if (!user.data) return null;
   return (
     <DropdownMenu>
@@ -93,20 +98,26 @@ function RailUserMenu() {
           <DropdownMenuLabel className="max-w-56 truncate">
             {user.data.name?.trim() || user.data.email}
           </DropdownMenuLabel>
+          {/* The rail draws only the avatar, so the version sits under the name here. */}
+          <OpenBotVersion className="-mt-1 max-w-56 px-1.5 pb-1 text-[10px] leading-3 text-muted-foreground" />
         </DropdownMenuGroup>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          className="gap-2 px-2 py-1.5"
-          disabled={signOut.isPending}
-          onClick={async () => {
-            await signOut.mutateAsync();
-            await navigate({ to: "/sign" });
-          }}
-          variant="destructive"
-        >
-          <IconLogout />
-          Sign out
-        </DropdownMenuItem>
+        {signOutOffered ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              className="gap-2 px-2 py-1.5"
+              disabled={signOut.isPending}
+              onClick={async () => {
+                await signOut.mutateAsync();
+                await navigate({ to: "/sign" });
+              }}
+              variant="destructive"
+            >
+              <IconLogout />
+              Sign out
+            </DropdownMenuItem>
+          </>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -124,10 +135,10 @@ function RailDestination({
   const Icon = item.icon;
   return (
     <RailTip label={item.label}>
-      <Link
+      <NavigationTarget
         aria-label={item.label}
         className={cn(railButton, "relative")}
-        to={item.to}
+        item={item}
       >
         <Icon />
         {item.id === "bots" && showBadge ? (
@@ -137,7 +148,7 @@ function RailDestination({
             <BotsNavBadge />
           </span>
         ) : null}
-      </Link>
+      </NavigationTarget>
     </RailTip>
   );
 }
@@ -154,7 +165,10 @@ function Rail({
   /** Whether the rail carries the Bots badge: at desktop width, where the rail is on screen. */
   showBadge: boolean;
 }) {
-  const navigation = useNavigationItems();
+  // OpenDots draws Routines itself, as its own screen just above, so not a second time from the list.
+  const navigation = useNavigationItems().filter(
+    (item) => item.id !== "routines",
+  );
   return (
     <nav
       aria-label="Workspace navigation"
@@ -435,6 +449,7 @@ export function OpenDotsFrame({ children }: { children: ReactNode }) {
           onToggleNav={() => setNavCollapsed((collapsed) => !collapsed)}
           place={place}
         />
+        <UpdateBanner />
         <SelfHostBanner />
         <div className="relative flex min-h-0 flex-1">
           <main

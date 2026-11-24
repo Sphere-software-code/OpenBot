@@ -8,6 +8,7 @@ import type { VisibleChatItem } from "../src/components/channels/chat-messages";
 import {
   dropRepeatedAppCards,
   groupToolSteps,
+  type StepDetails,
   stepDetails,
   summarise,
   ToolActivity,
@@ -66,6 +67,67 @@ test("adjacent connector calls fold into one row named after the first", () => {
     id: "group:search",
     steps: items.slice(0, 3),
   });
+});
+
+test("a subtask folds into the same line as the searches beside it, even though the app draws it", () => {
+  const subtask = call(
+    "subtask",
+    "run_subagent",
+    { task: "Find five logistics companies." },
+    JSON.stringify(
+      JSON.stringify({ answer: "Five companies.", threadId: "t", steps: 9 }),
+    ),
+  );
+  const items = [
+    subtask,
+    search(),
+    fetch(["https://a.example/1"]),
+    text("answer"),
+  ];
+  const grouped = groupToolSteps(items, () => true);
+  expect(grouped.map((item) => item.kind)).toEqual(["tools", "text"]);
+  const steps = items.slice(0, 3).map((item) => stepDetails(item as ToolItem));
+  expect(steps[0]).toMatchObject({
+    kind: "subtask",
+    label: "Subtask",
+    detail: "Find five logistics companies.",
+    output: "Five companies.",
+    failed: false,
+  });
+  expect(summarise(steps)).toBe(
+    "Searched the web, read 1 page and ran a subtask",
+  );
+  expect(
+    summarise([steps[0], steps[0]].filter((step) => step !== undefined)),
+  ).toBe("Ran 2 subtasks");
+});
+
+test("browsing one site names the site; pages on several sites are counted", () => {
+  const page = (id: string, href?: string): StepDetails => ({
+    id,
+    kind: "browser",
+    label: "Opened a page",
+    ...(href ? { href } : {}),
+    pending: false,
+    failed: false,
+    refused: false,
+    pages: 1,
+    inputs: [],
+  });
+  expect(summarise([page("a", "https://www.example.com/")])).toBe(
+    "Browsed example.com",
+  );
+  expect(
+    summarise([page("a", "https://gov.uk/a"), page("b", "https://gov.uk/b")]),
+  ).toBe("Browsed 2 pages on gov.uk");
+  expect(
+    summarise([
+      page("a", "https://a.example/"),
+      page("b", "https://b.example/"),
+    ]),
+  ).toBe("Browsed 2 pages");
+  // A page with no address on record is still counted.
+  expect(summarise([page("a")])).toBe("Browsed 1 page");
 });
 
 test("one connector call keeps its own line, and anything the app draws stays where it is", () => {
@@ -298,6 +360,53 @@ test("a refusal and a failure each count as an issue on the folded line", () => 
   expect(view.getByText("2 issues")).toBeDefined();
   expect(view.getByText("Blocked")).toBeDefined();
   expect(view.getByText("Didn't work")).toBeDefined();
+});
+
+test("the computer asking the Bot to look again after a handback never reaches the transcript", () => {
+  // The turn as it ran: the first page it opened was turned away, it looked, and opened it again.
+  const refusal = JSON.stringify({
+    ok: false,
+    reason: "Take a fresh browser snapshot after handback before acting.",
+    staleRefs: true,
+    snapshotRequired: true,
+  });
+  const url = "https://the-internet.herokuapp.com/login";
+  const items = [
+    call("open", "computer_navigate", { url }, refusal),
+    call("look", "computer_snapshot", {}, JSON.stringify({ elements: [] })),
+    call(
+      "again",
+      "computer_navigate",
+      { url },
+      JSON.stringify({ ok: true, url, title: "The Internet" }),
+    ),
+  ];
+  const grouped = groupToolSteps(items, drawn);
+  expect(grouped).toHaveLength(1);
+  const view = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ToolActivity group={grouped[0] as ToolGroup} active={false} />
+    </QueryClientProvider>,
+  );
+  expect(view.queryByText(/fresh browser snapshot/)).toBeNull();
+  expect(view.queryByText("Didn't work")).toBeNull();
+  expect(view.queryByText(/issue/)).toBeNull();
+  expect(view.getAllByText("Opened page")).toHaveLength(1);
+  expect(view.getByText("The Internet")).toBeDefined();
+
+  // A handback whose closing snapshot failed says so too, and is a failure the person sees.
+  const failed = call(
+    "back",
+    "computer_navigate",
+    { url },
+    JSON.stringify({
+      ok: false,
+      reason: "The assistant's computer could not be reached.",
+      handoffStatus: "completed",
+      snapshotRequired: true,
+    }),
+  );
+  expect(groupToolSteps([failed], drawn)).toHaveLength(1);
 });
 
 test("while running, the line names the step in progress; opened, a step shows its inputs", () => {

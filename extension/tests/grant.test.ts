@@ -10,10 +10,12 @@ import {
   type GrantVerdict,
   PASS_HINTS,
 } from "../src/offscreen/grant";
+import { reservePort } from "../../tests/support/reserved-port";
 
-const BUSY = "Intelligence is busy or unreachable. Retrying; nothing is lost.";
+const BUSY =
+  "OpenBot's backend is busy or unreachable. Retrying; nothing is lost.";
 const MARKETPLACE =
-  "Intelligence needs its marketplace licence before it can capture. Retrying; nothing is lost.";
+  "OpenBot's backend needs its marketplace licence before it can capture. Retrying; nothing is lost.";
 
 function body(status: number, code: string, message = "m") {
   return { status, body: { code, message } };
@@ -37,7 +39,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
     const r = TRAJECTORY_GATE_REFUSALS.invalidId;
     const v = park(classifyGrantError(r.status, r));
     expect(v.hint).toBe(
-      "Learning capture is off: the Recorder sent Intelligence a request it could not read.",
+      "Learning capture is off: the Recorder sent OpenBot's backend a request it could not read.",
     );
   });
 
@@ -94,7 +96,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
   test("row 6: IDENTITY_REQUIRED 401 is held, never signed-out", () => {
     const v = hold(classifyGrantError(401, { code: "IDENTITY_REQUIRED" }));
     expect(v.hint).toBe(
-      "Learning capture is paused: OpenBot could not tell Intelligence who you are.",
+      "Learning capture is paused: OpenBot could not tell its backend who you are.",
     );
   });
 
@@ -103,15 +105,15 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(503, { code: "INTELLIGENCE_RUNTIME_REQUIRED" }),
     );
     expect(v.hint).toBe(
-      "Learning capture is off: this OpenBot is not connected to Intelligence.",
+      "Learning capture is off: this OpenBot is not connected to its backend.",
     );
   });
 
-  test("row 8: could not connect to Intelligence is retried", () => {
+  test("row 8: could not connect to OpenBot's backend is retried", () => {
     const b = body(
       502,
       "CONNECTION_FAILED",
-      "Could not connect to Intelligence",
+      "Could not connect to OpenBot's back end",
     );
     expect(retry(classifyGrantError(b.status, b.body)).reason).toBe(BUSY);
   });
@@ -120,16 +122,17 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
     const b = body(
       502,
       "CONNECTION_FAILED",
-      "Intelligence returned an invalid trajectory connection grant",
+      "OpenBot's back end returned an invalid trajectory connection grant",
     );
     const v = hold(classifyGrantError(b.status, b.body));
     expect(v.hint).toBe(
-      "Learning capture is paused: Intelligence answered the capture pass in a form the Recorder cannot use.",
+      "Learning capture is paused: OpenBot's backend answered the capture pass in a form the Recorder cannot use.",
     );
   });
 
   test("row 10: a rejected request is retried on 5xx, 408 and 429 and held on any other 4xx", () => {
-    const message = "Intelligence rejected the trajectory connection request";
+    const message =
+      "OpenBot's backend rejected the trajectory connection request";
     expect(
       retry(classifyGrantError(503, { code: "CONNECTION_FAILED", message }))
         .reason,
@@ -146,7 +149,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(409, { code: "CONNECTION_FAILED", message }),
     );
     expect(v.hint).toBe(
-      "Learning capture is paused: Intelligence refused the capture pass (409).",
+      "Learning capture is paused: OpenBot's backend refused the capture pass (409).",
     );
   });
 
@@ -158,7 +161,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       expect(retry(classifyGrantError(503, body)).reason).toBe(BUSY);
       const v = hold(classifyGrantError(409, body));
       expect(v.hint).toBe(
-        "Learning capture is paused: Intelligence refused the capture pass (409).",
+        "Learning capture is paused: OpenBot's backend refused the capture pass (409).",
       );
     }
   });
@@ -168,7 +171,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(404, { code: "TRAJECTORIES_UNAVAILABLE" }),
     );
     expect(v.hint).toBe(
-      "Learning capture is off: Product Trajectories are turned off in Intelligence (FF_LEARNING_TRAJECTORIES).",
+      "Learning capture is off: Product Trajectories are turned off in OpenBot's backend (FF_LEARNING_TRAJECTORIES).",
     );
   });
 
@@ -177,14 +180,14 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(403, { code: "TRAJECTORIES_NOT_ENABLED" }),
     );
     expect(v.hint).toBe(
-      "Learning capture is paused: Intelligence says this organization's licence does not include Product Trajectories, that its billing is blocked, or that it could not check right now.",
+      "Learning capture is paused: OpenBot's backend says this organization's licence does not include Product Trajectories, that its billing is blocked, or that it could not check right now.",
     );
   });
 
   test("row 13: VALIDATION_ERROR is parked", () => {
     const v = park(classifyGrantError(400, { code: "VALIDATION_ERROR" }));
     expect(v.hint).toBe(
-      "Learning capture is off: Intelligence refused the recording's request.",
+      "Learning capture is off: OpenBot's backend refused the recording's request.",
     );
   });
 
@@ -193,7 +196,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(409, { code: "TRAJECTORY_APP_USER_CONFLICT" }),
     );
     expect(v.hint).toBe(
-      "Learning capture is off: Intelligence already holds this recording for someone else.",
+      "Learning capture is off: OpenBot's backend already holds this recording for someone else.",
     );
   });
 
@@ -202,7 +205,7 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
       classifyGrantError(404, { code: "LEARNING_CONTAINER_NOT_FOUND" }),
     );
     expect(v.hint).toBe(
-      "Learning capture is paused: Intelligence could not find your Learning space.",
+      "Learning capture is paused: OpenBot's backend could not find your Learning space.",
     );
   });
 
@@ -275,9 +278,18 @@ describe("classifyGrantError, one assertion per pass row of the table", () => {
     ).toEqual({ kind: "signed-out", reason: "revoked" });
   });
 
+  test("row 23b: a proxy's 407 is a few quick passes, not the five-minute hold of an unknown answer", () => {
+    // What the computer's egress filter answers a browser that does not hold its credentials yet.
+    expect(classifyGrantError(407, null)).toEqual({
+      kind: "proxy",
+      hint: "Learning capture is paused: this browser's network proxy has not let the capture pass through yet (407).",
+    });
+    expect(classifyGrantError(407, { code: "ANYTHING" }).kind).toBe("proxy");
+  });
+
   test("row 23: the gateway-policy sentence is fixed for the streamer's check", () => {
     expect(PASS_HINTS.GATEWAY_NOT_ALLOWED).toBe(
-      "Learning capture is off: the capture pass pointed at an Intelligence address your organization does not allow.",
+      "Learning capture is off: the capture pass pointed at a backend address your organization does not allow.",
     );
   });
 
@@ -394,6 +406,19 @@ describe("fetchGrant", () => {
     });
   });
 
+  test("the egress filter's own 407 is the proxy row (23b)", async () => {
+    // As agent-computer's filter answers it (egress.ts), with no body.
+    respond = () =>
+      new Response(null, {
+        status: 407,
+        headers: {
+          "proxy-authenticate": 'Basic realm="OpenBot"',
+          "content-type": "text/plain",
+        },
+      });
+    expect((await failure()).kind).toBe("proxy");
+  });
+
   test("a 200 that is not a grant is held (row 23a)", async () => {
     respond = () => Response.json({ ok: true });
     expect((await failure()).kind).toBe("hold");
@@ -410,13 +435,7 @@ describe("fetchGrant", () => {
   });
 
   test("an unreachable OpenBot retries (row 21)", async () => {
-    const dead = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () => new Response(""),
-    });
-    const url = `http://127.0.0.1:${dead.port}`;
-    dead.stop(true);
+    const url = `http://127.0.0.1:${await reservePort()}`;
     try {
       await fetchGrant({ openbotUrl: url, token: "t" }, id);
       throw new Error("did not fail");

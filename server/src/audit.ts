@@ -1,3 +1,4 @@
+import { currentApprovalContext } from "@openbot/toolkit/continuation";
 import type { AuditInitiator } from "@openbot/toolkit/initiator";
 import {
   and,
@@ -6,11 +7,23 @@ import {
   getTableColumns,
   gt,
   inArray,
+  isNull,
   lt,
+  ne,
+  notInArray,
   or,
+  type SQL,
   sql,
 } from "drizzle-orm";
 import type { PgColumn } from "drizzle-orm/pg-core";
+import {
+  actorCondition,
+  appCondition,
+  effectCondition,
+  intentCondition,
+  ruleCondition,
+  toolCondition,
+} from "./audit-filters";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
 import { parsePageLimit } from "./paging";
@@ -112,6 +125,17 @@ export const auditEventTypes = [
    * endpoint that dies mid-answer from one that never answers at all.
    */
   "agent.stream_stalled",
+  /**
+   * A built-in Bot's run refused before its model call, because it would have sent more tools than
+   * the model accepts in one request (Chat Completions: 128).
+   *
+   * The person is told in the run; this is for the admin, who is the one who can fix it and the one
+   * who would otherwise never hear of it. Rare since tool search: an app's tools wait behind a
+   * search and are not counted, so this fires only when what a Bot needs on every step is itself
+   * past the limit. Payload: `bot`, `tools` (what the run would have sent, including the runtime's
+   * and the client's own), `limit`, `provider`.
+   */
+  "agent.tool_limit_refused",
   /*
    * Which of a Bot's tools were put in front of the model for one run, and why those.
    *
@@ -179,6 +203,8 @@ export const auditEventTypes = [
    * was current when it was made. The client id, never the secret.
    */
   "mcp.oauth_client_registered",
+  /** A Connect attempt could not read the deployment's client. No credential or raw fault is recorded. */
+  "mcp.oauth_client_read_failed",
   /*
    * One person's brokered account was exercised with a real call, to see whether it is really there.
    *
@@ -298,6 +324,26 @@ export const auditEventTypes = [
    */
   "app_access.owner_granted",
   "app_access.owner_revoked",
+  /**
+   * An admin described what one Bot may do in one app, and the deployment's model chose the app's
+   * actions for it (plugins/grant-translate.ts).
+   *
+   * Nothing changed: the set is a draft until the admin saves it, and the save is its own
+   * `plugin.grants_changed` row. This one answers "who asked for these actions, in what words, and
+   * what came back", including a set that never checked and a request no model was set up to answer.
+   * Target the app; payload `actor`, `bot`, `app`, `text` (the admin's words), `outcome` (`written`,
+   * `did_not_check`, `no_model` or `model_failed`), and when actions came back `grants`, `otherApps`,
+   * `summary`, `explanation`, `warning`, `checked`, `attempts` and, for a set that did not check,
+   * `error`.
+   */
+  "plugin.grants_translated",
+  /**
+   * A change to one Bot's actions on one app, saved together. Each action turned on or off also has
+   * its own `plugin_granted` / `plugin_revoked` row; this one says they were one decision, by whom,
+   * and, when the set was chosen from a description, the sentence. Target the app; payload `actor`,
+   * `app`, `bot`, `added` and `removed` (refs), and `authoring` (`{ source: "english", text }`).
+   */
+  "plugin.grants_changed",
   // Every action a Bot takes on its computer, allowed or refused. Both, always: a trail that records
   // only what was permitted cannot answer whether the Bot tried.
   "computer.action_allowed",
@@ -355,6 +401,31 @@ export const auditEventTypes = [
    */
   "computer.policy_loaded",
   /**
+   * An admin saved the boundary: added a rule, removed one, or switched trial mode.
+   *
+   * The policy table holds only the current rules and who saved them last, and the trail recorded the
+   * boundary only at start-up, so "who added the rule that stopped this, and when" had no answer, and
+   * nor did "what did the boundary say last Tuesday". Every save writes one, even one that changed
+   * nothing, because the save itself is the event.
+   *
+   * Payload: `by` (the admin's address), `added` and `removed` (each `{ list, rule, name? }`, where
+   * `list` is `deny` or `allow` and `name` is the rule's label), `mode` (`{ before, after }`), the
+   * whole policy `before` and `after`, and `authoring` (`{ source: "english", text }`) when the rule
+   * was written from a sentence in plain English, with the sentence.
+   */
+  "computer.policy_changed",
+  /**
+   * An admin described a boundary in English and the deployment's model wrote it as a rule.
+   *
+   * Nothing changed: the rule is a draft until the admin saves it, and the save is its own row. This
+   * one answers "who asked for this rule, in what words, and what came back", including a rule that
+   * never compiled and a request no model was set up to answer. Target `policy`; payload `actor`,
+   * `text` (the admin's words), `outcome` (`written`, `did_not_compile`, `no_model` or
+   * `model_failed`), and when a rule came back `rule`, `effect`, `summary`, `explanation`, `warning`,
+   * `compiled`, `attempts` and, for one that did not compile, `error`.
+   */
+  "computer.policy_translated",
+  /**
    * Whether this deployment gives each Bot a computer of its own, said out loud at boot.
    *
    * Without a supervisor every Bot shares one browser, which is a legitimate way to run on a laptop
@@ -400,6 +471,8 @@ export const auditEventTypes = [
   "component.published",
   "component.unpublished",
   "component.draft_saved",
+  // A build's own description, replaced by a newer build's where nobody here had edited it.
+  "component.description_updated",
   "component.refused",
 
   /*
@@ -433,6 +506,32 @@ export const auditEventTypes = [
    * it, under which filter, belongs on it too.
    */
   "audit.exported",
+  /**
+   * An admin asked the trail a question in plain English, and the deployment's model turned it into
+   * filters (`audit-ask.ts`).
+   *
+   * Nothing changed and nothing left: the answer is the trail's own rows under those filters, drawn
+   * on the admin's screen. Recorded because a question names what somebody went looking for, and the
+   * filters say what they were shown. Target `audit_trail`; payload `actor`, `question`, `outcome`
+   * (`answered`, `partly_answered`, `unanswerable`, `not_valid`, `no_model` or `model_failed`), and
+   * when there was an answer `filters`, `reading`, `unanswered` and `attempts`; `problems` when the
+   * model's filters could not be used.
+   */
+  "audit.asked",
+  /**
+   * An admin asked what would happen if a Bot took an action, in plain English, and the deployment's
+   * model read it as one action (`what-if.ts`). Nothing changed. Target `governance`; payload
+   * `actor`, `question`, `outcome` (`parsed`, `unclear`, `not_valid`, `no_model` or `model_failed`),
+   * and `action` and `attempts` when it was read; `problems` when it couldn't be.
+   */
+  "what_if.asked",
+  /**
+   * An admin checked what OpenBot's controls decide about one action: one they confirmed from a
+   * question (`from: "question"`), or an audit row's (`from: "audit_row"`, with `eventId`, for "Why
+   * did this happen?"). Nothing changed. Target `governance`; payload `actor`, `action`, `outcome`
+   * and `decidedBy`, the control that settled it.
+   */
+  "what_if.checked",
   /*
    * Getting in, and being turned away.
    *
@@ -563,18 +662,77 @@ export const auditEventTypes = [
   "approval.evaluated",
   "approval.person_decided",
   "approval.withdrawn",
+  /*
+   * A rule change carries who made it (the row's actor) and, for a team rule, the team rules `before`
+   * and `after`. Rules saved together from a description are one row, targeted `team`, with `added`
+   * and `authoring` (`{ source: "english", text }`).
+   */
   "approval.rule_changed",
   "approval.settings_changed",
+  /**
+   * An admin described team approval rules in English and the deployment's model wrote them as rule
+   * rows (approvals/rule-translate.ts).
+   *
+   * Nothing changed: the rows are a draft until the admin saves them, and the save is its own
+   * `approval.rule_changed` row. This one answers "who asked for these rules, in what words, and what
+   * came back", including rows that never checked and a request no model was set up to answer.
+   * Target `approval_rule`; payload `actor`, `text` (the admin's words), `outcome` (`written`,
+   * `did_not_check`, `no_model` or `model_failed`), and when rows came back `rules`, `summary`,
+   * `explanation`, `warning`, `checked`, `attempts` and, for rows that did not check, `error`.
+   */
+  "approval.rules_translated",
+  /**
+   * An admin saved guidance for auto-review, or removed it (approvals/reviewer-guidance.ts). The
+   * reviewer reads it with every action it reviews, below the built-in safety requirements.
+   * Target `approval_settings` `team`; payload `actor`, `change` (`saved` or `removed`), `before` and
+   * `after` (the guidance either side, null for none), and on a save `reading`: `summary` and
+   * `explanation`, the independent reading of the words the admin saw before saving.
+   */
+  "approval.guidance_changed",
   /*
    * Enterprise controls (server/src/admin). Every switch an administrator flips is on the trail with
    * who flipped it, because the table only holds the current answer.
+   *
+   * `capability.changed` is one switch: `scopeKind`, `scopeId`, `capability`, `allowed`, `by`.
+   * Switches saved together from a description (admin/capability-translate.ts) are one row each, and
+   * each also carries `before` (the switch's value, null when unset), `batch` (one id for the save)
+   * and `authoring` (`{ source: "english", text }`).
    */
   "capability.changed",
+  /**
+   * An admin described a permission change in English and the deployment's model wrote it as switch
+   * changes (admin/capability-translate.ts).
+   *
+   * Nothing changed: the changes are a draft until the admin saves them, and the save is its own
+   * `capability.changed` rows. This one answers "who asked for this change, in what words, and what
+   * came back", including changes that never checked and a request no model was set up to answer.
+   * Target `capability`; payload `actor`, `text` (the admin's words), `outcome` (`written`,
+   * `did_not_check`, `no_model` or `model_failed`), and when changes came back `changes`, `summary`,
+   * `explanation`, `warning`, `checked`, `attempts` and, for changes that did not check, `error`.
+   */
+  "capability.changes_translated",
   "enterprise.setting_changed",
   // Turning SSO-required on ended the sessions made before it.
   "auth.sessions_revoked",
+  /*
+   * A save carries the scope, the mode, the rules and who saved it, and `authoring`
+   * (`{ source: "english", text }`) when the list was written from a sentence in plain English.
+   */
   "network_policy.changed",
   "network_policy.removed",
+  /**
+   * An admin described the network allowlist in English and the deployment's model wrote it as
+   * entries (admin/network-translate.ts).
+   *
+   * Nothing changed: the list is a draft until the admin saves it, and the save is its own
+   * `network_policy.changed` row. This one answers "who asked for this list, in what words, and what
+   * came back", including a list that never parsed and a request no model was set up to answer.
+   * Target `network_policy`; payload `actor`, `text` (the admin's words), `outcome` (`written`,
+   * `did_not_parse`, `no_model` or `model_failed`), and when a list came back `mode`, `rules`,
+   * `summary`, `reachable`, `explanation`, `warning`, `parsed`, `attempts` and, for one that did not
+   * parse, `error`.
+   */
+  "network_policy.translated",
   /*
    * Somebody named in INITIAL_ADMIN_EMAILS signing in with a social provider while SSO is required.
    * Allowed, so a broken identity provider cannot lock the deployment out, and loud: it is the one
@@ -668,6 +826,10 @@ export const auditEventTypes = [
   /* A person opened one of their own learned Skills to every Bot, or closed it again. Target and payload `skill`. */
   "learning.skill_opened",
   "learning.skill_closed",
+  /* A person asked an admin to share a Skill they approved themselves. Target and payload `skill`. */
+  "learning.sharing_requested",
+  /* An admin answered such a request. Target `skill`; payload `skill`, `userId` and `decision`, `approved` or `declined`. */
+  "learning.sharing_decided",
 ] as const;
 
 export type AuditEventType = (typeof auditEventTypes)[number];
@@ -755,11 +917,46 @@ export type AuditEventQuery = {
    * and a filter that returns only the first quietly hides two thirds of the refusals.
    */
   eventType?: string;
+  /**
+   * Types to leave out, separated by commas: what the personal edition's Activity does not show
+   * (`app/src/lib/audit/outcome.ts`), asked of the server so a page of 50 is 50 rows a person reads.
+   */
+  excludeEventType?: string;
+  /**
+   * Tools whose successful calls to leave out, separated by commas: a call whose change is recorded
+   * on its own row (`CALLS_RECORDED_AS_CHANGES` in `@openbot/shared/activity-rows`). A call that
+   * failed is kept.
+   */
+  excludeCalls?: string;
   actorUserId?: string;
   /** One kind, or several separated by commas, the way `eventType` takes several. */
   initiatorKind?: string;
+  /** One target type, or several separated by commas, the way `eventType` takes several. */
   targetType?: string;
   targetId?: string;
+  /**
+   * One Bot's rows, or several Bots' separated by commas: what each did (`payload.bot`) and what was
+   * done to it (an `agent` target), the same two the audit page's Bot column reads. Asked of the server, so a Bot's actions older than
+   * the newest page are found too. A folder given to a Bot before its row said `bot` named it as
+   * `botId`, and is that Bot's row too.
+   */
+  bot?: string;
+  /**
+   * App calls (`mcp.call_*`) to these apps, separated by commas, matched by `appKey` so
+   * `composio-gmail`, `arcade-Gmail` and `gmail` are one app. See `audit-filters.ts`.
+   */
+  app?: string;
+  /** App calls of these tools, separated by commas, by the name the row records, in any case. */
+  tool?: string;
+  /** App calls that only read (`read`) or change something (`write`). */
+  effect?: string;
+  /**
+   * What an action did, separated by commas, in the boundary's own words (`run_command`,
+   * `navigate`, `write_tool`), derived from the row's tool and key as the gateway derives it.
+   */
+  intent?: string;
+  /** Refusals by this boundary rule, its text exactly as recorded. One: a rule can hold commas. */
+  rule?: string;
   from?: string;
   to?: string;
 };
@@ -839,6 +1036,12 @@ function initiatorColumns(initiator: AuditInitiator | undefined) {
 
 /** One row as written, handed to anything that streams the trail elsewhere. */
 export type AuditTapEvent = {
+  /** Persisted row identity, stable across analytics delivery attempts. */
+  id?: string;
+  createdAt?: Date;
+  /** Trusted native/headless action scope; never read from an analytics client. */
+  runId?: string;
+  threadId?: string;
   eventType: string;
   targetType: string;
   targetId?: string;
@@ -871,10 +1074,18 @@ export function createAuditStore(database: Database): AuditStore {
         ...initiatorColumns(initiator),
         payload: redactAuditPayload(event.payload) as Record<string, unknown>,
       };
-      await database.insert(auditEvents).values(row);
+      const [persisted] = await database
+        .insert(auditEvents)
+        .values(row)
+        .returning({ id: auditEvents.id, createdAt: auditEvents.createdAt });
       for (const tap of auditTaps) {
         try {
-          tap(row);
+          const run = currentApprovalContext();
+          tap({
+            ...row,
+            ...persisted,
+            ...(run ? { runId: run.runId, threadId: run.threadId } : {}),
+          });
         } catch (error) {
           console.error(
             JSON.stringify({
@@ -1004,6 +1215,49 @@ function matchesRequested(column: PgColumn, values: string[] | undefined) {
   return inArray(column, [first, ...rest]);
 }
 
+/** Leaves out the successful calls of these tools. Naming nothing leaves out nothing. */
+function notSucceededCall(tools: string[] | undefined) {
+  return tools && tools.length > 0
+    ? or(
+        ne(auditEvents.eventType, "mcp.call_succeeded"),
+        isNull(auditEvents.targetId),
+        notInArray(auditEvents.targetId, tools),
+      )
+    : undefined;
+}
+
+/** The condition a set to leave out puts on a column. Naming nothing leaves out nothing. */
+function notRequested(column: PgColumn, values: string[] | undefined) {
+  return values && values.length > 0 ? notInArray(column, values) : undefined;
+}
+
+/**
+ * The rows of any of these Bots: what each did (`payload.bot`) and what was done to it. A folder
+ * given to a Bot before its row said `bot` named it as `botId`, and a routine is its Bot's,
+ * whoever made it.
+ */
+function botCondition(bots: string[] | undefined) {
+  if (!bots) return undefined;
+  if (bots.length === 0) return sql`false`;
+  const named = (column: SQL<string>) =>
+    bots.length === 1 ? eq(column, bots[0] as string) : inArray(column, bots);
+  return or(
+    named(sql<string>`${auditEvents.payload} ->> 'bot'`),
+    and(
+      eq(auditEvents.targetType, "agent"),
+      named(sql<string>`${auditEvents.targetId}`),
+    ),
+    and(
+      eq(auditEvents.targetType, "host_access"),
+      named(sql<string>`${auditEvents.payload} ->> 'botId'`),
+    ),
+    and(
+      eq(auditEvents.targetType, "routine"),
+      named(sql<string>`${auditEvents.payload} ->> 'agentId'`),
+    ),
+  );
+}
+
 export function createAuditReader(database: Database): AuditReader {
   return {
     list: async (query) => {
@@ -1012,17 +1266,27 @@ export function createAuditReader(database: Database): AuditReader {
           auditEvents.eventType,
           requestedValues(query.eventType),
         ),
-        query.actorUserId
-          ? eq(auditEvents.actorUserId, query.actorUserId)
-          : undefined,
+        notRequested(
+          auditEvents.eventType,
+          requestedValues(query.excludeEventType),
+        ),
+        notSucceededCall(requestedValues(query.excludeCalls)),
+        actorCondition(query.actorUserId),
         matchesRequested(
           auditEvents.initiatorKind,
           requestedValues(query.initiatorKind),
         ),
-        query.targetType
-          ? eq(auditEvents.targetType, query.targetType)
-          : undefined,
+        matchesRequested(
+          auditEvents.targetType,
+          requestedValues(query.targetType),
+        ),
         query.targetId ? eq(auditEvents.targetId, query.targetId) : undefined,
+        botCondition(requestedValues(query.bot)),
+        appCondition(requestedValues(query.app)),
+        toolCondition(requestedValues(query.tool)),
+        effectCondition(query.effect?.trim()),
+        intentCondition(requestedValues(query.intent)),
+        ruleCondition(query.rule),
         query.from
           ? gt(auditEvents.createdAt, new Date(query.from))
           : undefined,
@@ -1122,10 +1386,18 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     cursor,
     limit,
     eventType: optional("eventType"),
+    excludeEventType: optional("excludeEventType"),
+    excludeCalls: optional("excludeCalls"),
     actorUserId: optional("actorUserId"),
     initiatorKind: optional("initiatorKind"),
     targetType: optional("targetType"),
     targetId: optional("targetId"),
+    bot: optional("bot"),
+    app: optional("app"),
+    tool: optional("tool"),
+    effect: optional("effect"),
+    intent: optional("intent"),
+    rule: optional("rule"),
     from,
     to,
   };

@@ -1,8 +1,14 @@
-import { IconPin, IconPinnedOff, IconTrash } from "@tabler/icons-react";
+import {
+  IconPencil,
+  IconPin,
+  IconPinnedOff,
+  IconTrash,
+} from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { memo, useState } from "react";
 import { DeleteConversationDialog } from "@/components/channels/delete-conversation-dialog";
+import { RenameConversationDialog } from "@/components/channels/rename-conversation-dialog";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -18,17 +24,19 @@ import { ChannelItemContent } from "./channel-item-content";
  * Memoized roster row. `use-channel-events` preserves unchanged row identity, and
  * `content-visibility` keeps off-screen rows cheap without virtualization.
  *
- * Right-click opens Pin and Delete. Deleting is confirmed in a dialog that names the channel,
- * because the row it was invoked on is one of several identical-looking rows.
+ * Right-click opens Pin, Rename and Delete. Rename is offered only to the person who started the
+ * conversation, which is who the server lets rename it. Deleting is confirmed in a dialog that
+ * names the channel, because the row it was invoked on is one of several identical-looking rows.
  */
 export const Channel = memo(function Channel({
   channelId,
   participantIds,
   name,
   summary,
-  lastMessage,
+  untitled,
   lastMessageAt,
   pinned,
+  canRename,
   unread,
   busy,
   emphasis,
@@ -38,10 +46,12 @@ export const Channel = memo(function Channel({
   name: string;
   /** What the conversation is about, once named. The channel name only says which Bot it is. */
   summary?: string;
-  /** Used as the thread title until the conversation has been named. */
-  lastMessage?: string;
+  /** Used as the thread title until the conversation has been named. See `untitledLine`. */
+  untitled?: string;
   lastMessageAt?: string;
   pinned: boolean;
+  /** Whether this person started the conversation, and so may rename it. The server's answer. */
+  canRename: boolean;
   unread: boolean;
   busy: boolean;
   emphasis: MessageListEmphasis;
@@ -57,9 +67,10 @@ export const Channel = memo(function Channel({
   });
   /* Types in only on arrival; an already-named row draws it outright. */
   const revealed = useTypedReveal(summary);
-  const threadTitle = revealed.text || lastMessage || "New conversation";
+  const threadTitle = revealed.text || untitled || "New conversation";
   const setPinned = useMutation(setChannelPinnedMutationOptions(queryClient));
   const [confirming, setConfirming] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   /**
    * Why a pin did not take, said on the row it was asked of.
    *
@@ -83,7 +94,7 @@ export const Channel = memo(function Channel({
             }
             params={{ channelId }}
             type="button"
-            className="flex flex-row py-2 px-2 gap-2 items-center w-full hover:bg-foreground/5 rounded-lg [contain-intrinsic-size:auto_3.25rem] [content-visibility:auto]"
+            className="flex flex-row py-2 px-2.5 gap-2 items-center w-full hover:bg-foreground/5 rounded-lg [contain-intrinsic-size:auto_3.25rem] [content-visibility:auto]"
             activeProps={{
               className: "bg-foreground/5",
             }}
@@ -91,7 +102,7 @@ export const Channel = memo(function Channel({
             <ChannelItemContent
               participantIds={participantIds}
               name={name}
-              title={summary || lastMessage || "New conversation"}
+              title={summary || untitled || "New conversation"}
               displayedTitle={threadTitle}
               lastMessageAt={lastMessageAt}
               emphasis={emphasis}
@@ -115,6 +126,12 @@ export const Channel = memo(function Channel({
             {pinned ? <IconPinnedOff /> : <IconPin />}
             {pinned ? "Unpin conversation" : "Pin conversation"}
           </ContextMenuItem>
+          {canRename ? (
+            <ContextMenuItem onClick={() => setRenaming(true)}>
+              <IconPencil />
+              Rename conversation…
+            </ContextMenuItem>
+          ) : null}
           <ContextMenuItem
             variant="destructive"
             onClick={() => setConfirming(true)}
@@ -129,6 +146,12 @@ export const Channel = memo(function Channel({
           {pinProblem}
         </p>
       ) : null}
+      <RenameConversationDialog
+        channelId={channelId}
+        onOpenChange={setRenaming}
+        open={renaming}
+        title={summary || untitled || ""}
+      />
       <DeleteConversationDialog
         channelId={channelId}
         // Away first when this row's channel is the one on screen.

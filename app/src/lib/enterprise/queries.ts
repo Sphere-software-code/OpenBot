@@ -12,7 +12,8 @@ export type CapabilityKey =
   | "slackTeams"
   | "teamBots"
   | "ownerApps"
-  | "isolatedComputers";
+  | "isolatedComputers"
+  | "proactive";
 
 /** One switch as the server stored it at each scope. `null` means no row: the scope inherits. */
 export type CapabilitySetting = {
@@ -25,8 +26,9 @@ export type CapabilitySetting = {
   groups: Record<string, boolean>;
 };
 
+/** One allowlist entry. Either kind can name ports (`443`, `5432,8000-8100`); without them, every port. */
 export type EgressRule =
-  | { type: "domain"; value: string }
+  | { type: "domain"; value: string; ports?: string }
   | { type: "cidr"; value: string; ports?: string };
 
 export type NetworkMode =
@@ -52,6 +54,10 @@ export type EnterpriseSettings = {
   mcpAllowlist: { enabled: boolean; servers: string[] };
   /** People may open the Skills learned from their recordings to every Bot. Off by default. */
   skillSharing: boolean;
+  /** How many check-ins each Bot may run for one person in a day. 24 by default. */
+  proactiveDailyRuns: number;
+  /** People may pick the model a built-in Bot answers on, per conversation. Off by default. */
+  modelSelection: boolean;
 };
 
 export type EnterpriseOverview = {
@@ -101,13 +107,125 @@ export type ActionRecord = {
   createdAt: string;
 };
 
+/** Why a check-in stopped before the model. */
+export type CheckInSkipReason =
+  | "off_admin"
+  | "off_person"
+  | "paused"
+  | "capped"
+  | "unreachable"
+  | "no_sources"
+  | "busy";
+
+/**
+ * One Bot's check-ins over the window, as the admin's Check-ins page reads them. Counts only: the
+ * server sends no titles and no people.
+ *
+ * `items` are the ones raised in the window, by where each stands now, so `raised` is the sum of the
+ * other four. `acceptance` is started out of started and hidden, null until somebody answered one.
+ */
+export type BotCheckInMetrics = {
+  agentId: string;
+  name: string;
+  avatarSeed: string;
+  /** People whose check-ins with this Bot are on now. */
+  peopleOn: number;
+  runs: {
+    quiet: number;
+    raised: number;
+    failed: number;
+    skipped: Record<CheckInSkipReason, number>;
+  };
+  items: {
+    raised: number;
+    started: number;
+    hidden: number;
+    cleared: number;
+    open: number;
+  };
+  acceptance: number | null;
+  /** This Bot's items that a ping carried. */
+  pinged: number;
+};
+
+export type CheckInMetrics = {
+  days: 7 | 30;
+  /** The daily cap in force. */
+  dailyRuns: number;
+  bots: BotCheckInMetrics[];
+  /** One ping folds every Bot's items for a person, so pings are counted for everybody at once. */
+  pings: { sent: number; itemsPerPing: number | null };
+};
+
 export const enterpriseKeys = {
   all: ["enterprise"] as const,
   overview: () => ["enterprise", "overview"] as const,
   modelUsage: (days: number) =>
     ["enterprise", "model-usage", { days }] as const,
   actions: () => ["enterprise", "actions"] as const,
+  /*
+   * Under the enterprise root although the route is `/api/admin/proactive`: who has check-ins on and
+   * the cap in force both move when a switch or a setting is saved, and every enterprise write
+   * invalidates this root.
+   */
+  checkIns: (days: 7 | 30) => ["enterprise", "check-ins", { days }] as const,
+  /* Under the root, so saving a policy, which changes the one in force, asks the replay again. */
+  networkReplay: (candidate: NetworkCandidate) =>
+    ["enterprise", "network-replay", candidate] as const,
 };
+
+/** A network policy as the dialog holds it, not yet saved. */
+export type NetworkCandidate = {
+  scopeKind: "organization" | "group";
+  scopeId: string;
+  mode: NetworkMode;
+  rules: EgressRule[];
+  locked: boolean;
+};
+
+/** One host whose page visits a candidate decides differently from the policy in force. */
+export type NetworkReplayHost = {
+  host: string;
+  /** "block": allowed today, blocked by the candidate. "allow": the other way round. */
+  change: "block" | "allow";
+  visits: number;
+  /** The Bots that made them, by id. */
+  bots: string[];
+  lastVisit: string;
+};
+
+/**
+ * Recent page visits replayed under a candidate network policy, beside the policy in force.
+ * `covered` is the visits by Bots the candidate would apply to; `undecided` is visits to a named host
+ * that only an IP range could allow, which the computer decides with an address the trail doesn't keep.
+ */
+export type NetworkReplayReport = {
+  scanned: number;
+  covered: number;
+  wouldBlock: number;
+  wouldAllow: number;
+  undecided: number;
+  unchanged: number;
+  /** Capped by the server; the counts cover every visit, and `sites` every site. */
+  hosts: NetworkReplayHost[];
+  sites: number;
+};
+
+/**
+ * What a network policy would change, over the page visits on the trail. Writes nothing. A list the
+ * save would refuse is refused here too, with the parser's sentence.
+ */
+export function networkReplayQueryOptions(candidate: NetworkCandidate) {
+  return queryOptions({
+    queryKey: enterpriseKeys.networkReplay(candidate),
+    queryFn: (): Promise<NetworkReplayReport> =>
+      client("/api/admin/enterprise/network/replay", "report", {
+        method: "POST",
+        body: candidate,
+        fallback: "Couldn't check this list against recent page visits.",
+      }),
+  });
+}
 
 export function enterpriseOverviewQueryOptions() {
   return queryOptions({
@@ -131,6 +249,18 @@ export function modelUsageQueryOptions(days = 30) {
       (
         await client(`/api/admin/enterprise/models/usage?days=${days}`, {
           fallback: "Could not load model usage",
+        })
+      ).json(),
+  });
+}
+
+export function checkInMetricsQueryOptions(days: 7 | 30) {
+  return queryOptions({
+    queryKey: enterpriseKeys.checkIns(days),
+    queryFn: async (): Promise<CheckInMetrics> =>
+      (
+        await client(`/api/admin/proactive?days=${days}`, {
+          fallback: "Couldn't load check-ins",
         })
       ).json(),
   });
@@ -166,7 +296,7 @@ export function myCapabilitiesQueryOptions() {
     queryFn: async (): Promise<MyCapabilities> =>
       (
         await client("/api/admin/enterprise/me", {
-          fallback: "Could not load what this deployment allows",
+          fallback: "Couldn't load what OpenBot allows.",
         })
       ).json(),
   });

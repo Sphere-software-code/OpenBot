@@ -32,7 +32,14 @@ import {
   updateApprovalRuleMutationOptions,
 } from "@/lib/approvals";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
 import { queryClient } from "@/query-client";
+import {
+  ALWAYS_ASKS,
+  ASK_FIRST_DESCRIPTION,
+  ASK_FIRST_TITLE,
+  HANDED_TO_YOU,
+} from "./ask-first-copy";
 import { HOST_LABELS, LabelSelect, RuleForm, RuleRow } from "./rules";
 
 /**
@@ -43,6 +50,9 @@ import { HOST_LABELS, LabelSelect, RuleForm, RuleRow } from "./rules";
 export function ApprovalSettings() {
   const inbox = useQuery(approvalInboxOptions());
   const me = useQuery(currentUserQueryOptions()).data;
+  // The personal edition has no Admin to point at, and no team for team settings to govern.
+  const personal =
+    useQuery(deploymentCapabilitiesQueryOptions()).data?.edition === "personal";
   const agents = useQuery(agentListQueryOptions());
   const hiddenAgents = useQuery(agentListQueryOptions(true));
   const preferences = useMutation(
@@ -83,7 +93,7 @@ export function ApprovalSettings() {
           {error.message}
         </p>
       ) : null}
-      {me?.role === "admin" ? (
+      {me?.role === "admin" && !personal ? (
         <p className="mt-6 text-muted-foreground text-sm">
           Team settings and shared account requests are in{" "}
           <Link className="underline underline-offset-4" to="/admin/approvals">
@@ -92,21 +102,37 @@ export function ApprovalSettings() {
           .
         </p>
       ) : null}
-      <PageSection title="Before a Bot acts">
+      <PageSection
+        description={
+          /*
+           * What asks whatever these settings say (server/src/approvals/policy.ts), in the same words
+           * as onboarding's Welcome (ask-first-copy.ts). A Bot's own workspace is left out of what
+           * always asks on purpose: deleting a file there is an ordinary change, as the last sentence
+           * says.
+           */
+          <>
+            {ALWAYS_ASKS} They also ask before every edit or command in a folder
+            on your own computer. {HANDED_TO_YOU} Bots can create, edit, and
+            delete files in their own workspace without asking, unless your
+            settings or rules say so.
+          </>
+        }
+        title="Before a Bot acts"
+      >
         <PageRows>
           <Item size="sm">
             <ItemMedia variant="icon">
               <IconHandStop />
             </ItemMedia>
             <ItemContent>
-              <ItemTitle>Ask before making changes</ItemTitle>
-              <ItemDescription>
-                Review a Bot's changes to websites, connected apps, and files.
+              <ItemTitle>{ASK_FIRST_TITLE}</ItemTitle>
+              <ItemDescription className="line-clamp-none">
+                {ASK_FIRST_DESCRIPTION}
               </ItemDescription>
             </ItemContent>
             <ItemActions>
               <Switch
-                aria-label="Ask before making changes"
+                aria-label={ASK_FIRST_TITLE}
                 checked={inbox.data?.enabled ?? false}
                 disabled={inbox.isLoading || preferences.isPending}
                 onCheckedChange={(enabled) => preferences.mutate({ enabled })}
@@ -183,8 +209,8 @@ export function ApprovalSettings() {
         description={
           <>
             The strictest matching rule wins. An "ask" rule beats an "allow"
-            rule. Team rules are locked. Passwords, security settings and
-            payments are always handed to you. Rules for one Bot are on{" "}
+            rule.{personal ? " " : " Team rules are locked. "}Rules for one Bot
+            are on{" "}
             <Link className="underline underline-offset-4" to="/bots">
               that Bot's page
             </Link>

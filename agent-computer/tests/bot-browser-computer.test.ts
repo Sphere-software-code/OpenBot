@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { reservePort } from "../../tests/support/reserved-port";
 import type { BotBrowserState } from "../../shared/bot-browser";
 import type { ComputerControlState } from "../../shared/computer-control";
 import type { LauncherConnection } from "../../shared/openbot-browser";
@@ -55,23 +56,11 @@ let root = "";
 let site: ReturnType<typeof Bun.serve> | undefined;
 let origin = "";
 
-async function freePort(): Promise<number> {
-  const probe = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: () => new Response(),
-  });
-  const { port } = probe;
-  await probe.stop(true);
-  if (port === undefined) throw new Error("The port probe did not listen.");
-  return port;
-}
-
 async function startComputer(
   name: string,
   env: Record<string, string>,
 ): Promise<Computer> {
-  const port = await freePort();
+  const port = await reservePort();
   const base = `http://127.0.0.1:${port}`;
   const child = Bun.spawn([process.execPath, "src/index.ts"], {
     cwd: join(import.meta.dir, ".."),
@@ -87,7 +76,8 @@ async function startComputer(
       WORKSPACE_DIR: join(root, name, "workspace"),
       ...env,
     },
-    stdout: "ignore",
+    // The computer's log, beside the test that failed: it says what the answer to the test leaves out.
+    stdout: "inherit",
     stderr: "inherit",
   });
   const computer = { base, child };
@@ -106,6 +96,26 @@ async function startComputer(
 }
 
 let computer: Computer;
+
+/**
+ * The status a route was expected to answer, and when it is another, what the computer said.
+ *
+ * The bar's back, forward and reload failed now and then on CI, as a 502 or as an answer with no
+ * tabs in it, and the test said only "Expected: 200, Received: 502" or "undefined is not an object".
+ * The body names the address that did not load and whether it was in time; the computer's own log
+ * line beside it (`computer-bar-navigation-failed`) says what Playwright said.
+ */
+function answered<T>(
+  path: string,
+  answer: { status: number; json: T },
+  status = 200,
+): T {
+  if (answer.status !== status)
+    throw new Error(
+      `${path} answered ${answer.status}, expected ${status}. The computer said:\n${JSON.stringify(answer.json)}`,
+    );
+  return answer.json;
+}
 
 async function call<T = Record<string, unknown>>(
   path: string,
@@ -409,48 +419,49 @@ describe.skipIf(!asked)(
       const control = (await call<ComputerControlState>("/control")).json;
       expect(control).toMatchObject({ holder: "human", heldBy: "user-1" });
 
-      const two = await call<BotBrowserState>("/bot-browser/tabs", {
-        body: { action: "new", url: page("two") },
-      });
-      expect(two.status).toBe(200);
-      expect(two.json.tabs).toHaveLength(2);
-      expect(activeTab(two.json)).toMatchObject({
+      const two = answered(
+        "new tab",
+        await call<BotBrowserState>("/bot-browser/tabs", {
+          body: { action: "new", url: page("two") },
+        }),
+      );
+      expect(two.tabs).toHaveLength(2);
+      expect(activeTab(two)).toMatchObject({
         url: page("two"),
         title: "two",
       });
-      const first = two.json.tabs.find((tab) => tab.url === page("start"));
-      const second = activeTab(two.json);
+      const first = two.tabs.find((tab) => tab.url === page("start"));
+      const second = activeTab(two);
       if (!first || !second) throw new Error("Both tabs should be listed.");
 
-      const switched = await call<BotBrowserState>("/bot-browser/tabs", {
-        body: { action: "activate", tabId: first.id },
-      });
-      expect(activeTab(switched.json)?.id).toBe(first.id);
+      const switched = answered(
+        "activate",
+        await call<BotBrowserState>("/bot-browser/tabs", {
+          body: { action: "activate", tabId: first.id },
+        }),
+      );
+      expect(activeTab(switched)?.id).toBe(first.id);
       // The Bot's page is the tab in front now: what it reads next is that tab.
       expect((await call<{ url: string }>("/read")).json.url).toBe(
         page("start"),
       );
 
       // The address bar, back, forward and reload, in the tab in front.
-      const there = await call<BotBrowserState>("/bot-browser/navigate", {
-        body: { url: page("three") },
-      });
-      expect(activeTab(there.json)).toMatchObject({
+      const bar = async (path: string, body: Record<string, string>) =>
+        answered(
+          path,
+          await call<BotBrowserState>("/bot-browser/navigate", { body }),
+        );
+      const there = await bar("address", { url: page("three") });
+      expect(activeTab(there)).toMatchObject({
         id: first.id,
         url: page("three"),
       });
-      const back = await call<BotBrowserState>("/bot-browser/navigate", {
-        body: { action: "back" },
-      });
-      expect(activeTab(back.json)?.url).toBe(page("start"));
-      const forward = await call<BotBrowserState>("/bot-browser/navigate", {
-        body: { action: "forward" },
-      });
-      expect(activeTab(forward.json)?.url).toBe(page("three"));
-      expect(
-        (await call("/bot-browser/navigate", { body: { action: "reload" } }))
-          .status,
-      ).toBe(200);
+      const back = await bar("back", { action: "back" });
+      expect(activeTab(back)?.url).toBe(page("start"));
+      const forward = await bar("forward", { action: "forward" });
+      expect(activeTab(forward)?.url).toBe(page("three"));
+      await bar("reload", { action: "reload" });
       expect(
         (
           await call("/bot-browser/navigate", {
@@ -459,10 +470,13 @@ describe.skipIf(!asked)(
         ).status,
       ).toBe(400);
 
-      const closed = await call<BotBrowserState>("/bot-browser/tabs", {
-        body: { action: "close", tabId: second.id },
-      });
-      expect(closed.json.tabs.map((tab) => tab.id)).toEqual([first.id]);
+      const closed = answered(
+        "close tab",
+        await call<BotBrowserState>("/bot-browser/tabs", {
+          body: { action: "close", tabId: second.id },
+        }),
+      );
+      expect(closed.tabs.map((tab) => tab.id)).toEqual([first.id]);
 
       // Handed back: nobody is named, and the bar refuses again.
       expect(
@@ -565,7 +579,7 @@ describe.skipIf(!asked)(
       await call("/control/release", { body: { requestId } });
     }, 60_000);
 
-    test("handing the wheel back ends the recording, then disconnects the Recorder, before the hand-back answers", async () => {
+    test("handing the wheel backends the recording, then disconnects the Recorder, before the hand-back answers", async () => {
       const requestId = await takeWheel("user-1");
       expect((await start("user-1", "Handed back")).status).toBe(200);
       calls.length = 0;
@@ -770,7 +784,8 @@ describe.skipIf(!asked)("a person's keys on a Bot's live screen", () => {
           error?: string;
         };
         if (message.type === "frame") resolve();
-        if (message.type === "error") errors.push(message.error ?? "");
+        if (message.type === "error" || message.type === "input-error")
+          errors.push(message.error ?? "");
       });
     });
     try {
@@ -858,7 +873,8 @@ describe.skipIf(!asked)("what a person types while they hold the wheel", () => {
           error?: string;
         };
         if (message.type === "frame") resolve();
-        if (message.type === "error") errors.push(message.error ?? "");
+        if (message.type === "error" || message.type === "input-error")
+          errors.push(message.error ?? "");
       });
     });
     const key = (key: string, code: string, windowsVirtualKeyCode: number) => {

@@ -1,4 +1,8 @@
-import { queryOptions } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  queryOptions,
+  useQuery,
+} from "@tanstack/react-query";
 import { client } from "@/lib/client";
 
 /**
@@ -29,6 +33,11 @@ export type DeploymentCapabilities = {
    * deployment: single-user mode on the server, which only a local, unreachable install can be in.
    */
   localEvaluation: boolean;
+  /**
+   * Which product this is. `personal` is one person on their own machine: no Admin, and what they
+   * need of it under Settings. A server from before the switch reads as `team`.
+   */
+  edition: "team" | "personal";
   transcription?: boolean;
   voice?: boolean;
 };
@@ -62,12 +71,13 @@ export function deploymentCapabilitiesQueryOptions() {
        */
       const body = (await (
         await client("/api/capabilities", {
-          fallback: "This deployment's capabilities could not be loaded.",
+          fallback: "Couldn't load what OpenBot can do.",
         })
       ).json()) as {
         generativeUi?: boolean;
         selfHostBanner?: boolean;
         localEvaluation?: boolean;
+        edition?: string;
         transcription?: boolean;
         voice?: boolean;
       };
@@ -76,9 +86,49 @@ export function deploymentCapabilitiesQueryOptions() {
         generativeUi: body.generativeUi === true,
         selfHostBanner: body.selfHostBanner === true,
         localEvaluation: body.localEvaluation === true,
+        edition: body.edition === "personal" ? "personal" : "team",
         transcription: body.transcription === true,
         voice: body.voice === true,
       };
     },
   });
+}
+
+/**
+ * Whether this deployment offers memory: what a person's Bots remember about them, and the apps a
+ * Bot learns it from. Every memory screen, row and link reads this.
+ *
+ * NOT IN THE PERSONAL EDITION. OpenBot Desktop runs a local Intelligence whose licence leaves memory
+ * out, so the personal edition has no memory to show. Read from the edition, not from Intelligence's
+ * entitlement: the server's entitlement read only chooses where memory is kept (Intelligence, or
+ * OpenBot's own tables when Intelligence is unlicensed or unreachable), and it changes from one
+ * minute to the next while Intelligence starts. A screen gated on it would come and go, and a team
+ * deployment that keeps memory in its own tables would lose screens that work.
+ *
+ * An edition that could not be read is the team edition, as everywhere else.
+ */
+export function offersMemory(
+  capabilities: Pick<DeploymentCapabilities, "edition"> | undefined,
+): boolean {
+  return capabilities?.edition !== "personal";
+}
+
+/**
+ * {@link offersMemory} for a component. False until the edition is known, so the personal edition
+ * never draws a memory row for a moment or asks the server for memory it doesn't have.
+ */
+export function useOffersMemory(): boolean {
+  const capabilities = useQuery(deploymentCapabilitiesQueryOptions());
+  return !capabilities.isPending && offersMemory(capabilities.data);
+}
+
+/** {@link offersMemory} for a route guard, which has the query client and no component. */
+export async function deploymentOffersMemory(
+  queryClient: QueryClient,
+): Promise<boolean> {
+  return offersMemory(
+    await queryClient
+      .ensureQueryData(deploymentCapabilitiesQueryOptions())
+      .catch(() => undefined),
+  );
 }

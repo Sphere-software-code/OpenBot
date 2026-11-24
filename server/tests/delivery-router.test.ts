@@ -68,6 +68,8 @@ function fixture(
         : null,
     binding: async () => ownedBinding,
     bindingsFor: async () => [ownedBinding],
+    bindingsByUse: async () => [ownedBinding],
+    checkInConversations: async () => [],
     devices: async () => [],
     offerInbox: async (input: unknown) => {
       offered.push(input);
@@ -122,6 +124,7 @@ function fixture(
     queue,
     owner: "worker",
     authoriseScope: async () => live,
+    scopeFor: async () => null,
     runTurn: async (input) => {
       calls.push(input);
       await turnHook?.(router);
@@ -191,6 +194,27 @@ test("queue invokes selected Bot and original conversation, emits durable async 
   });
   expect(f.statuses.at(-1)).toMatchObject({ state: "sent" });
 });
+test("a turn knows where its message was written, so its surface can be told", async () => {
+  const queued = fixture();
+  await queued.router.sweep("delivery.inbound");
+  const native = fixture();
+  native.inbox.source = "native";
+  await native.router.sweep("delivery.inbound");
+  const paired = fixture();
+  await paired.router.converse({
+    transport: "teams",
+    realm: "T",
+    identity: "U",
+    externalId: "m1",
+    text: "Hi",
+    signal: new AbortController().signal,
+  });
+  expect(
+    [queued, native, paired].map(
+      (f) => (f.calls[0] as { source?: unknown }).source,
+    ),
+  ).toEqual(["slack", "native", "teams"]);
+});
 test("revoked source ownership and lost lease cannot execute turns or sends", async () => {
   const f = fixture();
   f.revoke();
@@ -218,6 +242,7 @@ test("provider refusal persists failure while uncertain network persists unknown
     queue: f.queue,
     owner: "w",
     authoriseScope: async () => true,
+    scopeFor: async () => null,
     runTurn: async () => ({ replyText: "" }),
     providers: {
       slack: {
@@ -311,6 +336,7 @@ test("a suspended governed turn reports its pending approval", async () => {
     queue: f.queue,
     owner: "w",
     authoriseScope: async () => true,
+    scopeFor: async () => null,
     runTurn: async () => {
       throw suspended;
     },
@@ -357,6 +383,7 @@ test("chat sends carry the Bot's identity; SMS after STOP is recorded opted out,
     queue: refused.queue,
     owner: "w",
     authoriseScope: async () => true,
+    scopeFor: async () => null,
     runTurn: async () => ({ replyText: "" }),
     audit: async (event) => {
       refused.calls.push({ audit: event });
@@ -402,6 +429,7 @@ test("the person's update routing decides which transports carry each kind", asy
     queue: f.queue,
     owner: "w",
     authoriseScope: async () => true,
+    scopeFor: async () => null,
     runTurn: async () => ({ replyText: "" }),
     providers: {},
     routeFor: async ({ kind }) => {

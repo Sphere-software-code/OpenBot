@@ -1,4 +1,5 @@
 import { cutAtCodeUnits } from "../channels/text";
+import { appsPage } from "../edition";
 import { MAX_RESULT_CHARS, type McpCallResult, type McpTool } from "./mcp";
 
 /**
@@ -144,6 +145,9 @@ type Connection = { url: string; token?: string };
  * was not.
  */
 export const listNeedsCredential = false;
+
+/** This list is this file, so every start brings the saved copy up to date with it. */
+export const listIsThisCode = true;
 
 /** The same list for everybody, because this adapter's capability is this code rather than a server. */
 export async function listTools(_connection: Connection): Promise<McpTool[]> {
@@ -522,6 +526,6 @@ export async function callTool(
   }
 
   return failure(
-    `${toolName} is not a tool this connector implements. The stored tool list is out of date; refresh it on the Plugins page.`,
+    `${toolName} is not a tool this connector implements. The stored tool list is out of date; refresh it on the ${appsPage()} page.`,
   );
 }

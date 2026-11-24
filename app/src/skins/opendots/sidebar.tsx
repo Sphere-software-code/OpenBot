@@ -22,6 +22,9 @@ import {
 } from "@/components/app-sidebar/app-sidebar";
 import { ChannelPagination } from "@/components/app-sidebar/channel-pagination";
 import { DeleteConversationDialog } from "@/components/channels/delete-conversation-dialog";
+import { BrandName } from "@/components/edition/brand-name";
+import { NavigationTarget } from "@/components/edition/team-features-dialog";
+import { OpenBotVersion } from "@/components/layout/openbot-version";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -34,14 +37,17 @@ import { type AgentProfile, agentListQueryOptions } from "@/lib/agents/queries";
 import { groupRoster } from "@/lib/agents/roster";
 import { signOutMutationOptions } from "@/lib/auth/mutations";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { useSignOutOffered } from "@/lib/auth/sign-out-offered";
+import { untitledLine } from "@/lib/channels/label";
 import { setChannelPinnedMutationOptions } from "@/lib/channels/mutations";
 import {
   type ChannelSummary,
   channelListQueryOptions,
 } from "@/lib/channels/queries";
+import { useOffersMemory } from "@/lib/deployment/queries";
 import { appConfig } from "@/lib/generated/application-config";
 import { memoriesQueryOptions } from "@/lib/memory";
-import { useNavigationItems } from "@/lib/navigation";
+import { isNavigationLink, useNavigationItems } from "@/lib/navigation";
 import { routinesQueryOptions } from "@/lib/routines/queries";
 import { cn } from "@/lib/utils";
 import { queryClient } from "@/query-client";
@@ -121,7 +127,9 @@ function Wordmark({ onNavigate }: { onNavigate: () => void }) {
       onClick={onNavigate}
       to="/"
     >
-      <span className="truncate">{productName}</span>
+      <span className="truncate">
+        <BrandName>{productName}</BrandName>
+      </span>
     </Link>
   );
 }
@@ -166,7 +174,9 @@ function BotsSection({
 }) {
   const agents = useQuery(agentListQueryOptions());
   const dots = agents.data ? dotOrder(agents.data) : [];
-  const bots = useNavigationItems().find((item) => item.id === "bots");
+  const bots = useNavigationItems()
+    .filter(isNavigationLink)
+    .find((item) => item.id === "bots");
   return (
     <section aria-label="Bots">
       <NavLabel
@@ -282,7 +292,7 @@ function ThreadRow({
   const [confirming, setConfirming] = useState(false);
   const [pinProblem, setPinProblem] = useState<string | null>(null);
   const unread = isUnread(channel, open ? channel.id : undefined);
-  const title = channel.summary || channel.lastMessage || channel.name;
+  const title = channel.summary || untitledLine(channel) || channel.name;
   const link: LinkProps =
     channel.agentIds.length > 1
       ? { to: "/group/$channelId", params: { channelId: channel.id } }
@@ -482,7 +492,9 @@ function WorkspaceLinks({
   onNavigate: () => void;
 }) {
   const routines = useQuery(routinesQueryOptions());
-  const memories = useQuery(memoriesQueryOptions());
+  // No Memories row where memory isn't offered (see `offersMemory`).
+  const memory = useOffersMemory();
+  const memories = useQuery({ ...memoriesQueryOptions(), enabled: memory });
   // OpenDots keeps these rows in the chrome's olive ink; the row you are on only gains the tint.
   const row = (section: string) =>
     cn(
@@ -499,7 +511,10 @@ function WorkspaceLinks({
    * is no rail. Bots is the row under the list of Bots above.
    */
   const drawerOnly = "md:hidden";
-  const navigation = useNavigationItems().filter((item) => item.id !== "bots");
+  // Routines is OpenDots' own row above, so the shared list's entry is not drawn twice.
+  const navigation = useNavigationItems().filter(
+    (item) => item.id !== "bots" && item.id !== "routines",
+  );
   return (
     <nav
       aria-label="Workspace"
@@ -516,29 +531,32 @@ function WorkspaceLinks({
         <span className="min-w-0 flex-1 truncate">Routines</span>
         <Count value={routines.data?.routines.length} />
       </Link>
-      <Link
-        aria-current={current("memories")}
-        className={row("memories")}
-        onClick={onNavigate}
-        params={{ screen: "memories" }}
-        to="/s/$screen"
-      >
-        <IconBook />
-        <span className="min-w-0 flex-1 truncate">Memories</span>
-        <Count value={memories.data?.length} />
-      </Link>
+      {memory ? (
+        <Link
+          aria-current={current("memories")}
+          className={row("memories")}
+          onClick={onNavigate}
+          params={{ screen: "memories" }}
+          to="/s/$screen"
+        >
+          <IconBook />
+          <span className="min-w-0 flex-1 truncate">Memories</span>
+          <Count value={memories.data?.length} />
+        </Link>
+      ) : null}
       {/* OpenBot's own destinations, from the one list every frame reads. */}
       {navigation.map((item) => (
-        <Link
+        <NavigationTarget
           aria-current={place.section === item.id ? "page" : undefined}
           className={cn(row(item.id), item.section === "primary" && drawerOnly)}
+          item={item}
           key={item.id}
           onClick={onNavigate}
-          to={item.to}
         >
           <item.icon />
+          {/* The label alone, no trademark sign: "OpenBot for Business" only just fits this rail. */}
           <span className="min-w-0 flex-1 truncate">{item.label}</span>
-        </Link>
+        </NavigationTarget>
       ))}
       <UserRow />
     </nav>
@@ -561,6 +579,7 @@ function UserRow() {
   const user = useQuery(currentUserQueryOptions());
   const navigate = useNavigate();
   const signOut = useMutation(signOutMutationOptions(queryClient));
+  const signOutOffered = useSignOutOffered();
   if (!user.data) return null;
   const name = user.data.name?.trim() || user.data.email;
   const initials = initialsOf(user.data);
@@ -572,19 +591,24 @@ function UserRow() {
       >
         {initials}
       </span>
-      <span className="min-w-0 flex-1 truncate text-[12px] text-(--opendots-muted)">
-        {name}
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-[12px] text-(--opendots-muted)">
+          {name}
+        </span>
+        <OpenBotVersion className="text-[10px] leading-3 text-(--opendots-icon)" />
       </span>
-      <IconAction
-        disabled={signOut.isPending}
-        label="Sign out"
-        onClick={async () => {
-          await signOut.mutateAsync();
-          await navigate({ to: "/sign" });
-        }}
-      >
-        <IconLogout />
-      </IconAction>
+      {signOutOffered ? (
+        <IconAction
+          disabled={signOut.isPending}
+          label="Sign out"
+          onClick={async () => {
+            await signOut.mutateAsync();
+            await navigate({ to: "/sign" });
+          }}
+        >
+          <IconLogout />
+        </IconAction>
+      ) : null}
     </div>
   );
 }

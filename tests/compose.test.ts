@@ -103,6 +103,10 @@ function runLangGraphAguiModelProbe(
         "tools = ModuleType('src.tool_runtime')",
         "tools.ToolAwareAgent = LangGraphAgent",
         "tools.bind_tools = tools.execute_tools = tools.next_step = lambda *args: None",
+        "tools.billing_refusal = tools.provider_message = tools.provider_refusal = lambda *args, **kwargs: None",
+        "from types import SimpleNamespace",
+        // No run chose a model or effort, so the deployment's own configuration applies.
+        "tools.current_tools = lambda: SimpleNamespace(model='', effort='')",
         "tools.model_messages = lambda messages: messages",
         "sys.modules['src.tool_runtime'] = tools",
         "from src import main",
@@ -177,6 +181,17 @@ function runLangGraphAguiModelProbe(
       join(dir, "langgraph", "checkpoint", "memory.py"),
       ["class MemorySaver:", "    pass", ""].join("\n"),
     );
+    // The ChatGPT plan's model list (`chatgpt_models`) imports httpx at module level. The probe
+    // only builds a model, so a stand-in is enough, like the packages above.
+    writeFileSync(
+      join(dir, "httpx.py"),
+      [
+        "class AsyncClient:",
+        "    def __init__(self, *_args, **_kwargs):",
+        "        pass",
+        "",
+      ].join("\n"),
+    );
 
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -211,11 +226,29 @@ function runLangGraphAguiModelProbe(
   }
 }
 
-function runComposeConfig(env: Record<string, string>) {
+function runComposeConfig(
+  env: Record<string, string>,
+  desktop = false,
+  userOverride?: string,
+) {
   const output = execFileSync(
     "docker",
     [
       "compose",
+      ...(desktop
+        ? [
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "desktop/src-tauri/telemetry.compose.yml",
+            ...(userOverride ? ["-f", userOverride] : []),
+            ...([env.COPILOTKIT_TELEMETRY_DISABLED, env.DO_NOT_TRACK].some(
+              (value) => value === "1" || value === "true",
+            )
+              ? ["-f", "desktop/src-tauri/telemetry-disabled.compose.yml"]
+              : []),
+          ]
+        : []),
       "--env-file",
       "/dev/null",
       "--profile",
@@ -248,6 +281,107 @@ function runComposeConfig(env: Record<string, string>) {
   };
 }
 
+test("passes desktop identity, metadata and opt-out into the server container", () => {
+  const telemetry = {
+    CPK_TELEMETRY_ID: "12345678-1234-4123-8123-123456789012",
+    COPILOTKIT_TELEMETRY_SAMPLE_RATE: "1",
+    COPILOTKIT_TELEMETRY_URL: "http://127.0.0.1:4321/ingest",
+    OPENBOT_DISTRIBUTION: "desktop",
+    OPENBOT_VERSION: "1.0.0",
+    OPENBOT_PLATFORM: "macos",
+    OPENBOT_ARCH: "aarch64",
+    OPENBOT_OS_VERSION: "26.0",
+    OPENBOT_ENGINE: "docker",
+    COPILOTKIT_TELEMETRY_DISABLED: "1",
+    DO_NOT_TRACK: "1",
+    OPENBOT_PRODUCT_TELEMETRY: "0",
+  };
+  const enterprise = runComposeConfig(telemetry).services;
+  for (const key of Object.keys(telemetry)) {
+    expect(enterprise.server.environment[key]).toBeUndefined();
+  }
+  const services = runComposeConfig(
+    {
+      ...telemetry,
+      OPENBOT_ACCOUNT_EMAIL: "synthetic@example.invalid",
+      OPENBOT_PROMPT: "synthetic private content",
+    },
+    true,
+  ).services;
+  for (const [key, value] of Object.entries(telemetry)) {
+    expect(services.server.environment[key]).toBe(value);
+    expect(services["agent-computer"].environment[key]).toBeUndefined();
+  }
+  expect(services.server.environment.OPENBOT_ACCOUNT_EMAIL).toBeUndefined();
+  expect(services.server.environment.OPENBOT_PROMPT).toBeUndefined();
+  const overlay = parse(
+    readFileSync(
+      join(import.meta.dir, "../desktop/src-tauri/telemetry.compose.yml"),
+      "utf8",
+    ),
+  );
+  expect(Object.keys(overlay.services)).toEqual(["server"]);
+  expect(Object.keys(overlay.services.server.environment).sort()).toEqual(
+    Object.keys(telemetry).sort(),
+  );
+  // Telemetry configuration must not change the local server's runtime mode.
+  expect(services.server.environment.NODE_ENV).toBe("");
+});
+
+test("keeps a server opt-out from the user's Compose override", () => {
+  const dir = mkdtempSync(join(tmpdir(), "openbot-telemetry-override-"));
+  try {
+    const override = join(dir, "custom.yml");
+    writeFileSync(
+      override,
+      'services:\n  server:\n    environment:\n      DO_NOT_TRACK: "1"\n      OPENBOT_PRODUCT_TELEMETRY: "0"\n',
+    );
+    const env = runComposeConfig(
+      { OPENBOT_DISTRIBUTION: "desktop" },
+      true,
+      override,
+    ).services.server.environment;
+    expect(env.DO_NOT_TRACK).toBe("1");
+    expect(env.OPENBOT_PRODUCT_TELEMETRY).toBe("0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native opt-out wins over a Compose override that enables telemetry", () => {
+  const dir = mkdtempSync(join(tmpdir(), "openbot-native-opt-out-"));
+  try {
+    const override = join(dir, "custom.yml");
+    writeFileSync(
+      override,
+      'services:\n  server:\n    environment:\n      DO_NOT_TRACK: "0"\n      COPILOTKIT_TELEMETRY_DISABLED: "0"\n      OPENBOT_PRODUCT_TELEMETRY: "1"\n',
+    );
+    for (const key of ["DO_NOT_TRACK", "COPILOTKIT_TELEMETRY_DISABLED"]) {
+      for (const value of ["true", "1"]) {
+        const env = runComposeConfig({ [key]: value }, true, override).services
+          .server.environment;
+        expect(env.COPILOTKIT_TELEMETRY_DISABLED).toBe("1");
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("leaves optional telemetry settings absent for ordinary Compose startup", () => {
+  const env = runComposeConfig({}).services.server.environment;
+  for (const key of [
+    "CPK_TELEMETRY_ID",
+    "COPILOTKIT_TELEMETRY_URL",
+    "OPENBOT_DISTRIBUTION",
+    "OPENBOT_PRODUCT_TELEMETRY",
+    "COPILOTKIT_TELEMETRY_DISABLED",
+    "DO_NOT_TRACK",
+  ]) {
+    expect(env[key] ?? undefined).toBeUndefined();
+  }
+});
+
 // `docker compose config` pays a one-off cold start on the first call in a process — the Compose
 // plugin initialising and resolving every image reference — which is several seconds on a loaded CI
 // runner and a fraction of that once warm. A test that happened to be the first to call it was
@@ -257,6 +391,51 @@ function runComposeConfig(env: Record<string, string>) {
 beforeAll(() => {
   runComposeConfig({});
 }, 60_000);
+
+/**
+ * Older Compose (v2.24.5, for one) validates every service before it applies profiles, so one
+ * service whose image comes out blank fails the whole project, profile or not. The desktop app
+ * runs `compose config` before it starts anything, so on those versions Start stopped with
+ * "Compose config exited with exit status: 15" whenever no harness was picked.
+ *
+ * Current Compose applies the same check to every service a profile turns on, so turning them all
+ * on with nothing set is how this suite sees what older Compose sees. CI also runs v2.24.5 itself.
+ */
+test("gives every service a real image when nothing is set, so older Compose reads the file", () => {
+  const output = execFileSync(
+    "docker",
+    [
+      "compose",
+      "-f",
+      "docker-compose.yml",
+      "-f",
+      "desktop/src-tauri/telemetry.compose.yml",
+      "-f",
+      "desktop/src-tauri/telemetry-disabled.compose.yml",
+      "--env-file",
+      "/dev/null",
+      "--profile",
+      "*",
+      "config",
+      "--format",
+      "json",
+    ],
+    {
+      cwd: join(import.meta.dir, ".."),
+      env: { PATH: process.env.PATH ?? "" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const services = (
+    JSON.parse(output) as { services: Record<string, { image?: string }> }
+  ).services;
+  expect(Object.keys(services)).toContain("agent-harness");
+  const blank = Object.entries(services)
+    .filter(([, service]) => !service.image?.trim())
+    .map(([name]) => name);
+  expect(blank).toEqual([]);
+});
 
 test("provides PostgreSQL with pgvector for local development", () => {
   const compose = composeFile();
@@ -446,7 +625,8 @@ test("passes the selected Anthropic provider and model into the picked harness",
     OPENAI_API_KEY: "sk-openai-synthetic",
     OPENAI_BASE_URL: "https://openai-compatible.example/v1",
     BOT_PROVIDER: "openai",
-    BOT_MODEL: "gpt-5.5",
+    // Unset arrives as unset: the server, not a stand-in here, decides the model.
+    BOT_MODEL: "",
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_BASE_URL: "",
   });
@@ -586,6 +766,57 @@ test("carries per-Bot egress into the computer and the supervisor", () => {
   expect(compose).toContain("required: false");
 });
 
+/**
+ * The personal edition's one computer is its one person's (scripts/start.sh sets `COMPUTER_PERSON_ID`), so Record runs
+ * in their Bots' browsers there. Anywhere else it is unset, and the shared computer stays nobody's.
+ */
+test("starts the shared computer as one person's only when told whose it is", () => {
+  expect(
+    runComposeConfig({ COMPUTER_PERSON_ID: "personal" }).services[
+      "agent-computer"
+    ]?.environment.COMPUTER_PERSON_ID,
+  ).toBe("personal");
+  expect(
+    runComposeConfig({}).services["agent-computer"]?.environment
+      .COMPUTER_PERSON_ID,
+  ).toBe("");
+});
+
+/**
+ * The personal edition's one computer runs the person's own browser beside their Bots, which it knows from the edition
+ * (agent-computer's person-access.ts): the edition in `.env` has to reach it, as it reaches the server.
+ */
+/**
+ * A Recorder in the shared computer is handed the laptop's loopback addresses for OpenBot and a local gateway, which in
+ * that container are the container: OpenBot Desktop names where each is reached instead, and the computer relays them
+ * (agent-computer's loopback-relay.ts). The setting, and the host the gateway's relay names, have to reach it.
+ */
+test("hands the shared computer the loopback addresses it relays, and this machine by name", () => {
+  const computer = runComposeConfig({
+    COMPUTER_LOOPBACK_RELAYS:
+      "3010=server:3001,14401=host.docker.internal:14401",
+  }).services["agent-computer"];
+  expect(computer?.environment.COMPUTER_LOOPBACK_RELAYS).toBe(
+    "3010=server:3001,14401=host.docker.internal:14401",
+  );
+  expect(computer?.extra_hosts).toEqual(["host.docker.internal=host-gateway"]);
+  expect(
+    runComposeConfig({}).services["agent-computer"]?.environment
+      .COMPUTER_LOOPBACK_RELAYS,
+  ).toBe("");
+});
+
+test("tells the shared computer which edition it runs in", () => {
+  expect(
+    runComposeConfig({ OPENBOT_EDITION: "personal" }).services["agent-computer"]
+      ?.environment.OPENBOT_EDITION,
+  ).toBe("personal");
+  expect(
+    runComposeConfig({}).services["agent-computer"]?.environment
+      .OPENBOT_EDITION,
+  ).toBe("");
+});
+
 test("gives the selected harness the same governed callback as the framework Bot", () => {
   const config = runComposeConfig({
     OPENBOT_TOOL_URL: "http://callback.example/api/agent-tools/call",
@@ -598,6 +829,25 @@ test("gives the selected harness the same governed callback as the framework Bot
     });
     expect(config.services[service].extra_hosts).toContain(
       "host.docker.internal=host-gateway",
+    );
+  }
+});
+
+/**
+ * Rootless Podman on Linux gives `host-gateway` an address that is not this machine's loopback, where
+ * the person's browser and a local Intelligence listen. OpenBot Desktop sets `OPENBOT_HOST_GATEWAY`
+ * there, to the address its Podman configuration maps to loopback, and every service that calls the
+ * host by name takes it.
+ */
+test("sends host.docker.internal where OPENBOT_HOST_GATEWAY says", () => {
+  const config = runComposeConfig({ OPENBOT_HOST_GATEWAY: "10.0.2.2" });
+  for (const service of [
+    "server",
+    "agent-harness",
+    "agent-langgraph",
+  ] as const) {
+    expect(config.services[service].extra_hosts).toContain(
+      "host.docker.internal=10.0.2.2",
     );
   }
 });
@@ -659,13 +909,28 @@ test("gives the server container addresses, not the host's loopback", () => {
     SERVER_PORT: "3001",
     DATABASE_URL: "postgres://openbot:openbot@postgres:5432/openbot",
     AGENT_COMPUTER_URL: "http://agent-computer:4100",
-    COMPUTER_SUPERVISOR_URL: "http://supervisor:4300",
   });
   for (const [name, value] of Object.entries(environment)) {
     expect(`${name}=${value}`).not.toMatch(/localhost|127\.0\.0\.1|\[::1\]/);
   }
   // Production refuses `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS`, which a local OpenBot needs.
   expect(environment.NODE_ENV).toBe("");
+});
+
+/**
+ * The supervisor by name unless the deployment says there is none.
+ *
+ * Unset is every deployment that predates the setting. Set empty is OpenBot Desktop, which runs the
+ * personal edition on one computer, and that edition refuses to start with a supervisor.
+ */
+test("gives the server the supervisor unless the deployment empties it", () => {
+  expect(
+    runComposeConfig({}).services.server?.environment.COMPUTER_SUPERVISOR_URL,
+  ).toBe("http://supervisor:4300");
+  const none = runComposeConfig({ COMPUTER_SUPERVISOR_CONTAINER_URL: "" })
+    .services.server?.environment;
+  expect(none?.COMPUTER_SUPERVISOR_URL ?? "").toBe("");
+  expect(none?.AGENT_COMPUTER_URL).toBe("http://agent-computer:4100");
 });
 
 test("puts the server beside the database and the Bots, and the worker beside the database only", () => {
@@ -705,8 +970,11 @@ test("addresses the server's Bots and endpoints from inside the network", () => 
       "http://host.docker.internal:3001/api/model-provider/v1",
     INTELLIGENCE_GATEWAY_WS_URL: "ws://localhost:14401",
     INTELLIGENCE_CONTAINER_GATEWAY_WS_URL: "ws://host.docker.internal:14401",
+    OPENBOT_THIS_MACHINE_CONTAINER_HOST: "host.docker.internal",
   });
   expect(withBots.services.server.environment).toMatchObject({
+    // How the server reaches an agent the person registered on their own loopback.
+    OPENBOT_THIS_MACHINE_HOST: "host.docker.internal",
     MANAGED_AGENT_AG_UI_URL: "http://agent-langgraph:4201/ag-ui",
     PICKED_HARNESS_URL: "http://agent-harness:4202/run",
     OPENAI_BASE_URL: "http://host.docker.internal:3001/api/model-provider/v1",
@@ -721,6 +989,7 @@ test("addresses the server's Bots and endpoints from inside the network", () => 
     PICKED_HARNESS_URL: "https://agents.example/run",
   });
   expect(without.services.server.environment).toMatchObject({
+    OPENBOT_THIS_MACHINE_HOST: "",
     MANAGED_AGENT_AG_UI_URL: "",
     PICKED_HARNESS_URL: "https://agents.example/run",
   });
@@ -750,4 +1019,21 @@ test("mounts the model sign-in folder into the server, and only there", () => {
     if (name === "server") continue;
     expect(JSON.stringify(service.volumes ?? [])).not.toContain(".openbot");
   }
+});
+
+/*
+ * A Bot's shell runs `ping` on its computer. iputils' ping carries the `cap_net_raw` file
+ * capability, and a process cannot exec a file whose capabilities are outside the container's
+ * bounding set. Docker's default set has NET_RAW; Podman's (the Desktop's engine on Windows and the
+ * default everywhere) does not, so on Windows `ping 8.8.8.8` answered "Operation not permitted",
+ * even as root. The computer asks for NET_RAW itself, so both engines give it the same.
+ */
+test("the computer is given NET_RAW, so ping works on Podman as on Docker", () => {
+  const computer = (
+    parse(composeFile()) as {
+      services: Record<string, { cap_add?: string[]; cap_drop?: string[] }>;
+    }
+  ).services["agent-computer"];
+  expect(computer?.cap_add ?? []).toContain("NET_RAW");
+  expect(computer?.cap_drop ?? []).not.toContain("NET_RAW");
 });

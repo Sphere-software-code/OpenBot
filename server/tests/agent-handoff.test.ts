@@ -3,7 +3,9 @@ import {
   createHandoffDesk,
   HANDOFF_KIND,
   type HandoffCaps,
+  resolveAddressedBot,
 } from "../src/agents/handoff";
+import { handoffTool } from "../src/agents/handoff-tool";
 import type { AgentProfileStore } from "../src/agents/profile-store";
 import type { AgentProfile } from "../src/agents/profile-types";
 import type { AuditStore } from "../src/audit";
@@ -313,6 +315,53 @@ describe("handing work to another Bot", () => {
 
     expect(outcome.ok).toBe(false);
     expect(rows).toEqual([]);
+  });
+
+  /*
+   * Found in an end-to-end run: "ask the Knowledge Bot for one sentence on what Helm is" was routed to
+   * Knowledge, which went looking for a way to reach the Knowledge Bot. A Bot that names itself is
+   * the one being asked, and the tool says so before anything else, a person's approval included.
+   */
+  test("a Bot naming itself is told it is the one asked, before anybody is asked to approve a hop", async () => {
+    const {
+      desk: handoff,
+      rows,
+      events,
+    } = desk({
+      roster: [
+        profile({ id: "knowledge", name: "Knowledge" }),
+        profile({ id: "researcher", name: "Researcher" }),
+      ],
+    });
+    const approvals: string[] = [];
+    const tool = handoffTool({
+      desk: handoff,
+      from: { ...FROM, botId: "knowledge" },
+      hasSomebodyToAsk: true,
+      maxDepth: 2,
+      maxPerRun: 3,
+      approvalGate: async (candidate) => {
+        approvals.push(String(candidate.scope));
+        return undefined;
+      },
+    });
+
+    const answer = await tool?.execute({
+      bot: "the Knowledge Bot",
+      task: "Say in one sentence what Helm is.",
+    });
+
+    expect(answer).toBe(
+      "Nothing was sent: you are Knowledge, so a request for Knowledge is a request to you. Do the work yourself and answer the person.",
+    );
+    expect(approvals).toEqual([]);
+    expect(rows).toEqual([]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        eventType: "agent.handoff_refused",
+        payload: expect.objectContaining({ reason: "self" }),
+      }),
+    ]);
   });
 
   test("a Bot cannot hand work to itself", async () => {
@@ -680,5 +729,65 @@ describe("the same ask a second time", () => {
     expect(outcome.ok).toBe(false);
     if (!outcome.ok)
       expect(outcome.refusal).toContain("could not be confirmed");
+  });
+});
+
+/**
+ * A Bot as people name it.
+ *
+ * "Ask the Knowledge Bot" reached the desk as `Knowledge Bot` and was refused as no such Bot, while
+ * Knowledge was right there. The looser reading only ever applies when nothing matches exactly, and
+ * only when it lands on one Bot.
+ */
+describe("a Bot named the way people name it", () => {
+  const roster = [
+    profile({ id: "knowledge", name: "Knowledge" }),
+    profile({ id: "general-assistant", name: "General Assistant" }),
+    profile({ id: "chatbot", name: "Chatbot" }),
+  ];
+  const resolved = (target: string, from = roster) => {
+    const outcome = resolveAddressedBot(from, target);
+    return outcome.kind === "found" ? outcome.bot.id : outcome.kind;
+  };
+
+  test("reaches the one Bot it means", () => {
+    for (const said of [
+      "Knowledge Bot",
+      "the Knowledge Bot",
+      "The knowledge bot",
+      "@knowledge",
+      "knowledge-bot",
+      "  KNOWLEDGE  ",
+    ])
+      expect(resolved(said)).toBe("knowledge");
+    expect(resolved("general assistant bot")).toBe("general-assistant");
+    expect(resolved("the General-Assistant")).toBe("general-assistant");
+  });
+
+  test("keeps a 'bot' that is part of the name, and matches no prefix of one", () => {
+    expect(resolved("Chatbot")).toBe("chatbot");
+    expect(resolved("the Chatbot")).toBe("chatbot");
+    expect(resolved("Chat")).toBe("none");
+    expect(resolved("Know")).toBe("none");
+  });
+
+  test("an exact name wins over a looser reading of another", () => {
+    const both = [
+      profile({ id: "knowledge", name: "Knowledge" }),
+      profile({ id: "knowledge-bot", name: "Knowledge Bot" }),
+    ];
+    expect(resolved("Knowledge Bot", both)).toBe("knowledge-bot");
+    expect(resolved("Knowledge", both)).toBe("knowledge");
+    // Neither is named exactly this, and it reads as both: refused rather than guessed.
+    expect(resolved("the Knowledge Bot", both)).toBe("ambiguous");
+  });
+
+  test("a hidden or deleted Bot is never reached by a looser name", () => {
+    const gone = [
+      profile({ id: "knowledge", name: "Knowledge", hidden: true }),
+      profile({ id: "archive", name: "Archive", deletedAt: new Date() }),
+    ];
+    expect(resolved("the Knowledge Bot", gone)).toBe("none");
+    expect(resolved("Archive Bot", gone)).toBe("none");
   });
 });

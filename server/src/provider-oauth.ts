@@ -53,10 +53,15 @@ const schema = z.object({
 const providers = {
   google: {
     token: "https://oauth2.googleapis.com/token",
+    // Google's native listing: the compatibility API's carries no more than names.
+    models:
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
   },
   xai: {
     token: "https://auth.x.ai/oauth2/token",
     chat: "https://api.x.ai/v1/chat/completions",
+    // xAI's own listing, which carries each model's efforts, default effort and modalities.
+    models: "https://api.x.ai/v1/language-models",
   },
 };
 
@@ -227,9 +232,15 @@ export function createProviderOAuthProxy(
     if (!sameToken(offered, `Bearer ${current.proxyToken}`))
       return refused(401, "The local model proxy requires authentication.");
 
+    /*
+     * `GET .../models`: the models this sign-in can use, for the composer's picker
+     * (`model-catalogue.ts`). Answered with the provider's own listing as it came, which the
+     * catalogue reads in either shape.
+     */
+    const listing = request.method === "GET";
     let body: ArrayBuffer;
     try {
-      body = await request.arrayBuffer();
+      body = listing ? new ArrayBuffer(0) : await request.arrayBuffer();
     } catch {
       return refused(400, "The model request body could not be read.");
     }
@@ -253,7 +264,7 @@ export function createProviderOAuthProxy(
     }
 
     let google: ReturnType<typeof googleRequest> | undefined;
-    if (current.provider === "google") {
+    if (current.provider === "google" && !listing) {
       try {
         google = googleRequest(JSON.parse(new TextDecoder().decode(body)));
       } catch {
@@ -271,6 +282,15 @@ export function createProviderOAuthProxy(
       });
       if (credential.provider === "google" && credential.quotaProject)
         headers.set("x-goog-user-project", credential.quotaProject);
+      if (listing) {
+        headers.delete("content-type");
+        return requestProvider(providers[credential.provider].models, {
+          method: "GET",
+          headers,
+          redirect: "error",
+          signal: request.signal,
+        });
+      }
       return requestProvider(google?.url ?? providers.xai.chat, {
         method: "POST",
         headers,
@@ -293,6 +313,17 @@ export function createProviderOAuthProxy(
       }
       if (!response.ok) {
         await response.body?.cancel();
+        /*
+         * A listing refused with a token that has just been refreshed says this sign-in may not
+         * list models, not that it has lapsed: chat on the same token is what decides that. Told
+         * to sign in again here, the person was asked to fix a sign-in that worked, and the
+         * catalogue falls back to the models this sign-in can use (`model-catalogue.ts`).
+         */
+        if (response.status === 401 && listing)
+          return refused(
+            401,
+            "The model provider does not list models for this sign-in.",
+          );
         if (response.status === 401)
           throw new SignInRequired("The model provider refused this sign-in.");
         return refused(
@@ -301,6 +332,14 @@ export function createProviderOAuthProxy(
         );
       }
       clearDesktopConnectionFailure("model");
+      if (listing)
+        return new Response(response.body, {
+          status: response.status,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          },
+        });
       if (google)
         return await googleResponse(
           response,
@@ -338,8 +377,12 @@ export function mountProviderOAuthProxy<T extends Env>(
   app: Hono<T>,
   proxy: ModelProviderProxy | undefined,
 ): void {
-  if (proxy)
+  if (proxy) {
     app.post("/api/model-provider/v1/chat/completions", (context) =>
       proxy(context.req.raw),
     );
+    app.get("/api/model-provider/v1/models", (context) =>
+      proxy(context.req.raw),
+    );
+  }
 }

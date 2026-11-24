@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { connectionKindFor } from "@/routes/_authed/admin/plugins/$key";
+import { connectionKindFor } from "@/components/manage/plugin-page";
 
 /**
  * Which shape the connector page draws, decided from the row rather than guessed.
@@ -25,4 +25,13 @@ test("a server added by URL still falls back to the shared-token shape", () => {
   expect(connectionKindFor({ provenance: "custom" } as never, undefined)).toBe(
     "deployment-bearer",
   );
+});
+
+test("a server added by URL and marked with an Entra scope is reached as the person asking, with no token to paste", () => {
+  expect(
+    connectionKindFor(
+      { provenance: "custom", entraScope: "api://hr-api/.default" } as never,
+      undefined,
+    ),
+  ).toBe("person-entra");
 });

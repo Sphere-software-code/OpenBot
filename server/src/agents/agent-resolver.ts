@@ -4,11 +4,16 @@ import type { AuditInitiator } from "../audit";
 import type { AgentFetch, StallGuard } from "../channels/stall-guard";
 import {
   type HandoffForRun,
+  type HoldsTools,
   type LoadAgentsForActor,
   type LoadAttachment,
   type LoadInstructions,
+  type LoadAppsForBot,
   type LoadToolsForBot,
   type MarkAttachmentsSent,
+  onOpenBotRunner,
+  type PickedModel,
+  type RecordToolLimitRefusal,
   type RuntimeModel,
   resolveRuntimeAgents,
   type SignRun,
@@ -17,11 +22,23 @@ import {
 import type { AcquireLearnedSkills } from "../learning/runtime";
 import type { LoadPersonalMemory } from "../memory/tools";
 import { NameContextMiddleware } from "../people/name-context";
+import { isProactiveInitiator } from "../proactive/initiator";
+import type { ProductTelemetry } from "../telemetry/product";
 import type { AgentActor } from "./profile-types";
 
 export type AgentResolutionContext = {
   initiator?: AuditInitiator;
   depth?: number;
+  /**
+   * A subagent's run (agents/subagent.ts): the same Bot with no coordination at all, so it can
+   * neither start a subagent of its own nor reach past itself to another Bot or a person.
+   */
+  subagent?: boolean;
+  /**
+   * Which runs on the Bots built may hold their tools. Absent means every run does. Set only for the
+   * runtime's own map, which it also runs for itself (`isAskedRun` in copilot.ts).
+   */
+  holdsTools?: HoldsTools;
 };
 
 export class CoworkerUnavailableError extends Error {}
@@ -29,6 +46,7 @@ export class CoworkerUnavailableError extends Error {}
 export type ActorAgentResolver = {
   resolveAgentsForActor(
     actor: AgentActor,
+    context?: AgentResolutionContext,
   ): Promise<Record<string, AbstractAgent>>;
   resolveAgentForActor(
     actor: AgentActor,
@@ -38,6 +56,7 @@ export type ActorAgentResolver = {
 };
 
 export type ActorAgentResolverDependencies = {
+  productTelemetry?: Pick<ProductTelemetry, "middleware">;
   loadNameForActor?: (actorId: string) => Promise<string | null>;
   loadAgents: LoadAgentsForActor;
   model: RuntimeModel;
@@ -47,6 +66,8 @@ export type ActorAgentResolverDependencies = {
     actorId: string,
     initiator?: AuditInitiator,
   ) => LoadToolsForBot;
+  /** The apps each Bot holds, as they stand for whoever is asking. See `LoadAppsForBot`. */
+  loadAppsForActor?: (actorId: string) => LoadAppsForBot;
   signRunForActor?: (
     actorId: string,
     initiator?: AuditInitiator,
@@ -72,6 +93,19 @@ export type ActorAgentResolverDependencies = {
   markAttachmentsSentForActor?: (actorId: string) => MarkAttachmentsSent;
   acquireLearnedSkills?: AcquireLearnedSkills;
   loadPersonalMemoryForActor?: (actorId: string) => LoadPersonalMemory;
+  /**
+   * The model a person picked for the conversation a run answers in. Absent, the deployment's. Given
+   * what started the run, so a run nobody is watching can think harder (`runModeOf`).
+   */
+  pickedModelForActor?: (
+    actorId: string,
+    initiator?: AuditInitiator,
+  ) => PickedModel;
+  /** Writes the row for a run refused for sending more tools than its model accepts. */
+  recordToolLimitRefusalForActor?: (
+    actorId: string,
+    initiator?: AuditInitiator,
+  ) => RecordToolLimitRefusal;
 };
 
 /**
@@ -105,8 +139,19 @@ export function createActorAgentResolver(
     const acquireForActor: AcquireLearnedSkills | undefined = acquire
       ? (agentId, signal) => acquire(agentId, signal, actor.id)
       : undefined;
+    /*
+     * A CHECK-IN RUNS EVERY BOT ON OPENBOT'S OWN RUNNER, and offers it everything it may read.
+     *
+     * A Bot on another framework is built as OpenBot would build it (`onOpenBotRunner`), so its own
+     * endpoint, and any tool that endpoint holds out of OpenBot's sight, is never called while nobody
+     * is watching. And its tools are not narrowed by skill: narrowing picks tools from the latest
+     * message, which for a check-in is OpenBot's own instruction, and its reads are already only what
+     * the person connected (`proactive/scope.ts`), so a narrowing could only drop an app.
+     */
+    const checkIn = isProactiveInitiator(context?.initiator);
+    const runnable = checkIn ? registered.map(onOpenBotRunner) : registered;
     return resolveRuntimeAgents(
-      () => Promise.resolve(registered),
+      () => Promise.resolve(runnable),
       deps.model,
       deps.resolveModelApiKey,
       deps.stallGuard,
@@ -114,9 +159,11 @@ export function createActorAgentResolver(
       deps.signRunForActor?.(actor.id, context?.initiator, context?.depth),
       deps.computerGuidance,
       deps.loadVendors,
-      deps.selectionForActor?.(actor.id),
+      checkIn ? undefined : deps.selectionForActor?.(actor.id),
       deps.agentFetch,
-      deps.handoffForActor?.(actor.id, context?.initiator, context?.depth),
+      context?.subagent
+        ? undefined
+        : deps.handoffForActor?.(actor.id, context?.initiator, context?.depth),
       onlyAgentId,
       deps.loadInstructionsForActor?.(actor.id),
       context?.initiator,
@@ -124,22 +171,38 @@ export function createActorAgentResolver(
       deps.markAttachmentsSentForActor?.(actor.id),
       acquireForActor,
       deps.loadPersonalMemoryForActor?.(actor.id),
+      deps.recordToolLimitRefusalForActor?.(actor.id, context?.initiator),
+      context?.holdsTools,
+      deps.pickedModelForActor?.(actor.id, context?.initiator),
+      deps.loadAppsForActor?.(actor.id),
     ).then((agents) => {
       const loadName = deps.loadNameForActor;
       if (loadName) {
-        for (const registeredAgent of registered) {
+        for (const registeredAgent of runnable) {
           if (registeredAgent.type !== "built_in") continue;
           agents[registeredAgent.id]?.use(
             new NameContextMiddleware(() => loadName(actor.id)),
           );
         }
       }
+      if (deps.productTelemetry)
+        for (const agent of Object.values(agents)) {
+          agent.use(deps.productTelemetry.middleware(actor.id));
+        }
       return agents;
     });
   };
 
-  const resolveAgentsForActor = async (actor: AgentActor) =>
-    resolveRegisteredAgents(actor, await deps.loadAgents(actor));
+  const resolveAgentsForActor = async (
+    actor: AgentActor,
+    context?: AgentResolutionContext,
+  ) =>
+    resolveRegisteredAgents(
+      actor,
+      await deps.loadAgents(actor),
+      undefined,
+      context,
+    );
 
   return {
     resolveAgentsForActor,

@@ -55,6 +55,7 @@ import type {
   RunAgentInput,
 } from "@ag-ui/client";
 import { EventType } from "@ag-ui/client";
+import { NOT_RUN_WHILE_WAITING } from "@openbot/shared/approval-outcomes";
 import { NOT_SHOWN } from "@openbot/shared/component-markers";
 import { frameFiring } from "@openbot/shared/routine-firing";
 import type { ApprovalContinuation } from "./continuation";
@@ -70,6 +71,11 @@ import type { AuditInitiator } from "./initiator";
 import { keepLease } from "./lease";
 import { TURN_LIMITS } from "./limits";
 import type { ComponentCatalog, TurnAdmission } from "./ports";
+import {
+  observeDetachedRun,
+  type StopRecorder,
+  stopRecorder,
+} from "./run-stop";
 import { historyOrEmpty } from "./thread-history";
 
 /** Everything a headless turn needs, injectable so tests never dial a model. */
@@ -91,8 +97,25 @@ export type TurnRunner = (input: {
   runId?: string;
   /** How deep in a Bot-to-Bot chain this turn is. Absent is a person's own turn, depth zero. */
   depth?: number;
+  /** Trusted host context, never a browser-provided analytics claim. */
+  telemetry?: {
+    trigger: "human" | "routine" | "followup" | "subagent" | "unknown";
+    surface?: "web" | "desktop" | "mobile" | "external_channel" | "unknown";
+    rootTaskId?: string;
+    /** The root task this turn works for, as its parent run's context already states it. */
+    inheritedRootTaskId?: string;
+    parentRunId?: string;
+    attempt?: number;
+  };
   /** The reply so far, each time more of it arrives, for a surface that shows a turn in progress. */
   onText?: (text: string) => void;
+  /**
+   * The skill the person picked for this turn, by its command, when the host resolved one: a group
+   * turn's message starts with the group's framing, so the `/<command>` the person began with is not
+   * where the server looks for it. Only a slug; the server reads the skill's instructions from its
+   * own store, and only for a skill this Bot holds. See `PICKED_SKILL_PROP`.
+   */
+  skill?: string;
 }) => Promise<{ replyText: string; components?: DrawnComponent[] }>;
 
 /** A display component the Bot drew in a turn and the server allowed, with the props it drew. */
@@ -137,6 +160,12 @@ export type IntelligenceLike = {
     agentId: string;
     ttlSeconds?: number;
     learningContainerId?: string;
+    /**
+     * The run's analytics context, which the platform records with the run. Sent on the wire only
+     * by a runtime that knows the field, as the one OpenBot installs does; `@copilotkit/runtime`
+     * 1.83.0 dropped it and locked as before.
+     */
+    analyticsContext?: Record<string, unknown>;
   }): Promise<unknown>;
   /** NOTE: no `userId` and no `agentId` — renew is identified by the thread and the run alone. */
   ɵrenewThreadLock(params: {
@@ -147,6 +176,14 @@ export type IntelligenceLike = {
   ɵcleanupThreadLock(params: {
     threadId: string;
     runId: string;
+  }): Promise<void>;
+  /** Records a stop OpenBot made; absent before `@copilotkit/runtime` has it. See `run-stop.ts`. */
+  ɵrecordRunStop?(params: {
+    threadId: string;
+    runId: string;
+    userId: string;
+    agentId: string;
+    signal?: AbortSignal;
   }): Promise<void>;
 };
 
@@ -169,6 +206,8 @@ export type RunnerLike = {
     agent: AbstractAgent;
     input: RunAgentInput;
     persistedInputMessages?: Message[];
+    /** Called by a runner that records its own stops; ignored by one that does not. */
+    recordStop?: StopRecorder;
   }): EventStream;
   stop(request: {
     threadId: string;
@@ -293,6 +332,10 @@ export function turnMessages(input: {
   continuation?: Parameters<TurnRunner>[0]["continuation"];
 }): { messages: Message[]; persistedInputMessages: Message[] } {
   const { seeded, historicIds, turn, continuation } = input;
+  /*
+   * A turn whose message the thread already holds is a retry of it, which a failed run that got as
+   * far as persisting its input leaves behind: the message is there once, never sent twice.
+   */
   const messages: Message[] = continuation
     ? sanitizeSeededHistory([
         ...continuation.snapshot.messages,
@@ -302,8 +345,11 @@ export function turnMessages(input: {
           toolCallId: continuation.snapshot.toolCallId,
           ...continuation.result,
         },
+        ...notRunBeside(continuation),
       ])
-    : [...seeded, turn];
+    : seeded.some((message) => message.id === turn.id)
+      ? seeded
+      : [...seeded, turn];
   return {
     messages,
     persistedInputMessages: messages.filter(
@@ -312,7 +358,52 @@ export function turnMessages(input: {
   };
 }
 
+/**
+ * An answer for each step asked for beside the one the turn stopped on, which never ran.
+ *
+ * A Bot asks for several steps at once (filling in a form's fields is one breath), and the turn stops
+ * at the first that waits for the person: the browser and the headless runner both run the steps in
+ * order and stop there. The ones after it were never run and nothing will ever answer them. Left
+ * unanswered, the history sanitizer dropped them, so the Bot never learned they had not happened,
+ * and the Claude Agent SDK's Bot, which waits for an answer to every step it asked for before it
+ * goes on, waited for them for ever: the person's decision reached it and it said nothing.
+ *
+ * A step that was answered before the turn stopped keeps its answer; only a step with none gets this.
+ */
+function notRunBeside(
+  continuation: NonNullable<Parameters<TurnRunner>[0]["continuation"]>,
+): Message[] {
+  const { messages, toolCallId } = continuation.snapshot;
+  const asked = messages.find(
+    (message) =>
+      message.role === "assistant" &&
+      message.toolCalls?.some((call) => call.id === toolCallId),
+  );
+  if (asked?.role !== "assistant") return [];
+  const answered = new Set(
+    messages.flatMap((message) =>
+      message.role === "tool" ? [message.toolCallId] : [],
+    ),
+  );
+  return (asked.toolCalls ?? [])
+    .filter((call) => call.id !== toolCallId && !answered.has(call.id))
+    .map((call) => ({
+      id: `${continuation.messageId}:${call.id}`,
+      role: "tool" as const,
+      toolCallId: call.id,
+      content: NOT_RUN_WHILE_WAITING,
+      error: NOT_RUN_WHILE_WAITING,
+    }));
+}
+
 /** The run's input: this run's id, the conversation, the tools it is offered, and any resume. */
+/**
+ * The `forwardedProps` key a headless turn names the skill the person picked under. The server's
+ * runtime reads it (`server/src/plugins/picked-skill.ts`) beside the `/<command>` a browser message
+ * starts with.
+ */
+export const PICKED_SKILL_PROP = "openbotSkill";
+
 export function turnInput(input: {
   threadId: string;
   runId: string;
@@ -320,8 +411,11 @@ export function turnInput(input: {
   state: unknown;
   tools: readonly HeadlessTool[];
   continuation?: Parameters<TurnRunner>[0]["continuation"];
+  skill?: string;
 }): RunAgentInput {
-  const { threadId, runId, messages, state, tools, continuation } = input;
+  const { threadId, runId, messages, state, tools, continuation, skill } =
+    input;
+  const carried = continuation?.snapshot.forwardedProps;
   return {
     threadId,
     runId,
@@ -329,7 +423,13 @@ export function turnInput(input: {
     state,
     tools: tools.filter((tool) => !tool.hidden).map((tool) => tool.definition),
     context: continuation?.snapshot.context ?? [],
-    forwardedProps: continuation?.snapshot.forwardedProps,
+    // An approval's resume carries what the run it continues was sent, the picked skill with it.
+    forwardedProps: skill
+      ? {
+          ...(carried && typeof carried === "object" ? carried : {}),
+          [PICKED_SKILL_PROP]: skill,
+        }
+      : carried,
     ...(continuation
       ? {
           resume: [
@@ -340,6 +440,40 @@ export function turnInput(input: {
             },
           ],
         }
+      : {}),
+  };
+}
+
+/**
+ * Where a host leaves a run's analytics context: the forwardedProps key CopilotKit's runtime reads
+ * for a browser run and sends, as `analyticsContext`, on the thread lock. This file is that engine
+ * for a turn with no browser, so it reads the same key.
+ */
+const ANALYTICS_CONTEXT = "__copilotkitAnalyticsContext";
+
+/** The run's input without the analytics context, and the context when it is an object. */
+function takeAnalyticsContext(input: RunAgentInput): {
+  input: RunAgentInput;
+  analyticsContext?: Record<string, unknown>;
+} {
+  const props: unknown = input.forwardedProps;
+  if (
+    typeof props !== "object" ||
+    props === null ||
+    Array.isArray(props) ||
+    !Object.hasOwn(props, ANALYTICS_CONTEXT)
+  )
+    return { input };
+  const { [ANALYTICS_CONTEXT]: context, ...rest } = props as Record<
+    string,
+    unknown
+  >;
+  return {
+    input: { ...input, forwardedProps: rest },
+    ...(typeof context === "object" &&
+    context !== null &&
+    !Array.isArray(context)
+      ? { analyticsContext: context as Record<string, unknown> }
       : {}),
   };
 }
@@ -372,6 +506,7 @@ async function takeLease(input: {
   agentId: string;
   ttlSeconds: number;
   learningContainerId?: string;
+  analyticsContext?: Record<string, unknown>;
   heartbeatMs: number;
   onLost: (error: unknown) => void;
 }): Promise<Lease> {
@@ -383,6 +518,7 @@ async function takeLease(input: {
     agentId,
     ttlSeconds,
     learningContainerId,
+    analyticsContext,
     heartbeatMs,
     onLost,
   } = input;
@@ -393,6 +529,7 @@ async function takeLease(input: {
     agentId,
     ttlSeconds,
     ...(learningContainerId ? { learningContainerId } : {}),
+    ...(analyticsContext ? { analyticsContext } : {}),
   });
 
   const heartbeat = keepLease({
@@ -501,6 +638,19 @@ export function settle(evidence: TurnEvidence): TurnOutcome {
 }
 
 /**
+ * A turn that finished and said nothing. A failure for a turn somebody is waiting to read, which is
+ * every turn but one: a check-in that read what it was asked to and found nothing new often ends
+ * without a closing line, and for it silence is the answer. Its own class so that caller can tell
+ * this apart by type; everyone else meets it as the error it always was, word for word.
+ */
+export class EmptyTurnError extends Error {
+  constructor() {
+    super("The turn finished without saying anything.");
+    this.name = "EmptyTurnError";
+  }
+}
+
+/**
  * The outcome as the caller receives it: a reply, or the error that names what happened.
  *
  * For a lost lock and a deadline, `stopped` is awaited first — the reference's own order
@@ -530,7 +680,7 @@ async function conclude(
         "The turn stopped to ask a question, and a routine has nobody to ask.",
       );
     case "empty":
-      throw new Error("The turn finished without saying anything.");
+      throw new EmptyTurnError();
     case "completed":
       return outcome.components.length > 0
         ? { replyText: outcome.replyText, components: outcome.components }
@@ -583,6 +733,17 @@ export function createTurnRunner(options: {
    * `config.ts`.
    */
   freshContextBots?: ReadonlySet<string>;
+  /** Host-owned input enrichment before the runner publishes RUN_STARTED.input. */
+  prepareRunInput?: (
+    input: RunAgentInput,
+    turn: Parameters<TurnRunner>[0],
+  ) => Promise<RunAgentInput>;
+  /** A cancellation/timeout this host actually observed, separate from stream completion. */
+  onKnownStop?: (
+    actorUserId: string,
+    runId: string,
+    outcome: "cancelled" | "timeout",
+  ) => Promise<void>;
 }): TurnRunner {
   const {
     intelligence,
@@ -599,23 +760,25 @@ export function createTurnRunner(options: {
     freshContextBots,
   } = options;
 
-  return async ({
-    ownerUserId,
-    routineId,
-    agentId,
-    threadId,
-    instruction,
-    initiator: suppliedInitiator,
-    continuation,
-    signal,
-    userMessage,
-    runId: suppliedRunId,
-    depth,
-    onText,
-  }) => {
+  return async (hostTurn) => {
+    let {
+      ownerUserId,
+      routineId,
+      agentId,
+      threadId,
+      instruction,
+      initiator: suppliedInitiator,
+      continuation,
+      signal,
+      userMessage,
+      runId: suppliedRunId,
+      depth,
+      onText,
+      skill,
+    } = hostTurn;
     if (signal?.aborted) throw new Error("The headless turn was cancelled.");
     // A paused Bot or a refused capability throws here; a pause mid-turn aborts the returned signal.
-    signal = await admission({ ownerUserId, agentId, signal });
+    signal = await admission({ ownerUserId, agentId, threadId, signal });
     if (continuation && continuation.snapshot.threadId !== threadId)
       throw new Error(
         "The interrupted conversation does not match this thread.",
@@ -735,6 +898,28 @@ export function createTurnRunner(options: {
       ...(depth ? { depth } : {}),
     });
     agent.threadId = threadId;
+    /*
+     * A Stop this turn did not make itself: a person pressing Stop on the thread, which Intelligence
+     * relays to the runner. Known here as a cancel, like the turn's own. A lost lock is the turn's
+     * own stop and is not reported as one.
+     */
+    let stoppingHere = false;
+    observeDetachedRun(
+      agent,
+      () => stoppingHere,
+      () => {
+        void options
+          .onKnownStop?.(ownerUserId, runId, "cancelled")
+          .catch(() => {
+            console.warn(
+              JSON.stringify({
+                type: "product-telemetry",
+                reason: "stop_observation_failed",
+              }),
+            );
+          });
+      },
+    );
     agent.setMessages(messages);
     if (continuation) agent.setState(continuation.snapshot.state);
     const headlessTools = [
@@ -755,14 +940,38 @@ export function createTurnRunner(options: {
       agent.use(new HeadlessToolsMiddleware(headlessTools, initiator));
     if (signal?.aborted) throw new Error("The headless turn was cancelled.");
 
-    const input = turnInput({
+    let input = turnInput({
       threadId,
       runId,
       messages,
       state: agent.state,
       tools: headlessTools,
       ...(continuation ? { continuation } : {}),
+      ...(skill ? { skill } : {}),
     });
+
+    let stated = false;
+    if (options.prepareRunInput) {
+      try {
+        input = await options.prepareRunInput(input, hostTurn);
+        stated = true;
+      } catch {
+        console.warn(
+          JSON.stringify({
+            type: "product-telemetry",
+            reason: "headless_context_failed",
+          }),
+        );
+      }
+    }
+    /*
+     * The analytics context goes on the lock and nowhere else, as the runtime does for a browser
+     * run: the agent and the run's stored events never see it. Only a context the host stated for
+     * THIS turn is sent; one left in a resumed run's forwardedProps is dropped with the key.
+     */
+    const taken = takeAnalyticsContext(input);
+    input = taken.input;
+    const analyticsContext = stated ? taken.analyticsContext : undefined;
 
     /*
      * The reply is recovered by diffing the agent, because the runner throws away what `runAgent`
@@ -796,6 +1005,7 @@ export function createTurnRunner(options: {
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let backstop: ReturnType<typeof setTimeout> | undefined;
     let heartbeatError: unknown;
+    let lockLost = false;
     let waiting: HeadlessToolSuspension | undefined;
     /** Whether the deadline stopped this turn. See `settle`. */
     let stopped = false;
@@ -814,6 +1024,7 @@ export function createTurnRunner(options: {
 
     /** Stop this exact run, both ends: the agent's own abort and the runner's stop flag. */
     const stopTurn = () => {
+      stoppingHere = true;
       try {
         agent.abortRun();
       } catch {
@@ -833,6 +1044,7 @@ export function createTurnRunner(options: {
       agentId,
       ttlSeconds: lockTtlSeconds,
       ...(learningContainerId ? { learningContainerId } : {}),
+      ...(analyticsContext ? { analyticsContext } : {}),
       heartbeatMs,
       /*
        * A lock we no longer hold means somebody else is in this thread — the person, most likely,
@@ -841,6 +1053,7 @@ export function createTurnRunner(options: {
        */
       onLost: (error) => {
         heartbeatError = error;
+        lockLost = true;
         stopTurn();
       },
     });
@@ -848,6 +1061,16 @@ export function createTurnRunner(options: {
     try {
       const cancelled = new Promise<never>((_resolve, reject) => {
         cancelTurn = () => {
+          void options
+            .onKnownStop?.(ownerUserId, runId, "cancelled")
+            .catch(() => {
+              console.warn(
+                JSON.stringify({
+                  type: "product-telemetry",
+                  reason: "stop_observation_failed",
+                }),
+              );
+            });
           stopTurn();
           reject(new Error("The headless turn was cancelled."));
         };
@@ -856,8 +1079,24 @@ export function createTurnRunner(options: {
       });
       const completed = new Promise<void>((resolve, reject) => {
         let terminal: Error | undefined;
+        /*
+         * A stop this turn makes (its cancel, a pause, the deadline) is recorded with Intelligence
+         * before the run's terminal event, so the run reads as cancelled. The runner does the
+         * recording and bounds it; see `run-stop.ts`.
+         */
+        const recordStop = stopRecorder(
+          intelligence,
+          { threadId, runId, userId: ownerUserId, agentId },
+          () => !lockLost,
+        );
         runner
-          .run({ threadId, agent, input, persistedInputMessages })
+          .run({
+            threadId,
+            agent,
+            input,
+            persistedInputMessages,
+            ...(recordStop ? { recordStop } : {}),
+          })
           .subscribe({
             /*
              * RUN_ERROR THROUGH `next` IS TERMINAL. The Intelligence runner reports a failed run by
@@ -898,6 +1137,16 @@ export function createTurnRunner(options: {
       const timeout = new Promise<never>((_resolve, reject) => {
         deadline = setTimeout(() => {
           stopped = true;
+          void options
+            .onKnownStop?.(ownerUserId, runId, "timeout")
+            .catch(() => {
+              console.warn(
+                JSON.stringify({
+                  type: "product-telemetry",
+                  reason: "stop_observation_failed",
+                }),
+              );
+            });
           stopTurn();
         }, turnTimeoutMs);
         deadline.unref?.();

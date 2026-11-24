@@ -1,16 +1,21 @@
 import {
   IconArrowLeft,
+  IconBrain,
   IconBuildingBank,
+  IconBulb,
   IconChecks,
   IconCode,
   IconDeviceDesktop,
-  IconFileText,
   IconKey,
   IconLayoutGrid,
   IconListDetails,
+  IconLockAccess,
   IconPuzzle,
+  IconRadar,
   IconShieldCheck,
+  IconSlash,
   IconUsers,
+  IconZoomQuestion,
 } from "@tabler/icons-react";
 import { Link, type LinkOptions } from "@tanstack/react-router";
 import type * as React from "react";
@@ -25,6 +30,7 @@ import {
   SidebarMenuItem,
   SidebarRail,
 } from "@/components/ui/sidebar";
+import { managePaths } from "@/lib/manage-paths";
 
 const appLinkOptions = { to: "/" } satisfies LinkOptions;
 const adminLinkOptions = { to: "/admin" } satisfies LinkOptions;
@@ -78,14 +84,24 @@ const GROUPS: {
         linkOptions: { to: "/admin/plugins" },
       },
       {
+        title: "Providers",
+        icon: IconBrain,
+        linkOptions: { to: "/admin/providers" },
+      },
+      {
         title: "Skills",
-        icon: IconFileText,
+        icon: IconSlash,
         linkOptions: { to: "/admin/skills" },
       },
       {
         title: "Automatic learning",
-        icon: IconFileText,
+        icon: IconBulb,
         linkOptions: { to: "/admin/learning" },
+      },
+      {
+        title: "Check-ins",
+        icon: IconRadar,
+        linkOptions: { to: "/admin/proactive" },
       },
       {
         title: "UI components",
@@ -108,6 +124,11 @@ const GROUPS: {
         linkOptions: { to: "/admin/people" },
       },
       {
+        title: "Permissions",
+        icon: IconLockAccess,
+        linkOptions: { to: "/admin/permissions" },
+      },
+      {
         title: "Identity providers",
         icon: IconBuildingBank,
         linkOptions: { to: "/admin/identity-providers" },
@@ -118,9 +139,14 @@ const GROUPS: {
     label: "What happened",
     items: [
       {
-        title: "Audit",
+        title: managePaths("team").auditLabel,
         icon: IconListDetails,
         linkOptions: { to: "/admin/audit" },
+      },
+      {
+        title: "What would happen",
+        icon: IconZoomQuestion,
+        linkOptions: { to: "/admin/what-if" },
       },
     ],
   },
@@ -130,7 +156,7 @@ export function AdminSidebar({
   ...props
 }: React.ComponentProps<typeof Sidebar>) {
   return (
-    <Sidebar {...props}>
+    <Sidebar variant="inset" {...props}>
       {/*
        * Pinned to the same height as the app sidebar's header. Left to itself this one is 60px
        * against the app's 45px — `p-2` around a `size="lg"` button rather than a fixed height — so

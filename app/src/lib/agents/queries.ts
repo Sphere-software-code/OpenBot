@@ -27,6 +27,16 @@ export type AgentProfile = {
    * deployment's own credential and needs no setup at all.
    */
   builtIn: boolean;
+  /**
+   * Whether it runs inside OpenBot on OpenBot's own model. Only such a Bot gets the composer's model
+   * picker; a Bot on its own framework picks its own model. Absent reads as no.
+   */
+  runsOnOpenBotModel?: boolean;
+  /**
+   * Whether OpenBot gives it a key for its tools on every run, because OpenBot runs it: the harness
+   * picked in setup, or the Bot in the box. It needs no key of its own. Absent reads as no.
+   */
+  keyFromOpenBot?: boolean;
   /** Whether a key is set for it. Never the key itself. */
   hasAuth: boolean;
   /**
@@ -65,6 +75,17 @@ export type AgentProfile = {
    * longer holds "Isolated Bots". `deployment`: this OpenBot cannot make a second computer.
    */
   isolationOffReason: "admin" | "deployment" | null;
+  /**
+   * What the starter Bot is told, kept apart from `roleDescription`, which says what it does and is
+   * what the conversation header shows. Only the starter has these. Every other Bot's instructions
+   * are its role description, and its profile leaves this out.
+   */
+  instructions?: string | null;
+  /**
+   * What runs it, by the name a person reads ("LangChain", "OpenBot"). Absent when
+   * OpenBot doesn't know, such as an agent connected by address with no framework named.
+   */
+  framework?: string;
 };
 
 /**
@@ -106,7 +127,7 @@ export function agentCapabilitiesQueryOptions() {
     queryKey: agentKeys.capabilities(),
     queryFn: (): Promise<AgentCapabilities> =>
       client("/api/agents/capabilities", "capabilities", {
-        fallback: "Could not load what this deployment supports",
+        fallback: "Couldn't load what OpenBot supports.",
       }),
     // Deployment configuration, not data: it cannot change without the server restarting.
     staleTime: Number.POSITIVE_INFINITY,

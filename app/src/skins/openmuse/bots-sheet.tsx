@@ -9,10 +9,11 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { AbstractAvatar } from "@/components/agents/abstract-avatar";
 import {
   attentionSummary,
-  needsInput,
+  waitingOnYou,
 } from "@/components/bot-profile/attention";
 import { Item, ItemContent, ItemTitle } from "@/components/ui/item";
 import { agentListQueryOptions } from "@/lib/agents/queries";
+import { shownSubtitle } from "@/lib/agents/subtitle";
 import { botAttentionQueryOptions } from "@/lib/bot-lifecycle/queries";
 import { channelListQueryOptions } from "@/lib/channels/queries";
 import { appConfig } from "@/lib/generated/application-config";
@@ -64,7 +65,7 @@ export function BotsSheet({ onClose }: { onClose: () => void }) {
               const waiting = attention.data?.find(
                 (entry) => entry.agentId === agent.id,
               );
-              const asks = waiting ? needsInput(waiting) : 0;
+              const asks = waiting ? waitingOnYou(waiting) : 0;
               const summary = waiting ? attentionSummary(waiting) : "";
               const selected = agent.id === centre?.id;
               return (
@@ -92,7 +93,9 @@ export function BotsSheet({ onClose }: { onClose: () => void }) {
                     <span className={cn(museText.small, "line-clamp-1")}>
                       {asks
                         ? `Needs you · ${summary}`
-                        : summary || agent.title || agent.roleDescription}
+                        : summary ||
+                          (agent.title && shownSubtitle(agent.title)) ||
+                          agent.roleDescription}
                     </span>
                   </ItemContent>
                   {selected ? (

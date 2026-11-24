@@ -16,7 +16,13 @@ import {
   Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
-import { cleanup, render, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   type BrokeredAccount,
@@ -219,6 +225,8 @@ type Deployment = {
   authScheme?: string;
   /** What the app publishes as the things a person types in, for the `API_KEY` schemes. */
   fields?: BrokerField[];
+  /** Where the key comes from, as the server answers it beside the fields. Absent by default. */
+  guide?: { steps: string; url: string | null };
   /** Whether a real call was ever made with this key and worked, as this deployment recorded it. */
   verified?: boolean;
   /** When that happened. Null wherever `verified` is false — a check that failed records no time. */
@@ -339,6 +347,10 @@ type Server = {
    * longer publishes is a 400 on the whole connection, however tidy the screen looked.
    */
   submitted: Record<string, string>[];
+  /** How many times the vendor was asked about the account (`/connection/confirm`). */
+  confirmsAsked: number;
+  /** What the vendor answers about the account from now on: a consent finished elsewhere. */
+  answer: (confirms: boolean) => void;
 };
 
 /**
@@ -386,6 +398,10 @@ function installDeployment(deployment: Deployment): Server {
       state.refusesFields = refusal;
     },
     submitted: [],
+    confirmsAsked: 0,
+    answer: (confirms) => {
+      state.confirms = confirms;
+    },
   };
 
   global.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -445,6 +461,7 @@ function installDeployment(deployment: Deployment): Server {
       });
     }
     if (path.endsWith("/connection/confirm") && method === "POST") {
+      server.confirmsAsked += 1;
       // What the route answers with no key at all: nothing to ask, and no answer invented.
       if (!state.composioConfigured) {
         return new Response(
@@ -554,7 +571,11 @@ function installDeployment(deployment: Deployment): Server {
         );
       }
       if (SERVER_FIELD_SCHEMES.includes(state.authScheme)) {
-        return json({ fields: state.fields });
+        return json(
+          deployment.guide
+            ? { fields: state.fields, guide: deployment.guide }
+            : { fields: state.fields },
+        );
       }
       return json({ authorizationUrl: CONSENT_URL });
     }
@@ -697,7 +718,10 @@ afterEach(() => {
  * shell, neither of which this file is about. The index route is registered only so
  * the Back link has something to build an href from.
  */
-function renderAccountScreen(client: QueryClient) {
+function renderAccountScreen(
+  client: QueryClient,
+  at = `/connections/${APP_KEY}`,
+) {
   const rootRoute = createRootRoute({ component: Outlet });
   const authedRoute = createRoute({
     id: "/_authed",
@@ -736,7 +760,7 @@ function renderAccountScreen(client: QueryClient) {
   const router = createRouter({
     routeTree: tree,
     history: createMemoryHistory({
-      initialEntries: [`/connections/${APP_KEY}`],
+      initialEntries: [at],
     }),
   });
   return render(
@@ -934,6 +958,44 @@ test("a key app asks for what the app asked for, with its own help text", async 
   expect(view.queryByText(/starting with 'pplx-'/)).toBeTruthy();
 });
 
+/**
+ * THE DIALOG SAYS WHY IT ASKS FOR A KEY AND WHERE TO GET ONE, ABOVE THE BOXES.
+ *
+ * Reported from OpenBot Desktop 0.3.3: Connect on a key-only app opened a form with the provider's
+ * developer wording and nothing else, and the person, who expected a sign-in, had nowhere to go.
+ * The guide is the server's answer for 1Password (see `server/src/plugins/key-guides.ts`).
+ */
+test("a key app's dialog explains the key and links to the provider's page for it", async () => {
+  installDeployment({
+    authScheme: "API_KEY",
+    composioConfigured: true,
+    confirms: false,
+    fields: [PERPLEXITY_KEY],
+    guide: {
+      steps:
+        "1Password connects through a Connect server that your 1Password admin runs. They create it in 1Password.com under Developer, along with an access token for it.",
+      url: "https://www.1password.dev/connect/get-started",
+    },
+    recorded: false,
+  });
+
+  const view = renderAccountScreen(queryClient());
+  await userEvent.click(await view.findByRole("button", { name: "Connect" }));
+
+  const guide = await view.findByTestId("key-guide");
+  expect(guide.textContent).toContain(
+    "Gmail doesn't offer a sign-in here, so it connects with a key from your Gmail account.",
+  );
+  expect(guide.textContent).toContain("Connect server");
+  const link = view.getByRole("link", { name: /Get a key from Gmail/ });
+  expect(link.getAttribute("href")).toBe(
+    "https://www.1password.dev/connect/get-started",
+  );
+  expect(link.getAttribute("target")).toBe("_blank");
+  // The guide sits above the form, which still draws the app's own box.
+  expect(await view.findByLabelText("API Key")).toBeTruthy();
+});
+
 test("a key app nobody has connected says it will ask for a key, not send you off", async () => {
   installDeployment({
     authScheme: "API_KEY",
@@ -946,7 +1008,9 @@ test("a key app nobody has connected says it will ask for a key, not send you of
   const view = renderAccountScreen(queryClient());
 
   expect(
-    await view.findByText(/Gmail connects with a key you already have/),
+    await view.findByText(
+      /Needs a key from Gmail\. Connect shows where to get one\./,
+    ),
   ).toBeTruthy();
   /*
    * The screen's own not-connected sentence is written for the kind that leaves, and pressing
@@ -969,7 +1033,12 @@ test("a key app nobody has connected keeps the screen's own reassurance", async 
 
   // The row's own sentence, which is the one the screen's cannot be: pressing Connect here opens a
   // form rather than leaving for a consent screen.
-  expect(await view.findByText(/Connect asks for it\./)).toBeTruthy();
+  expect(
+    await view.findByText(/Connect shows where to get one\./),
+  ).toBeTruthy();
+  // And the row above it no longer says there is nothing to paste.
+  expect(view.queryByText(/There is no token to paste/)).toBeNull();
+  expect(view.getByText(/with a key from the app/)).toBeTruthy();
   /*
    * And the half of the screen's line that survives it. Replacing the whole line took away the one
    * thing an administrator reading this row needs to know — that the connector is finished whether
@@ -977,7 +1046,7 @@ test("a key app nobody has connected keeps the screen's own reassurance", async 
    */
   expect(
     view.getByText(
-      /Setup is complete without it, and it reaches your documents only/,
+      /Setup is complete without it, and it reaches only your own Gmail account/,
     ),
   ).toBeTruthy();
 });
@@ -1102,6 +1171,46 @@ test("a consent app's Connect leaves for the vendor's own page", async () => {
   }
 });
 
+test("in OpenBot Desktop, the page asks again once the window is back in front", async () => {
+  /*
+   * The window sends the sign-in to the person's browser and this page stays where it is, so it
+   * never arrives here again to confirm on load. The browser hands the person back to the window
+   * when the sign-in is done, and the focus that brings is when the account is asked about.
+   */
+  const server = installDeployment({
+    authScheme: "OAUTH2",
+    composioConfigured: true,
+    confirms: false,
+    recorded: false,
+  });
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke: async () => null,
+    transformCallback: () => 0,
+  };
+  const watched = watchNavigation();
+
+  try {
+    const view = renderAccountScreen(queryClient());
+    await userEvent.click(await view.findByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(watched.navigations).toEqual([CONSENT_URL]));
+    const before = server.confirmsAsked;
+
+    server.answer(true);
+    window.dispatchEvent(new Event("focus"));
+
+    await waitFor(() => expect(server.confirmsAsked).toBe(before + 1));
+    expect(
+      await view.findByRole("button", { name: "Disconnect" }),
+    ).toBeTruthy();
+    // Once per sign-in: a later focus asks nothing more.
+    window.dispatchEvent(new Event("focus"));
+    expect(server.confirmsAsked).toBe(before + 1);
+  } finally {
+    watched.restore();
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  }
+});
+
 test("a typed scheme this screen does not know is refused, not navigated to undefined", async () => {
   installDeployment({
     /*
@@ -1174,8 +1283,8 @@ test("the row names the app rather than calling it the app", async () => {
  */
 function accountState(overrides: Partial<BrokeredAccount>): BrokeredAccount {
   return {
-    authorizesPerAction: false,
     configured: true,
+    reconnectsInPlace: false,
     connect: () => {},
     connected: false,
     connecting: false,
@@ -1183,6 +1292,7 @@ function accountState(overrides: Partial<BrokeredAccount>): BrokeredAccount {
     disconnected: false,
     disconnecting: false,
     fields: null,
+    guide: null,
     /*
      * NULL BESIDE THE NULL `submissionError` BELOW, because these cases are about the sentences the
      * ROW carries and neither refusal is one of them: both belong to the dialog, which is drawn only
@@ -1211,6 +1321,13 @@ function accountState(overrides: Partial<BrokeredAccount>): BrokeredAccount {
     submittingFields: false,
     verified: false,
     verifiedAt: null,
+    serverId: "gmail",
+    fieldsSubmitted: false,
+    connectAnother: () => {},
+    connectingAnother: false,
+    makeDefault: () => {},
+    disconnectAccount: () => {},
+    changingAccount: null,
     ...overrides,
   };
 }
@@ -1218,13 +1335,15 @@ function accountState(overrides: Partial<BrokeredAccount>): BrokeredAccount {
 /** The row with both screens' arguments filled in, so only the account differs between cases. */
 function renderRow(account: BrokeredAccount) {
   return render(
-    <BrokeredAccountRow
-      account={account}
-      connectedDescription="A Bot granted its tools reads your Gmail as you."
-      disconnectedDescription="No Bot can read this as you."
-      provider="composio"
-      title="Gmail"
-    />,
+    <QueryClientProvider client={queryClient()}>
+      <BrokeredAccountRow
+        account={account}
+        connectedDescription="A Bot granted its tools reads your Gmail as you."
+        disconnectedDescription="No Bot can read this as you."
+        provider="composio"
+        title="Gmail"
+      />
+    </QueryClientProvider>,
   );
 }
 
@@ -1256,52 +1375,53 @@ test("both kinds say Connected, and the line beneath says how", () => {
   ).toBeTruthy();
 });
 
-test("a per-action broker offers no whole-app Connect, and still offers Disconnect", () => {
+test("a consent app offers Connect, and Disconnect once it is connected", () => {
   /*
-   * THE DEFECT THIS CLOSES, FOUND BY PRESSING THE BUTTON AND NOT BY ANY TEST. Both screens drew
-   * this row unconditionally, so under Arcade a disconnected app offered Connect — and the adapter
-   * refuses an authorization carrying no action, so the press could only ever come back with
-   * "Arcade grants per action, so an authorization needs the action it is for and none was given."
-   * Every time, with no state in which it could succeed, and with the thing the person actually
-   * wanted sitting in the list underneath.
-   */
-  const disconnected = renderRow(
-    accountState({ authorizesPerAction: true, kind: "consent" }),
-  );
-
-  expect(disconnected.queryByRole("button", { name: /Connect/ })).toBeNull();
-  expect(disconnected.getByText("Approved per action")).toBeTruthy();
-
-  cleanup();
-
-  /*
-   * AND THE OTHER HALF OF THE ROW IS UNTOUCHED, which is the part worth guarding. Per-action
-   * authorizations still add up to ONE account at the vendor, `revoke` is a real act on it, and
-   * this row is the only place it is offered — so withholding Disconnect along with Connect would
-   * strand somebody holding a live connection with no way to end it.
-   */
-  const connected = renderRow(
-    accountState({
-      authorizesPerAction: true,
-      connected: true,
-      kind: "consent",
-    }),
-  );
-
-  expect(connected.getByText("Connected")).toBeTruthy();
-  expect(connected.getByRole("button", { name: "Disconnect" })).toBeTruthy();
-  expect(connected.queryByText("Approved per action")).toBeNull();
-});
-
-test("a whole-app broker keeps its Connect", () => {
-  /*
-   * THE OTHER SIDE OF THE GATE, so the case above cannot pass by the row having lost Connect
-   * outright. Composio fixes one auth state for a whole toolkit, and one press is the whole story.
+   * ON EVERY BROKER. Arcade's apps used to draw "Approved per action" here in place of Connect,
+   * because its adapter refused a consent with no action on it. It now asks Arcade for the whole
+   * app in one consent, as Composio's Connect does, so the row is the same row on both.
    */
   const view = renderRow(accountState({ kind: "consent" }));
 
   expect(view.getByRole("button", { name: /Connect/ })).toBeTruthy();
   expect(view.queryByText("Approved per action")).toBeNull();
+
+  cleanup();
+
+  const connected = renderRow(
+    accountState({ connected: true, kind: "consent" }),
+  );
+  expect(connected.getByText("Connected")).toBeTruthy();
+  expect(connected.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+  expect(connected.queryByRole("button", { name: /Connect/ })).toBeNull();
+});
+
+test("a connected Arcade row offers Reconnect beside Disconnect, and a Composio row does not", () => {
+  /*
+   * WHERE A BOT'S CARD SENDS SOMEBODY TO RECONNECT, ON BOTH BROKERS. On Arcade a consent over the
+   * connection that stands adds what it asks for, so one press finishes reconnecting here. On
+   * Composio a second consent would attach a second account, so reconnecting is Disconnect first.
+   */
+  const pressed: string[] = [];
+  const arcade = renderRow(
+    accountState({
+      connected: true,
+      kind: "consent",
+      reconnectsInPlace: true,
+      connect: () => pressed.push("connect"),
+    }),
+  );
+  fireEvent.click(arcade.getByRole("button", { name: "Reconnect" }));
+  expect(pressed).toEqual(["connect"]);
+  expect(arcade.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+
+  cleanup();
+
+  const composio = renderRow(
+    accountState({ connected: true, kind: "consent" }),
+  );
+  expect(composio.queryByRole("button", { name: "Reconnect" })).toBeNull();
+  expect(composio.getByRole("button", { name: "Disconnect" })).toBeTruthy();
 });
 
 test("an app needing no account offers nothing to press", () => {
@@ -2516,7 +2636,7 @@ function AccountProbe() {
     verifiedAt: null,
     probe: null,
     checkable: true,
-    authorizesPerAction: false,
+    reconnectsInPlace: false,
     authScheme: "API_KEY",
     returnTo: "settings",
     report: () => {},
@@ -2660,4 +2780,141 @@ test("a re-check that spent nothing leaves the rejection the record still names"
   expect(view.getByText(/Your account is still connected/)).toBeTruthy();
   // Never the absolution, which is the other app's state and not this one's.
   expect(view.queryByText(/hasn't been checked with Gmail/)).toBeNull();
+});
+
+/**
+ * A person's accounts at the app, as `/servers/:id/accounts` answers them, for the cases below.
+ * Every other request is a 404, so nothing here can be answered by accident.
+ */
+function answerAccounts(body: unknown) {
+  global.fetch = (async (input: RequestInfo | URL) => {
+    const requested = typeof input === "string" ? input : String(input);
+    const path = requested.split("?")[0] ?? requested;
+    if (path.endsWith("/accounts")) {
+      return new Response(JSON.stringify(body), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+}
+
+test("several accounts are listed by name, each with its own Disconnect, and another can be connected", async () => {
+  answerAccounts({
+    accounts: [
+      {
+        id: "a1",
+        identity: "dana@work.example",
+        label: "dana@work.example",
+        isDefault: true,
+        connectedAt: "2026-10-01T09:00:00.000Z",
+      },
+      {
+        id: "a2",
+        identity: "dana.home@gmail.example",
+        label: "dana.home@gmail.example",
+        isDefault: false,
+        connectedAt: "2026-10-20T09:00:00.000Z",
+      },
+    ],
+    canAddAnother: true,
+  });
+  const pressed: string[] = [];
+  const view = renderRow(
+    accountState({
+      connected: true,
+      kind: "consent",
+      connectAnother: () => pressed.push("another"),
+      makeDefault: (id) => pressed.push(`default:${id}`),
+      disconnectAccount: (id) => pressed.push(`disconnect:${id}`),
+    }),
+  );
+
+  expect(await view.findByText("dana@work.example")).toBeTruthy();
+  expect(view.getByText("dana.home@gmail.example")).toBeTruthy();
+  expect(view.getByText("Your accounts")).toBeTruthy();
+  expect(
+    view.getByText(
+      "Default. Bots use this account unless you ask for another.",
+    ),
+  ).toBeTruthy();
+  // One Disconnect per account, and none for the app as a whole.
+  expect(view.getAllByRole("button", { name: "Disconnect" })).toHaveLength(2);
+  expect(view.getAllByRole("button", { name: "Make default" })).toHaveLength(1);
+
+  await userEvent.click(
+    view.getByRole("button", { name: /Connect another account/ }),
+  );
+  await userEvent.click(view.getByRole("button", { name: "Make default" }));
+  await userEvent.click(
+    view.getAllByRole("button", { name: "Disconnect" })[1] as HTMLElement,
+  );
+  expect(pressed).toEqual(["another", "default:a2", "disconnect:a2"]);
+});
+
+test("one account is named in the row, which keeps its Disconnect and offers another", async () => {
+  answerAccounts({
+    accounts: [
+      {
+        id: "a1",
+        identity: "dana@work.example",
+        label: "dana@work.example",
+        isDefault: true,
+        connectedAt: null,
+      },
+    ],
+    canAddAnother: true,
+  });
+  const view = renderRow(accountState({ connected: true, kind: "consent" }));
+
+  expect(
+    await view.findByText(/Signed in with Gmail as dana@work\.example\./),
+  ).toBeTruthy();
+  expect(view.getByText("Your account")).toBeTruthy();
+  expect(view.getAllByRole("button", { name: "Disconnect" })).toHaveLength(1);
+  expect(
+    view.getByRole("button", { name: /Connect another account/ }),
+  ).toBeTruthy();
+});
+
+/**
+ * ADDED IS NOT CONNECTED, ON THE APP'S PAGE TOO. A person who added an app and never signed in read
+ * a row with a Connect button and a sentence, and nothing that said plainly it wasn't connected.
+ */
+test("an added app nobody signed in to says Not connected beside Connect, on both pages", async () => {
+  installDeployment({
+    composioConfigured: true,
+    recorded: false,
+    confirms: false,
+  });
+
+  const person = renderAccountScreen(queryClient());
+  expect(await person.findByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(person.getByText("Not connected")).toBeTruthy();
+  cleanup();
+
+  const admin = renderAdminScreen(queryClient());
+  expect(await admin.findByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(admin.getByText("Not connected")).toBeTruthy();
+});
+
+/**
+ * BROWSE APPS SENDS A KEY APP HERE STRAIGHT AFTER ADDING IT (`?connect=true`), and the key form is
+ * what opens: there is no sign-in page to send anybody to.
+ */
+test("arriving to connect a key app opens its key form without a second press", async () => {
+  installDeployment({
+    authScheme: "API_KEY",
+    composioConfigured: true,
+    confirms: false,
+    fields: [PERPLEXITY_KEY],
+    recorded: false,
+  });
+
+  const view = renderAccountScreen(
+    queryClient(),
+    `/connections/${APP_KEY}?connect=true`,
+  );
+
+  expect(await view.findByLabelText("API Key")).toBeTruthy();
 });

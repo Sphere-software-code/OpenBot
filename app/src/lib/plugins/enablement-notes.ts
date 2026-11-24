@@ -17,9 +17,10 @@ import type { ComposioApp } from "./queries";
  *
  * The classification is measured server-side from the fetched listing and never re-derived here:
  * never inferred from the `Api` suffix (Arcade's naming convention, not a contract — a guess wearing
- * a measurement's clothes), and never from `classify()`'s verdict, which is TOTAL: its closed
- * destructive-write verdict for absent metadata is byte-identical to its verdict for a genuinely
- * destructive action, so counting "did classify return something" counts nothing.
+ * a measurement's clothes), and never from `classify()`'s verdict here, which is TOTAL: it answers
+ * every action, so counting "did classify return something" counts nothing. An action it could not
+ * classify is an unclassified write: not destructive, so it doesn't always ask, and kept away from
+ * every background read (`mightDestroy` in server/src/plugins/catalogue.ts).
  *
  * Phrased as what it will feel like, not as a percentage.
  */
@@ -28,7 +29,7 @@ export function coverageWarning(
 ): string | null {
   if (app.classifiedCount === null) return null;
   if (app.actionCount > 0 && app.classifiedCount === 0) {
-    return "This provider has not said which of its actions only read, so every action is treated as a destructive write and every call will ask for approval.";
+    return "This provider hasn't said which of its actions only read, so each one is treated as a change. Bots ask before using it wherever changes need approval, and check-ins can't use it.";
   }
   return null;
 }
@@ -88,9 +89,47 @@ export function consentBreadth(
  * render; sorting it in place would rewrite what the cache holds. By name rather than by the
  * vendor's own order, which is popularity — useful for a landing page, useless for finding the one
  * app somebody typed half the name of.
+ *
+ * APPS YOU SIGN IN TO COME FIRST, THEN APPS THAT NEED A KEY, each half by name. Most of the
+ * catalogue only takes a key or a token typed in, and someone browsing expects a sign-in. Listing
+ * the sign-in apps first puts the ones anybody can connect at the top of every search, and each
+ * key app's row says so (see {@link keyNeededLine}).
  */
 export function matchingApps(apps: ComposioApp[]): ComposioApp[] {
-  return [...apps].sort((left, right) => left.name.localeCompare(right.name));
+  return [...apps].sort(
+    (left, right) =>
+      Number(needsKey(left)) - Number(needsKey(right)) ||
+      left.name.localeCompare(right.name),
+  );
+}
+
+/** The schemes whose secret a person types, which is the whole of what a key app means here. */
+const FIELD_SCHEMES = [
+  "API_KEY",
+  "BASIC",
+  "BEARER_TOKEN",
+  "BASIC_WITH_JWT",
+  "S2S_OAUTH2",
+];
+
+/** Whether an added app's recorded scheme is one a person types a key for. */
+export function schemeNeedsKey(authScheme: string | null): boolean {
+  return authScheme !== null && FIELD_SCHEMES.includes(authScheme);
+}
+
+/** Whether connecting this app means typing a key from it rather than signing in. */
+export function needsKey(app: Pick<ComposioApp, "connection">): boolean {
+  return app.connection.kind === "fields";
+}
+
+/**
+ * The line on a directory row that says, before anybody adds the app, that it takes a key.
+ * Null for an app you sign in to, or one that needs nothing.
+ */
+export function keyNeededLine(
+  app: Pick<ComposioApp, "connection" | "name">,
+): string | null {
+  return needsKey(app) ? `Needs a key from ${app.name}` : null;
 }
 
 /**

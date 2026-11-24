@@ -5,6 +5,7 @@ import type { AppVariables } from "../auth/guards";
 import type { RoutineRunner } from "./runner";
 import { MINIMUM_INTERVAL_MS } from "./schedule";
 import {
+  NO_SHARED_CHANNEL,
   RoutineNotFoundError,
   RoutineRefusedError,
   type RoutineRunOutcome,
@@ -15,22 +16,26 @@ import {
 export type { RoutineStore } from "./store";
 
 /**
- * The routines page: what a person's standing instructions are, and a switch to stop one.
+ * The routines page: what a person's standing instructions are, a way to set one up, and a switch
+ * to stop one.
  *
- * THERE IS DELIBERATELY NO CREATE AND NO EDIT ENDPOINT HERE. Making a routine and changing one are
- * conversational — the four `RoutineTools` a Bot calls mid-chat, in `plugins/builtin-routines.ts` —
- * because the hard part of both is turning a sentence into a cron expression and a channel, which
- * is exactly what a conversation is for. This surface answers a narrower question: what is standing,
- * and does it stay standing. So it shows and it stops; it does not compose.
+ * CREATE IS HERE, AND IT IS THE BOT'S OWN PATH. A person who has never met a routine looks for one
+ * place to set one up, the way the Scheduled section of other assistants works, so the page offers
+ * New routine. It writes through `routineStore.create`, the call `create_routine` makes in
+ * `plugins/builtin-routines.ts`: the same instruction and title rules, the same frequency floor and
+ * cap, the same audit row, and the same check that the conversation is one the person and the Bot
+ * share. The page builds the five cron fields from a picker of common schedules; anything stranger
+ * is still a conversation with the Bot. There is no edit endpoint: changing a routine stays
+ * conversational.
  *
  * THERE IS ALSO NO GET-BY-ID. A routine id is never a page's own state — nothing links to one, and
  * nothing needs to fetch one in isolation — so the list is the read, the same way the channel
  * roster is a list with no companion single-channel screen.
  *
  * Owner-scoped through the store on every route, never by filtering a broader read afterwards:
- * `listFor`, `setEnabled` and `remove` all take the caller's id and answer as if a routine that
- * belongs to somebody else does not exist, which is what keeps a wrong id and somebody else's id
- * indistinguishable from outside.
+ * `create`, `listFor`, `setEnabled` and `remove` all take the caller's id and answer as if a routine
+ * that belongs to somebody else does not exist, which is what keeps a wrong id and somebody else's
+ * id indistinguishable from outside.
  */
 export function createRoutineRoutes(
   routineStore: RoutineStore,
@@ -102,6 +107,79 @@ export function createRoutineRoutes(
     });
   });
 
+  /*
+   * New routine, from the page. The owner is the caller and never a field; the Bot is the one the
+   * person picked, and the store accepts it only with a conversation the two of them share, which is
+   * also what proves the person may use that Bot. The conversation is required here: the store's
+   * fallbacks (the conversation a run was asked in, the only one shared) are for a Bot mid-turn, and
+   * their refusals are questions written for the model.
+   */
+  routes.post("/", requireUser, async (context) => {
+    const body = (await context.req.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null;
+    const text = (key: string): string | undefined => {
+      const value = body?.[key];
+      return typeof value === "string" && value.trim() !== ""
+        ? value.trim()
+        : undefined;
+    };
+    const agentId = text("agentId");
+    if (!agentId) {
+      return context.json({ error: "Choose a Bot for this routine." }, 400);
+    }
+    const instruction = text("instruction");
+    if (!instruction) {
+      return context.json({ error: "Say what the Bot should do." }, 400);
+    }
+    const cron = text("cron");
+    if (!cron) {
+      return context.json({ error: "Choose when it runs." }, 400);
+    }
+    const channelId = text("channelId");
+    if (!channelId) {
+      return context.json(
+        { error: "Choose a conversation for it to post in." },
+        400,
+      );
+    }
+    try {
+      const routine = await routineStore.create({
+        ownerUserId: context.var.actor.id,
+        agentId,
+        instruction,
+        title: text("title"),
+        cron,
+        timezone: text("timezone"),
+        channelId,
+      });
+      const summary = (await routineStore.listFor(context.var.actor.id)).find(
+        (candidate) => candidate.id === routine.id,
+      );
+      return context.json(
+        { routine: summary ? routineDto(summary) : { id: routine.id } },
+        201,
+      );
+    } catch (error) {
+      // The store lists the shared conversations by id for a model to pick from; a person picks
+      // from the form instead.
+      if (
+        error instanceof RoutineRefusedError &&
+        error.message.startsWith(NO_SHARED_CHANNEL)
+      ) {
+        return context.json(
+          {
+            error:
+              "This Bot isn't in that conversation. Choose another one, or a new conversation.",
+          },
+          400,
+        );
+      }
+      return mapStoreError(context, error);
+    }
+  });
+
   routes.put("/:id/enabled", requireUser, async (context) => {
     const body = await context.req.json().catch(() => null);
     const enabled = (body as { enabled?: unknown } | null)?.enabled;
@@ -156,7 +234,18 @@ type RoutineDto = {
   schedule: string;
   timezone: string;
   instruction: string;
-  channel: { id: string; name: string | null; gone: boolean };
+  /** What the person called it, or null: the page then names it by its schedule. */
+  title: string | null;
+  /**
+   * Where it posts. `title` is the conversation as the sidebar titles it, which is what a person
+   * recognises it by; `name` is only its Bots' names, the same for every conversation with them.
+   */
+  channel: {
+    id: string;
+    name: string | null;
+    title: string | null;
+    gone: boolean;
+  };
   enabled: boolean;
   nextRunAt: string;
   lastRun: { status: RoutineRunOutcome | null; at: string | null } | null;
@@ -184,9 +273,11 @@ function routineDto(routine: RoutineSummary): RoutineDto {
     schedule: routine.schedule,
     timezone: routine.timezone,
     instruction: routine.instruction,
+    title: routine.title,
     channel: {
       id: routine.channelId,
       name: routine.channelName,
+      title: routine.channelTitle,
       gone: routine.channelDeleted,
     },
     enabled: routine.enabled,

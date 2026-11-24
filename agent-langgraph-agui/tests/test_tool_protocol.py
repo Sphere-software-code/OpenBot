@@ -7,9 +7,10 @@ server is deterministic; these checks are protocol regressions, not live bot pro
 import asyncio
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from uuid import uuid4
 
 import httpx
@@ -82,6 +83,14 @@ def boundary(monkeypatch):
                 )
                 return
             captured["model"].append(body)
+            if refusal := captured.get("model_refusal"):
+                # A provider's own refusal, status and body exactly as it answers.
+                status, answer = refusal
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(answer).encode())
+                return
             if status := captured.get("model_status"):
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -250,16 +259,145 @@ async def test_only_provider_auth_status_emits_model_refresh_code(
     boundary, status, expected
 ):
     boundary["model_status"] = status
-    if not expected:
-        from openai import BadRequestError
-
-        with pytest.raises(BadRequestError):
-            await run_protocol(run_input([]), allow_error=True)
-        return
     events = await run_protocol(run_input([]), allow_error=True)
     errors = [event for event in events if event["type"] == "RUN_ERROR"]
     assert errors
+    assert events[-1]["type"] == "RUN_ERROR", "every run ends with a terminal event"
     assert (errors[-1].get("code") == "OPENBOT_MODEL_AUTH_REQUIRED") is expected
+    if not expected:
+        # Any other refusal ends the run in the provider's own words.
+        assert "controlled provider refusal" in errors[-1]["message"]
+
+
+# OpenAI's answer to a run offered 202 tools, captured from its API on 2026-11-07. Seen on OpenBot
+# Desktop as "Error code: 400 - Invalid 'tools': array too long. …" in red under the person's message.
+OPENAI_TOO_MANY_TOOLS = (
+    400,
+    {
+        "error": {
+            "message": "Invalid 'tools': array too long. Expected an array with maximum length "
+            "128, but got an array with length 202 instead.",
+            "type": "invalid_request_error",
+            "param": "tools",
+            "code": "array_above_max_length",
+        }
+    },
+)
+
+
+@pytest.mark.asyncio
+async def test_a_provider_refusal_is_marked_as_one_for_the_server_to_say_in_words(boundary):
+    boundary["model_refusal"] = OPENAI_TOO_MANY_TOOLS
+    events = await run_protocol(run_input([]), allow_error=True)
+    assert events[-1]["type"] == "RUN_ERROR", "every run ends with a terminal event"
+    # The provider's words, which the server keeps for its log and reads to notice a retired model,
+    # marked as a refusal so it tells the person in words (server/src/agents/provider-refusal.ts).
+    assert events[-1]["code"] == "OPENBOT_MODEL_REFUSED"
+    assert events[-1]["message"] == (
+        "Error code: 400 - Invalid 'tools': array too long. Expected an array with maximum "
+        "length 128, but got an array with length 202 instead."
+    )
+
+
+# The providers' own billing refusals: xAI's and OpenAI's captured from their APIs on 2026-11-05
+# (the xAI team id zeroed), Anthropic's as its API answers it.
+XAI_SPENDING_LIMIT = (
+    403,
+    {
+        "code": "permission-denied",
+        "error": "Your team 00000000-0000-0000-0000-000000000000 has either used all available "
+        "credits or reached its monthly spending limit. To continue making API requests, please "
+        "purchase more credits or raise your spending limit.",
+    },
+)
+OPENAI_NO_CREDITS = (
+    429,
+    {
+        "error": {
+            "message": "You have no credits remaining. Add credits to continue using the API at "
+            "https://platform.openai.com/settings/organization/billing/.",
+            "type": "insufficient_quota",
+            "param": None,
+            "code": "credit_balance_exhausted",
+        }
+    },
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal,said",
+    [
+        (XAI_SPENDING_LIMIT, "has either used all available credits"),
+        (OPENAI_NO_CREDITS, "You have no credits remaining"),
+    ],
+)
+async def test_a_provider_out_of_credit_is_told_as_that_never_as_sign_in_again(
+    boundary, refusal, said
+):
+    boundary["model_refusal"] = refusal
+    events = await run_protocol(run_input([]), allow_error=True)
+    errors = [event for event in events if event["type"] == "RUN_ERROR"]
+    assert events[-1]["type"] == "RUN_ERROR", "every run ends with a terminal event"
+    message = errors[-1]["message"]
+    assert "Sign in" not in message
+    assert errors[-1].get("code") == "OPENBOT_MODEL_BILLING"
+    assert "out of credit or has reached its spending limit" in message
+    assert said in message
+
+
+def test_the_provider_is_named_by_who_serves_the_model(monkeypatch):
+    from src.tool_runtime import provider_name
+
+    for base, model, name in [
+        ("https://api.x.ai/v1", "grok-4.7", "xAI"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.8-flash", "Google"),
+        ("http://host.docker.internal:3001/api/model-provider/v1", "grok-4.7", "xAI"),
+        ("", "gpt-6.1-terra", "OpenAI"),
+    ]:
+        monkeypatch.delenv("CHATGPT_AUTH_FILE", raising=False)
+        monkeypatch.setenv("BOT_PROVIDER", "openai")
+        monkeypatch.setenv("BOT_MODEL", model)
+        if base:
+            monkeypatch.setenv("OPENAI_BASE_URL", base)
+        else:
+            monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        assert provider_name() == name
+    monkeypatch.setenv("BOT_PROVIDER", "anthropic")
+    assert provider_name() == "Anthropic"
+
+
+def test_anthropic_credit_balance_refusal_is_billing():
+    import anthropic
+
+    from src.tool_runtime import billing_refusal
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Your credit balance is too low to access the Anthropic API. Please go "
+            "to Plans & Billing to upgrade or purchase credits.",
+        },
+    }
+    error = anthropic.BadRequestError(
+        "Error code: 400", response=httpx.Response(400, request=request, json=body), body=body
+    )
+    message = billing_refusal(error)
+    assert message and "Your credit balance is too low" in message
+    # A refusal for anything else keeps its own handling.
+    other = {"type": "error", "error": {"type": "invalid_request_error", "message": "bad tool"}}
+    assert (
+        billing_refusal(
+            anthropic.BadRequestError(
+                "Error code: 400",
+                response=httpx.Response(400, request=request, json=other),
+                body=other,
+            )
+        )
+        is None
+    )
 
 
 def snapshot(events):
@@ -446,6 +584,48 @@ async def test_http_refusal_tells_the_model_the_deployments_reason(
     boundary["callback_body"] = reply
     await run_protocol(run_input(["granted_lookup"], deployment=["granted_lookup"]))
     assert boundary["model"][-1]["messages"][-1]["content"] == expected
+
+
+@pytest.mark.asyncio
+async def test_computer_calls_made_together_run_one_at_a_time_in_order(boundary):
+    # A model that calls tools in parallel sends a form's fields in one step. A Bot has one browser,
+    # and side by side the fields took the focus from each other; a click could overtake the typing.
+    names = ["computer_type", "computer_click", "computer_key", "granted_lookup"]
+    computer = names[:3]
+    running = {"now": 0, "most": 0}
+    spans = {}
+    lock = Lock()
+
+    def authorize(body, _token):
+        started = time.monotonic()
+        with lock:
+            if body["name"] in computer:
+                running["now"] += 1
+                running["most"] = max(running["most"], running["now"])
+        # Long enough that calls sent together would overlap.
+        time.sleep(0.15)
+        with lock:
+            if body["name"] in computer:
+                running["now"] -= 1
+            spans[body["name"]] = (started, time.monotonic())
+        return 200
+
+    boundary["callback_authorize"] = authorize
+    events = await run_protocol(run_input(names, deployment=names))
+    called = [each["body"]["name"] for each in boundary["callback"]]
+    assert [name for name in called if name in computer] == computer
+    assert running["most"] == 1
+    # Everything else still runs beside them: the lookup overlaps the computer's calls rather than waiting for them.
+    lookup_start, lookup_end = spans["granted_lookup"]
+    assert any(
+        start < lookup_end and lookup_start < end
+        for name, (start, end) in spans.items()
+        if name in computer
+    )
+    # The model reads each answer against the call it made, in the order it made them.
+    assert [
+        m["toolCallId"] for m in snapshot(events) if m.get("role") == "tool"
+    ] == ["call-" + name for name in names]
 
 
 @pytest.mark.asyncio

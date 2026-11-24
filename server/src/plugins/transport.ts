@@ -61,6 +61,13 @@ export type VendorTransport = {
    * sequence hinted that the middle step was doing no work.
    */
   listNeedsCredential: boolean;
+  /**
+   * Whether the tool list is this deployment's own code rather than a vendor's answer, as it is for
+   * Routines and Drive. Such a list is brought up to date at every start (`refreshOwnListings`),
+   * because the copy saved when the app was added belongs to whichever build added it. Absent for a
+   * list somebody else publishes, which only a Refresh replaces.
+   */
+  listIsThisCode?: boolean;
   listTools(connection: {
     url: string;
     token?: string;
@@ -106,6 +113,19 @@ export type VendorTransport = {
       actorId?: string;
       /** The Bot the run belongs to. A routine runs as its Bot, which is never a name a model supplies. */
       botId?: string;
+      /**
+       * The thread of the run making the call, when it runs in one. Read by Routines only, as the
+       * conversation a routine asked for "here" posts into, and checked there against the actor's
+       * own conversations. Like the two above it, it comes from the run and never from `args`.
+       */
+      threadId?: string;
+      /**
+       * Which of the person's accounts at the app the call runs in, where the vendor tells them
+       * apart by an id (Composio's connected account id). Picked by the call path from the person's
+       * own accounts and never from `args`. Absent runs in whichever account the vendor holds for
+       * the person, which is what every call did before a person could hold two.
+       */
+      accountId?: string;
     },
     toolName: string,
     args: Record<string, unknown>,

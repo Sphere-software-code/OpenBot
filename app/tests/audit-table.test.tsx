@@ -9,14 +9,15 @@ import {
 } from "@tanstack/react-router";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
 import {
   type AuditEvent,
   botText,
   subjectText,
 } from "@/components/audit/audit-cells";
+import { AuditPage } from "@/components/manage/audit-page";
 import { agentKeys } from "@/lib/agents/queries";
-import { auditKeys } from "@/lib/audit/queries";
-import { Route as AuditRoute } from "@/routes/_authed/admin/audit";
+import { seedAuditPage } from "./seed-audit-page";
 
 /**
  * Admin → Audit as a log viewer: one window tall, the table across the whole pane and the only thing
@@ -65,16 +66,18 @@ const ROWS = [
   }),
 ];
 
-async function renderAudit() {
+async function renderAudit(sections?: ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
-  queryClient.setQueryData([...auditKeys.all, ""], { events: ROWS });
+  seedAuditPage(queryClient, "", { events: ROWS });
   queryClient.setQueryData(agentKeys.list(false), []);
   const router = createRouter({
-    routeTree: createRootRoute({ component: AuditRoute.options.component }),
+    routeTree: createRootRoute({
+      component: () => <AuditPage>{sections}</AuditPage>,
+    }),
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
   const view = render(
@@ -88,15 +91,16 @@ async function renderAudit() {
 
 const whats = (container: HTMLElement) =>
   [...container.querySelectorAll("tbody tr")].map(
-    (row) => row.querySelector("[data-column=what]")?.textContent,
+    (row) => row.querySelector("[data-column=what] > div")?.textContent,
   );
 
-test("the page is one viewport tall and only the table scrolls", async () => {
+test("the page fills the shell's panel and only the table scrolls", async () => {
   const view = await renderAudit();
   const heading = view.getByRole("heading", { name: "Audit" });
-  const page = heading.closest(".h-dvh");
+  const page = heading.closest(".overflow-hidden");
   expect(page).not.toBeNull();
-  expect(page?.className).toContain("overflow-hidden");
+  expect(page?.className).toContain("flex-1");
+  expect(page?.className).toContain("min-h-0");
   expect(heading.closest(".max-w-3xl")).toBeNull();
   const scroller = view.container.querySelector(
     "[data-slot=table-container]",
@@ -108,12 +112,20 @@ test("the page is one viewport tall and only the table scrolls", async () => {
 
 test("newest first, and a press on When turns it oldest first", async () => {
   const view = await renderAudit();
-  expect(whats(view.container)).toEqual(["navigate", "click", "type"]);
+  expect(whats(view.container)).toEqual([
+    "Open a page",
+    "Click on a page",
+    "Fill in a field",
+  ]);
   await userEvent
     .setup({ document })
     .click(view.getByRole("button", { name: /When/ }));
   await waitFor(() =>
-    expect(whats(view.container)).toEqual(["type", "click", "navigate"]),
+    expect(whats(view.container)).toEqual([
+      "Fill in a field",
+      "Click on a page",
+      "Open a page",
+    ]),
   );
 });
 
@@ -122,7 +134,9 @@ test("search narrows the rows already loaded, and says how many match", async ()
   await userEvent
     .setup({ document })
     .type(view.getByRole("searchbox", { name: "Search events" }), "save deal");
-  await waitFor(() => expect(whats(view.container)).toEqual(["click"]));
+  await waitFor(() =>
+    expect(whats(view.container)).toEqual(["Click on a page"]),
+  );
   expect(view.getByText("1 of 3 events")).toBeDefined();
 });
 
@@ -157,6 +171,25 @@ test("the Outcome button narrows the rows to the outcomes ticked", async () => {
   await user.click(
     await view.findByRole("menuitemcheckbox", { name: /Blocked/ }),
   );
-  await waitFor(() => expect(whats(view.container)).toEqual(["navigate"]));
+  await waitFor(() => expect(whats(view.container)).toEqual(["Open a page"]));
   expect(view.getByText("1 of 3 events")).toBeTruthy();
+});
+
+test("recording history shares a page scroller with the bounded audit log", async () => {
+  const view = await renderAudit(
+    <section aria-label="Recorded commands">
+      {Array.from({ length: 100 }, (_, i) => `Command ${i}`).map((command) => (
+        <p key={command}>{command}</p>
+      ))}
+    </section>,
+  );
+  const recording = view.getByRole("region", { name: "Recorded commands" });
+  const pageScroller = recording.closest(".overflow-y-auto");
+  expect(pageScroller).not.toBeNull();
+  const tableScroller = view.container.querySelector(
+    "[data-slot=table-container]",
+  );
+  expect(pageScroller?.contains(tableScroller)).toBe(true);
+  expect(tableScroller?.contains(recording)).toBe(false);
+  expect(recording.textContent).toContain("Command 99");
 });

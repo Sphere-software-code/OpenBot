@@ -38,6 +38,21 @@ export type AgentProfile = {
    * switch back restores it. `agents/isolation.ts` decides whether it is in effect now.
    */
   isolated: boolean;
+  /**
+   * What the personal starter is told, kept apart from `roleDescription`, which says what it does.
+   *
+   * The starter is the one Bot a person may edit whose instructions are not its description: the
+   * package writes a `system_prompt` for the model and a `role_description` for the person, and a
+   * conversation's header shows the second. Every other Bot answers null or leaves it out: a Bot a
+   * person made runs on its role description, and a package's own Bot keeps its prompt to itself.
+   */
+  instructions?: string | null;
+  /**
+   * What runs it, by the name a person reads ("LangChain", "OpenBot"), or absent when
+   * OpenBot doesn't know, such as an agent connected by address with no framework named. Read from
+   * what runs it, never its subtitle (`frameworkOf`).
+   */
+  framework?: string;
 };
 
 export type CreateAgentInput = Pick<
@@ -67,4 +82,15 @@ export type CreateAgentInput = Pick<
    * "Isolated Bots" switch for whoever sends it; false is always allowed.
    */
   isolated?: boolean;
+  /**
+   * New instructions for the personal starter. Absent leaves them as they are, and any other Bot
+   * ignores it: its instructions are its role description.
+   */
+  instructions?: string;
+  /**
+   * The framework a person named for an agent they run themselves, by its id in
+   * `shared/harnesses.json`. Read at creation only, and kept in its configuration so the Bot is told
+   * what runs it whatever its subtitle says (`frameworkOf`).
+   */
+  harness?: string;
 };

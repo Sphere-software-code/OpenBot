@@ -34,6 +34,10 @@ import type { AgentProfile } from "@/lib/agents/queries";
 import { approvalInboxOptions, ruleCoversBot } from "@/lib/approvals";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
 import { deliveryQueryOptions } from "@/lib/delivery";
+import {
+  deploymentCapabilitiesQueryOptions,
+  useOffersMemory,
+} from "@/lib/deployment/queries";
 import { memorySourcesQueryOptions } from "@/lib/memory";
 import { agentPluginsQueryOptions } from "@/lib/plugins/queries";
 import { proactiveSettingsQueryOptions } from "@/lib/proactive";
@@ -68,19 +72,24 @@ export function BotSettingsRows({ agent }: { agent: AgentProfile }) {
   const teamBots = useQuery(teamBotsQueryOptions());
   const published = teamBots.data?.teamBots.find((bot) => bot.id === agent.id);
   // Its owner and administrators change it there; anyone it is published to finds its link there.
+  // The personal edition has one person and nobody to share with.
+  const personal =
+    useQuery(deploymentCapabilitiesQueryOptions()).data?.edition === "personal";
+  const memory = useOffersMemory();
   const canShare =
-    agent.mine || me?.role === "admin" || published !== undefined;
+    !personal &&
+    (agent.mine || me?.role === "admin" || published !== undefined);
 
   const goals = useQuery(responsibilitiesQueryOptions());
   const reach = useQuery(deliveryQueryOptions());
-  const sources = useQuery(memorySourcesQueryOptions());
+  const sources = useQuery({ ...memorySourcesQueryOptions(), enabled: memory });
   const research = useQuery(proactiveSettingsQueryOptions());
   const approvals = useQuery(approvalInboxOptions());
 
-  const rows: Row[] = [
+  const allRows: Row[] = [
     {
       to: "/bots/$agentId/responsibilities",
-      title: "Responsibilities",
+      title: "Goals",
       icon: IconTargetArrow,
       summary: goals.data
         ? countLabel(
@@ -107,21 +116,27 @@ export function BotSettingsRows({ agent }: { agent: AgentProfile }) {
           )
         : "",
     },
-    {
-      to: "/bots/$agentId/memory",
-      title: "Memory",
-      icon: IconBrain,
-      summary:
-        sources.data && research.data
-          ? memorySummary(
-              sources.data.filter((source) => source.agentId === agent.id)
-                .length,
-              research.data.some(
-                (setting) => setting.agentId === agent.id && setting.enabled,
-              ),
-            )
-          : "",
-    },
+    // Not where memory isn't offered: there this Bot's check-ins are on What it can do.
+    ...(memory
+      ? [
+          {
+            to: "/bots/$agentId/memory" as const,
+            title: "Memory",
+            icon: IconBrain,
+            summary:
+              sources.data && research.data
+                ? memorySummary(
+                    sources.data.filter((source) => source.agentId === agent.id)
+                      .length,
+                    research.data.some(
+                      (setting) =>
+                        setting.agentId === agent.id && setting.enabled,
+                    ),
+                  )
+                : "",
+          },
+        ]
+      : []),
     {
       to: "/bots/$agentId/approvals",
       title: "Approval rules",
@@ -179,9 +194,26 @@ export function BotSettingsRows({ agent }: { agent: AgentProfile }) {
       to: "/bots/$agentId/setup",
       title: "Setup",
       icon: IconSettings,
-      summary: setupSummary(agent),
+      summary: setupSummary(agent, personal ? "personal" : "team"),
     },
   ];
+  /*
+   * THREE ROWS IN THE PERSONAL EDITION. Approval rules, Responsibilities and check-ins are sections
+   * of the access page there, renamed What it can do, so one page answers what a Bot can do. Reaching
+   * you is Slack, Teams and text, and Memory is what its local Intelligence isn't licensed for: the
+   * personal edition has neither.
+   */
+  const rows = personal
+    ? allRows.flatMap((row): Row[] =>
+        row.to === "/bots/$agentId/access"
+          ? [{ ...row, title: "What it can do" }]
+          : row.to === "/bots/$agentId/responsibilities" ||
+              row.to === "/bots/$agentId/reach" ||
+              row.to === "/bots/$agentId/approvals"
+            ? []
+            : [row],
+      )
+    : allRows;
 
   return (
     <PageSection title="Settings for this Bot">

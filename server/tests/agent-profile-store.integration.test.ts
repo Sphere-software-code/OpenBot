@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
+import { Hono } from "hono";
 import { authFromConfiguration } from "../src/agents/auth-header";
 import {
   AgentNotFoundError,
@@ -15,6 +16,9 @@ import type {
   AgentProfile,
   CreateAgentInput,
 } from "../src/agents/profile-types";
+import { createAgentRoutes } from "../src/agents/routes";
+import { createRuntimeAgentLoader } from "../src/agents/runtime-agents";
+import type { AppVariables } from "../src/auth/guards";
 import { DEPLOYMENT_ROUTES } from "../src/computer/deployment-routes";
 import { createDatabase } from "../src/db/client";
 import {
@@ -246,6 +250,43 @@ async function agentRow(agentId: string): Promise<{
 }
 
 describe("agent profile store integration", () => {
+  test("editing a duplicate replaces its copied standing instructions", async () => {
+    const owner = await createUser();
+    const source = await createProfileFixture({ owner });
+    await database
+      .update(agents)
+      .set({
+        configuration: {
+          endpoint: "https://seed.example.test/ag-ui",
+          standingInstructions: "Handle email and calendars.",
+        },
+      })
+      .where(eq(agents.id, source.agentId));
+    const copy = await store.duplicate(owner, source.agentId);
+    createdAgentIds.push(copy.id);
+    const runtime = createRuntimeAgentLoader(database);
+    const before = (await runtime(owner)).find((agent) => agent.id === copy.id);
+    if (before?.type !== "remote_ag_ui")
+      throw new Error("Expected remote copy");
+    expect(before.standingMessage.content).toContain(
+      "Handle email and calendars.",
+    );
+    await store.update(owner, copy.id, {
+      name: "Research Bot",
+      title: "Research",
+      roleDescription: "Only research public sources.",
+      visibility: "private",
+    });
+    const after = (await runtime(owner)).find((agent) => agent.id === copy.id);
+    if (after?.type !== "remote_ag_ui") throw new Error("Expected remote copy");
+    expect(after.standingMessage.content).toContain(
+      "Only research public sources.",
+    );
+    expect(after.standingMessage.content).not.toContain(
+      "Handle email and calendars.",
+    );
+  });
+
   test("refuses to create a coworker with no endpoint when this deployment has no managed Bot", async () => {
     const owner = await createUser();
     const withoutManaged = createAgentProfileStore(database, undefined);
@@ -290,6 +331,29 @@ describe("agent profile store integration", () => {
     );
     // No address was given and none was invented; that is what makes it built_in rather than remote.
     expect(row.configuration.endpoint).toBeUndefined();
+  });
+
+  /*
+   * The new starter wording is display only (app/src/lib/agents/subtitle.ts). The store hands every
+   * reader the subtitle as stored: the Bot's voice call is told it, a New Bot interview reads it,
+   * and an edit to any other field sends it back. Mapped here, an edit would store the new wording
+   * and the Bot would be told it.
+   */
+  test("a subtitle stored under LangChain's earlier name is read as stored", async () => {
+    const owner = await createUser();
+    const withoutManaged = createAgentProfileStore(database, undefined);
+    const created = await withoutManaged.create(owner, {
+      name: "Seeded Before The Rename",
+      title: "Everyday life. Powered by LangChain (LangGraph).",
+      roleDescription: "Help with everyday errands.",
+      visibility: "private",
+      systemPrompt: "Help with everyday errands.",
+    });
+    createdAgentIds.push(created.id);
+
+    expect((await withoutManaged.get(owner, created.id))?.title).toBe(
+      "Everyday life. Powered by LangChain (LangGraph).",
+    );
   });
 
   test("an edit moves the instruction such a coworker actually runs on", async () => {
@@ -942,5 +1006,54 @@ describe("agent profile store integration", () => {
       configuration: { endpoint: managedAgentAgUiUrl.toString() },
       packageId: null,
     });
+  });
+
+  /*
+   * The personal starter on the harness picked at setup sits at the address of the container
+   * OpenBot started for it, "agent-harness:4206" on OpenBot Desktop. Its Bot page names the
+   * framework instead, so the profile it reads says which one runs it, by what runs it.
+   */
+  test("serves the framework a Bot runs on, read from what runs it, for its Bot page", async () => {
+    const saved = {
+      PICKED_HARNESS_URL: process.env.PICKED_HARNESS_URL,
+      PICKED_HARNESS_IMAGE: process.env.PICKED_HARNESS_IMAGE,
+      PICKED_HARNESS_SOURCE: process.env.PICKED_HARNESS_SOURCE,
+    };
+    process.env.PICKED_HARNESS_URL = "http://agent-harness:4206";
+    process.env.PICKED_HARNESS_IMAGE =
+      "ghcr.io/copilotkit/openbot-agent-langgraph-agui:0.3.3";
+    delete process.env.PICKED_HARNESS_SOURCE;
+    try {
+      const owner = await createUser();
+      const picked = await createProfileFixture({
+        owner,
+        title: "Everyday life.",
+        configuration: { endpoint: "http://agent-harness:4206" },
+      });
+      const unnamed = await createProfileFixture({ owner });
+      const app = new Hono<{ Variables: AppVariables }>();
+      app.route(
+        "/",
+        createAgentRoutes(store, async (context, next) => {
+          context.set("actor", { ...owner, email: `${owner.id}@example.test` });
+          await next();
+        }),
+      );
+      const detail = async (agentId: string) =>
+        (
+          (await (
+            await app.request(`http://openbot.test/${agentId}`)
+          ).json()) as { agent: Record<string, unknown> }
+        ).agent;
+
+      expect((await detail(picked.agentId)).framework).toBe("LangChain");
+      // An agent connected by address with no framework named: OpenBot doesn't know, so it says none.
+      expect(await detail(unnamed.agentId)).not.toHaveProperty("framework");
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 });

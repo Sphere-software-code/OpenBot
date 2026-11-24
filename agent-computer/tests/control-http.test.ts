@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { reservePort } from "../../tests/support/reserved-port";
 import type { ComputerControlState } from "../../shared/computer-control";
 
 // A real HTTP dispatcher and shell lease, without launching Chromium. Opt in like live-screen tests
@@ -48,13 +49,7 @@ async function until(check: () => Promise<boolean>) {
 beforeAll(async () => {
   if (!asked) return;
   root = await mkdtemp(join(tmpdir(), "control-http-"));
-  const probe = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: () => new Response(),
-  });
-  const port = probe.port;
-  await probe.stop(true);
+  const port = await reservePort();
   base = `http://127.0.0.1:${port}`;
   child = Bun.spawn([process.execPath, "src/index.ts"], {
     cwd: join(import.meta.dir, ".."),
@@ -91,8 +86,10 @@ describe.skipIf(!asked)(
   "request handoff through the actual computer HTTP dispatcher",
   () => {
     test("take cannot overtake admitted work; later mutations are refused, then freshness is mandatory", async () => {
+      // Long enough to still be running when the help request below has launched the browser, which
+      // takes about 300 ms cold: at 0.3 s the two raced and the request often found the work done.
       const running = post("/exec", {
-        command: "printf admitted > admitted; sleep 0.3",
+        command: "printf admitted > admitted; sleep 1.5",
         timeoutMs: 3000,
       });
       await until(() => Bun.file(join(root, "workspace", "admitted")).exists());
@@ -121,7 +118,8 @@ describe.skipIf(!asked)(
         (await post("/control/release", { requestId: "wrong" })).status,
       ).toBe(409);
       expect((await post("/control/release", { requestId })).status).toBe(200);
-      for (const path of ["/navigate", "/click", "/type", "/key", "/scroll"]) {
+      // Opening another page needs no look at the one the person left; see handback-fresh-look.test.ts.
+      for (const path of ["/click", "/type", "/key", "/scroll"]) {
         const response = await post(path, {});
         expect(response.status).toBe(409);
         expect(await response.json()).toMatchObject({

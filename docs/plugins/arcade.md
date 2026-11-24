@@ -13,7 +13,7 @@ the approval rules and the audit trail are the same here and are not repeated.
 
 Some things on this page are stated as **unproven**, and the last section lists them. What is
 marked _measured_ was observed by hand against a live Arcade project during development, in two
-rounds, and **nothing in CI dials Arcade** — the vendor's behaviour can change without any check
+rounds, and **nothing in CI dials Arcade** — the vendor's behavior can change without any check
 here noticing:
 
 - **Before this page was first written (2026-10-12)**, with a throwaway script that is not in this
@@ -66,17 +66,20 @@ Four refusals protect this, and all four are deliberate:
 
 - **A named provider whose key is not set stops the server at startup.** An operator sees: _OPENBOT_BROKER_PROVIDER=arcade names a provider whose ARCADE_API_KEY is not set to a key. Set ARCADE_API_KEY to this deployment's key, or change or unset OPENBOT_BROKER_PROVIDER._ It does not fall back to a deployment with no broker, because that would send somebody looking for a broken vendor instead of at their own environment. A key that is empty or all whitespace — `ARCADE_API_KEY=` with nothing after it — is no key: that provider counts as unconfigured, and no client is ever built on an empty credential.
 - **Both keys set with the variable unset stops the server at startup.** An operator sees: _COMPOSIO_API_KEY and ARCADE_API_KEY are both set and OPENBOT_BROKER_PROVIDER is unset, so no provider is active and nothing brokered would work. Set OPENBOT_BROKER_PROVIDER to composio or arcade to say which vendor is live, or unset the key of the vendor this deployment is not using._ Nobody wants that state on purpose — the deployment would hold two vendor keys and broker nothing — and wiring no broker silently would surface much later and far away, as brokered features that simply do not work. "Both set" counts only keys that hold something: two blank keys are no keys, and are reported as such rather than as two configured vendors.
-- **Activating a provider is refused while the other one still holds connections.** It is keyed on connection rows, not on keys. The message names the provider being activated and how many connections still belong to the other. Switching by editing the environment would leave accounts nobody can revoke. **There is no one-step migration**; what ends the old provider's connections today is keeping it active — both keys set, `OPENBOT_BROKER_PROVIDER` naming the old provider — and using the ordinary ways a connection ends, each of which revokes at the vendor and deletes the row: each person disconnects their own on `/settings/connected-accounts`, an administrator disconnects a Shared app's account, an administrator removes an app (which ends every account connected to it), or a person is offboarded. When the old provider holds no connections, name the new one and restart.
+- **Activating a provider is refused while the other one still holds connections.** It is keyed on connection rows, not on keys. The message names the provider being activated and how many connections still belong to the other. Switching by editing the environment would leave accounts nobody can revoke. **There is no one-step migration**; what ends the old provider's connections today is keeping it active (both keys set, `OPENBOT_BROKER_PROVIDER` naming the old provider) and using the ordinary ways a connection ends, each of which revokes at the vendor and deletes the row: each person disconnects their own on `/connections`, an administrator disconnects a Shared app's account, an administrator removes an app (which ends every account connected to it), or a person is offboarded. When the old provider holds no connections, name the new one and restart.
 - **Holding connections at BOTH providers while nothing is active stops the server at startup.** It is the refusal above seen from the other side: with no provider named there is nothing to read one vendor's rows as, and reading them as the other's is the failure this whole section exists to prevent. The message names both vendors and says plainly that **nothing in the deployment can get past this**: with rows at both, activating either provider is refused by the rule above. The only way out is by hand — end one vendor's accounts in that vendor's own dashboard, delete its rows from `brokered_connections`, then name the other provider. The refusal at activation exists so that this state is never reached.
 
 ## Setting up the Arcade project
 
 ### One Arcade project per deployment
 
-Create one Arcade project for each deployment, and do not share. The verifier URL (below) is a
-setting of the **project**, and a staging deployment and a production deployment have different
-addresses, so they cannot both be pointed at by one project's setting. A project shared between them
-would have its verifier pointing at one and failing for the other.
+Create one Arcade project for each deployment where you can. The verifier URL (below) is a setting
+of the **project**, one address for the whole project. A single-user install points it at itself
+before every consent it starts, so single-user installs sharing a project (several on one key, say)
+take turns: whichever started the latest consent is where Arcade sends people back. A consent
+started in one while another's is still open on its consent screen comes back to the later one,
+which refuses it, and the person presses Connect again. A deployment that signs people in never
+changes the setting; see below.
 
 ### An OAuth app of your own, per provider
 
@@ -87,7 +90,7 @@ configuration.
 This was confirmed the hard way, and the reason matters because it is not a preference. A consent
 link was minted for an arbitrary `user_id` against Arcade's default Google provider. It **failed at
 verification** with _"the authorization process was not completed"_. The same consent minted for an
-Arcade project member's own identity **completed**. Arcade's built-in verifier has to recognise the
+Arcade project member's own identity **completed**. Arcade's built-in verifier has to recognize the
 end user as a member of the project, so it can only serve a `user_id` that is one. Per-person
 connections in OpenBot are arbitrary ids by definition — nobody is made a member of your Arcade
 project in order to connect their mailbox — so a default provider cannot serve them at all.
@@ -103,51 +106,105 @@ Arcade's admin API can create the OAuth provider, so that part can be scripted.
 > page was registered with the box left unticked, deliberately, to keep a policy variable out of the
 > measurement. What ticking it changes in practice is therefore not known here.
 
-### The verifier URL is the one dashboard-only step
+### The verifier URL
 
-**The verifier URL cannot be automated.** It is set by hand in the Arcade dashboard, on the project,
-and there is no API that does it. It is the single manual step in setting Arcade up, and it is the
-one that is easy to do wrongly, so it is stated here rather than left to be discovered.
-
-Set it to this deployment's verifier address, then switch the project to a custom verifier. The
-address is this API's public origin — `OPENBOT_PUBLIC_URL`, which defaults to `BETTER_AUTH_URL` —
-followed by the path, so paste:
+**After somebody finishes an app's consent, Arcade sends their browser to the project's custom user
+verifier, and that has to be this deployment's verify route:**
 
 ```
 <this deployment's public origin>/api/plugins/arcade/verify
 ```
 
+The origin is this API's public origin, `OPENBOT_PUBLIC_URL`, which defaults to `BETTER_AUTH_URL`.
 It is the API's origin, not the browser app's, where the two differ. A browser that arrives there
 is sent on to the Connections page, with a reason beside it if the consent was refused.
 
-**Nothing checks this setting, so the deployment warns about it instead.** Arcade has no API that
-reads which verifier a project uses, so this deployment cannot tell a correctly pointed project from
-one left at Arcade's default. Every time it starts with Arcade active it logs a warning naming the
-exact address to set — built from `OPENBOT_PUBLIC_URL` (or `BETTER_AUTH_URL`) — and pointing here.
+Before every Connect or Authorize, the deployment reads the project's setting through Arcade's admin
+API (`GET /v1/admin/settings/session_verification`, in [Arcade's OpenAPI](https://api.arcade.dev/v1/swagger)).
+Where it already names this deployment's verify route, the consent goes ahead. Arcade has one
+verifier per project and refuses a per-request return address (`next_uri`) on a mint, so this
+setting is the only way a consent finds its way back. What happens when it names somewhere else
+depends on whether the install owns its Arcade project.
 
-**If the project is left at Arcade's built-in verifier, this deployment's verify route is never
-called.** That route is the return leg that binds a consent to the attempt that started it, checks
+**A single-user install owns its project and sets the verifier itself.** It has its own name at
+Arcade (see [configuration](../configuration.md)), its one person is its admin, and the personal
+edition is one of these. Where the setting names another address, or is set to skip verification,
+it sets it to its own verify address with the custom verifier on (`PUT` on the same path), reads it
+back, and only then mints the consent. It logs `arcade-verifier-pointed` with the address it
+replaced. Nothing needs pasting into Arcade's dashboard, and the install is not tied to
+`localhost:3001` or any other address somebody once typed there. If Arcade refuses the write, or
+reads back something else, the person sees _"Couldn't start connecting Gmail. OpenBot couldn't set
+Arcade to send you back here after you sign in. Set the custom verifier in Arcade's dashboard to
+`<address>`"_, and the log has an `arcade-verifier-not-pointed` line.
+
+**A deployment that signs people in treats its project as shared and never changes it.** Rewriting
+the setting there would send another deployment's people here. Set the custom verifier in Arcade's
+dashboard (Auth, Settings) to this deployment's verify address. It says which address at startup,
+and until the project names it, Connect is refused before anybody is sent to a consent screen:
+_"Couldn't start connecting Gmail. Arcade would send you back somewhere else after you sign in. Ask
+an admin to set the custom verifier in Arcade's dashboard to `<address>`"_. The log has an
+`arcade-verifier-elsewhere` line naming the address it found.
+
+**A setting that cannot be read refuses the Connect too**, on either kind of deployment, with an
+`arcade-verifier-unread` line in the log. The key has to be a project key that can use Arcade's
+admin API, which every other admin call here (auth providers, user connections) already needs. A
+consent minted without the check could be spent on a page that does not exist.
+
+**A deployment that does not know its own origin cannot check the setting.** With neither
+`OPENBOT_PUBLIC_URL` nor `BETTER_AUTH_URL` set, it logs a warning at startup naming the variable to
+set, and consents come back to whatever address the project names.
+
+**If the project were left at Arcade's built-in verifier, this deployment's verify route would never
+be called.** That route is the return leg that binds a consent to the attempt that started it, checks
 that the identity returning is the one the attempt was minted for, records the connection and files
-its `mcp.account_connected` audit entry. None of that happens, and nothing in this deployment's logs
-says why. What was observed by hand (see the top of this page) is that Arcade's built-in verifier
-refuses a consent for any `user_id` that is not a member of the Arcade project — and the ids this
-deployment sends are its own internal ids, not project members — so in practice **nobody can
-connect**: the person is left on Arcade's
-page with _"the authorization process was not completed"_. A consent that does complete at Arcade
-that way is bound to no attempt; the Connections page may later record it when it asks Arcade
-whether the person is connected, but without the identity check the verify leg exists to make.
-
-> **Do not save the custom-verifier setting without a URL.** It switches off the path that currently
-> works and switches on nothing — and it presents as _this deployment's own code failing_: consents
-> that used to complete stop completing, with nothing in this deployment's logs to explain it. It is
-> the trap an operator will otherwise spend an afternoon on. If connections stop completing and
-> nothing here changed, look at the project's verifier setting before anything in this deployment.
+its `mcp.account_connected` audit entry. What was observed by hand (see the top of this page) is that
+Arcade's built-in verifier refuses a consent for any `user_id` that is not a member of the Arcade
+project, and the ids this deployment sends are its own internal ids, not project members, so in
+practice nobody could connect. That is why a single-user install turns the custom verifier on rather
+than only setting the address.
 
 ## What an administrator does
 
 The shape is Composio's: enable an app, grant its actions to a Bot, and each person connects their
 own account (or an administrator connects a Shared app's account). Two things are different and
 worth reading before pressing **Add**.
+
+### Connect asks for the whole app, and each action can still be approved alone
+
+**Connect works as it does on Composio.** It asks Arcade for one consent covering every scope the
+app's actions publish (the `auth.authorize` call, with the app's own authorization requirement read
+off its listing), and the consent comes back through the verifier above, which records the
+connection and lands the person on the app's page under Connections. That is where it lands
+whichever page Connect was pressed on: an administrator who started from the app's page under
+Plugins, or a sign-in started in OpenBot Desktop, ends in the browser on the app's page under
+Connections. Actions name the
+same requirement when they name the same auth provider instance, its `id` (or the same
+`provider_id` where none names an `id`): the live catalogue publishes one instance with and without
+its `provider_id` (`SquareupApi`) and two instances with neither (`XeroApi`). An app whose actions
+name more than one instance cannot be connected in one consent, and Connect says so. Where Arcade
+already holds everything the app asks for, Connect records the connection without a consent
+screen.
+
+**The action list under Connections still approves one action at a time**, for somebody who wants
+to grant less than the whole app. Either way, the connection is recorded in this deployment's
+`brokered_connections`, as Composio's are: a Bot's call needs that row before it reaches Arcade, a
+page that opens the app asks Arcade whether the connection is still there and writes or clears the
+row from the answer, and Disconnect and offboarding end it at Arcade and then here. That holds on a
+deployment that signs people in too: a grant Arcade holds with no row here (approved before rows
+were recorded, say) is recorded, with no new consent, when the person opens the app under
+Connections. Arcade still
+checks each action itself on every call. A call it refuses for want of authorization shows the
+person the Reconnect card. The row is cleared only where Arcade then answers that the account holds
+nothing for the app, which is Composio's lost account; where it holds the app's other actions, or
+does not answer within ten seconds, the row stays and those actions go on working. Either way the card's Reconnect goes to the app's page
+under Connections, as on Composio, and a connected Arcade app there offers Reconnect beside
+Disconnect: one press asks for the whole app over the connection that stands, with no Disconnect
+first.
+
+A single-user deployment is filed at Arcade under its own name, not under `dev-local-user`; see
+[Configuration](../configuration.md#authentication). Arcade keeps one account per user id and auth
+provider, so a person's second account at an app (**Connect another account**) is filed there
+under a further id of theirs, `<their id>~<suffix>`, with a random suffix minted when they press it.
 
 ### Toolkits are curated or they are wrappers, and the difference was measured
 
@@ -162,11 +219,14 @@ what OpenBot asks before running it depends on that classification. Arcade publi
 | `GithubApi` | 100 (the page cap) |                    **0** |
 
 Curated toolkits classify every tool. Generated API wrappers classify none. An action that is not
-classified is treated as a **destructive write**, because an unlabelled action is not claiming to be
-safe. So an administrator enabling an unclassified toolkit is warned **before** finishing that
-**every call will ask for approval** — not because anything is wrong with the toolkit, but because
-nothing in it can be told apart from a write that cannot be undone. Where a curated toolkit exists
-for the app, enable that one.
+classified is recorded as an **unclassified write** (`unclassified` on `mcp_tools`), because an
+unlabelled action is not claiming to be safe. It asks first wherever a change asks (**Extra
+vigilant**, or an approval rule), and a check-in, a task's unasked read or a memory source never
+calls it. It is not marked destructive, because Arcade never said it destroys anything: that marker
+is what makes a call ask as deleting does (see [Approvals](../approvals.md)) and what a Bot's page
+draws as "destroys things", and it stays for the actions Arcade flags, such as `Attio.RemoveFromList`. A
+Composio action with no label is recorded the same way. An administrator enabling an unclassified
+toolkit is warned **before** finishing. Where a curated toolkit exists for the app, enable that one.
 
 ## Least privilege is not an Arcade property
 
@@ -198,7 +258,9 @@ fixed when the app is registered, and no request can ask for fewer.
 
 So when somebody asks whether connecting an app "only lets it read", the answer is whatever that
 app's measurement says, not what Arcade says in general. The pre-redirect consent copy names the
-permission being asked for and lists the actions that share it, grouped on scopes.
+permission being asked for and lists the actions that share it, grouped on scopes. **Connect asks
+for every scope the app publishes**, so least privilege on a provider that has it means approving
+actions one at a time from the action list instead.
 
 ## Scope versus tool grant
 

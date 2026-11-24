@@ -4,10 +4,11 @@
  * Both used to start only when a person set them up by hand, one Bot and one app at a time, so on a
  * fresh deployment a Bot remembered what it was told and nothing else. Now:
  *
- * - A person who talks to one of their Bots in a conversation with that Bot alone gets background
- *   research from it: the same read-only run (`proactive/restriction.ts`), every four hours, first
- *   run one interval after the conversation so it never races it. Suggestions land in that
- *   conversation.
+ * - Only with OPENBOT_PROACTIVE_DEFAULTS=true: a person who talks to one of their Bots in a
+ *   conversation with that Bot alone gets check-ins from it: the same read-only run
+ *   (`proactive/restriction.ts`), hourly, first run one interval after the conversation so it never
+ *   races it. Otherwise a Bot offers a check-in on one thing in the conversation
+ *   (`proactive/offer-tool.ts`), and nothing runs until the person accepts.
  * - Each app the person connected in their own account, that the Bot can read, becomes a memory
  *   source for that Bot: one per app, read as the person, through the same authorization a source
  *   made by hand passes (`MemoryIngestion.defaultSourceCandidates`).
@@ -26,17 +27,23 @@
  *
  * Off for the whole deployment with OPENBOT_MEMORY_SOURCE_DEFAULTS=false and
  * OPENBOT_PROACTIVE_DEFAULTS=false. Either switch stops new defaults; neither touches existing rows.
+ * Memory sources are never adopted in an edition without memory (`editionHasMemory`), whatever the
+ * switch says; background research still is.
  */
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
+import { type Edition, editionHasMemory } from "../edition";
 import { type DefaultFeature, defaultOptOuts } from "../db/schema/defaults";
 import { memorySources } from "../db/schema/memory";
 import { proactiveSettings } from "../db/schema/proactive";
 import type { MemoryIngestion } from "./ingestion";
 
-/** How often background research runs when OpenBot switched it on, in minutes. */
-export const DEFAULT_RESEARCH_INTERVAL_MINUTES = 240;
+/**
+ * How often check-ins run when OpenBot switched them on, in minutes: hourly, the most often a Bot
+ * may look. Most end silently, and the person hears at most once an hour whatever they find.
+ */
+export const DEFAULT_RESEARCH_INTERVAL_MINUTES = 60;
 /** The shortest gap between two adoption passes for one person and Bot in this process. */
 const MIN_INTERVAL_MS = 5 * 60_000;
 
@@ -123,6 +130,8 @@ export function createMemoryDefaults(options: {
   ingestion: Pick<MemoryIngestion, "defaultSourceCandidates" | "sync">;
   /** OPENBOT_MEMORY_SOURCE_DEFAULTS, on unless switched off. */
   sources: boolean;
+  /** Without memory (`editionHasMemory`), no source is adopted whatever `sources` says. */
+  edition: Edition;
   /** OPENBOT_PROACTIVE_DEFAULTS, on unless switched off. */
   research: boolean;
   /** The Bots in this person's conversation, or null when it is not theirs. */
@@ -145,6 +154,7 @@ export function createMemoryDefaults(options: {
 }) {
   const now = options.now ?? Date.now;
   const minIntervalMs = options.minIntervalMs ?? MIN_INTERVAL_MS;
+  const sources = options.sources && editionHasMemory(options.edition);
   const log = options.log ?? ((entry) => console.warn(JSON.stringify(entry)));
   const lastRun = new Map<string, number>();
 
@@ -174,7 +184,7 @@ export function createMemoryDefaults(options: {
     ownerUserId: string,
     agentId: string,
   ): Promise<string[]> {
-    if (!options.sources) return [];
+    if (!sources) return [];
     if (await options.publishedByAnother?.(ownerUserId, agentId)) return [];
     const candidates = await options.ingestion.defaultSourceCandidates(
       ownerUserId,
@@ -257,6 +267,20 @@ export function createMemoryDefaults(options: {
         ).size
       )
         return false;
+      // One default per person and Bot: any check-in already there, on or off, is the person's
+      // choice. Checked under the lock, since a Bot can now hold several and nothing else stops a
+      // second.
+      const [existing] = await transaction
+        .select({ id: proactiveSettings.id })
+        .from(proactiveSettings)
+        .where(
+          and(
+            eq(proactiveSettings.ownerUserId, ownerUserId),
+            eq(proactiveSettings.agentId, agentId),
+          ),
+        )
+        .limit(1);
+      if (existing) return false;
       const rows = await transaction
         .insert(proactiveSettings)
         .values({
@@ -271,8 +295,6 @@ export function createMemoryDefaults(options: {
             now() + DEFAULT_RESEARCH_INTERVAL_MINUTES * 60_000,
           ),
         })
-        // One per person and Bot: a row already there, on or off, is the person's choice.
-        .onConflictDoNothing()
         .returning({ id: proactiveSettings.id });
       return rows.length > 0;
     });
@@ -294,7 +316,7 @@ export function createMemoryDefaults(options: {
      * Bot, switch on that Bot's defaults. Never waits and never throws.
      */
     personSpoke(ownerUserId: string, channelId: string) {
-      if (!options.sources && !options.research) return;
+      if (!sources && !options.research) return;
       if (!due(`channel:${ownerUserId}:${channelId}`)) return;
       void (async () => {
         const bots = await options.channelBots(ownerUserId, channelId);
@@ -310,7 +332,7 @@ export function createMemoryDefaults(options: {
     },
     /** A turn by this Bot for this person is starting: pick up apps connected since. Never waits. */
     botTurn(ownerUserId: string, agentId: string) {
-      if (!options.sources) return;
+      if (!sources) return;
       if (!due(`bot:${ownerUserId}:${agentId}`)) return;
       void adoptSources(ownerUserId, agentId).catch(failed("sources"));
     },

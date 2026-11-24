@@ -97,6 +97,12 @@ export type PluginServer = {
    * Null is not an older brokered row. It is a row that is not brokered at all.
    */
   authScheme: string | null;
+  /**
+   * The Microsoft Entra scope a server added by URL is reached with as the person asking, or null
+   * for one reached on the deployment's own token. Optional because a server replica older than
+   * this field does not send it, mid-rollout.
+   */
+  entraScope?: string | null;
   tools: PluginTool[];
   /** Empty for a healthy connector. See {@link WithdrawnGrant}. */
   withdrawn: WithdrawnGrant[];
@@ -118,6 +124,14 @@ export type PluginServer = {
    * {@link accountMode} is not `"shared"`.
    */
   sharedVendorConnected: boolean;
+  /**
+   * Whether this app may only hold the deployment's one shared account: it connects on this
+   * deployment's own OAuth client, so a person's own account would be the organization's access
+   * under their name. Decided by the server from how the app connects; a screen offers no personal
+   * Connect where this is true, and the server refuses one anyway. Optional because a server
+   * replica older than this field does not send it, mid-rollout, and absent reads as false.
+   */
+  sharedOnly?: boolean;
   /**
    * Who may give this app to a Bot: any Bot's owner, for their own Bot (`any`), or only an admin
    * (`admin`), with the default for its account filled in. Every person's own account defaults to
@@ -167,6 +181,11 @@ export type CatalogueItem = {
   auth: "none" | "deployment-bearer" | "user-oauth" | "builtin";
   /** True for a vendor that gives every customer their own hostname. */
   perInstance: boolean;
+  /**
+   * Whether connecting needs nothing typed first: no account, or an OAuth vendor the deployment
+   * registers itself with. Optional so an older server's answer still reads, as "no".
+   */
+  oneStep?: boolean;
 };
 
 /** One app in Composio's directory, as the picker shows it. */
@@ -195,6 +214,14 @@ export type ComposioApp = {
   classifiedCount: number | null;
   permissionCount: number | null;
   scopedActionCount: number | null;
+  /**
+   * How a person connects the app, as the server decided it off the broker's catalogue. `fields`
+   * is the one that asks for a key typed in; every other kind is a sign-in, or nothing at all.
+   * The directory says so on the row before anybody adds the app.
+   */
+  connection: {
+    kind: "consent" | "self-registering" | "fields" | "no-auth" | "unsupported";
+  };
   enabled: boolean;
 };
 
@@ -291,6 +318,7 @@ export const pluginKeys = {
   forAgent: (agentId: string) => ["plugins", "for-agent", agentId] as const,
   connections: () => ["plugins", "connections"] as const,
   siblings: (serverId: string) => ["plugins", "siblings", serverId] as const,
+  accounts: (serverId: string) => ["plugins", "accounts", serverId] as const,
   composioApps: (query: string) =>
     ["plugins", "composio", "apps", query] as const,
 };
@@ -497,7 +525,7 @@ export function pluginsPageQueryOptions() {
     queryKey: pluginKeys.page(),
     queryFn: async (): Promise<PluginsPage> => {
       const response = await client("/api/plugins", {
-        fallback: "Plugins could not be loaded.",
+        fallback: "Couldn't load your apps. Reload the page.",
       });
       return response.json();
     },
@@ -540,6 +568,46 @@ export function agentPluginsQueryOptions(agentId: string) {
         { fallback: "Couldn't load this Bot's apps." },
       );
       return response.json();
+    },
+  });
+}
+
+/** One of the signed-in person's accounts at an app, as `/servers/:id/accounts` answers it. */
+export type BrokeredAccountRecord = {
+  /** Which account a Disconnect or Make default press is about. Opaque. */
+  id: string;
+  /** What the app says the account is: an email address or a login. Null where it said none. */
+  identity: string | null;
+  /** What the person and their Bots call it: the identity, or "account 2" where there is none. */
+  label: string;
+  /** The account a Bot uses when it doesn't name one. */
+  isDefault: boolean;
+  connectedAt: string | null;
+};
+
+export type BrokeredAccounts = {
+  accounts: BrokeredAccountRecord[];
+  /** Whether this app can take another account beside the ones listed. The server decides. */
+  canAddAnother: boolean;
+};
+
+/**
+ * The person's own accounts at one brokered app. The server asks the app each time, so an account
+ * connected or ended elsewhere is listed as it stands now.
+ */
+export function brokeredAccountsQueryOptions(serverId: string) {
+  return queryOptions({
+    queryKey: pluginKeys.accounts(serverId),
+    queryFn: async (): Promise<BrokeredAccounts> => {
+      const response = await client(
+        `/api/plugins/servers/${encodeURIComponent(serverId)}/accounts`,
+        { fallback: "Couldn't list your accounts. Reload the page." },
+      );
+      const body: Partial<BrokeredAccounts> = await response.json();
+      return {
+        accounts: Array.isArray(body.accounts) ? body.accounts : [],
+        canAddAnother: body.canAddAnother === true,
+      };
     },
   });
 }

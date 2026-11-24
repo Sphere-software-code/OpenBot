@@ -914,6 +914,52 @@ test("a tab whose url Chrome withholds (a chrome:// page) starts with the networ
   });
 });
 
+test("a page the Record tab reaches while Record starts is its first step, and the next page change comes from it", async () => {
+  // A new browser's blank tab, whose address Chrome withholds, as OpenBot's own browser opens on.
+  fake.tabs.set(7, { id: 7 } as chrome.tabs.Tab);
+  const opening = hold("document");
+  const answer = page({ type: "page.record", title: "T", tabId: 7 });
+  await until(opening.hit, "Record waiting on the document");
+  expect((await state()).phase).toBe("starting");
+  // The person types an address into OpenBot's address bar while Record still starts: the tab commits it.
+  fake.tabs.set(7, { id: 7, url: DEAL } as chrome.tabs.Tab);
+  fake.webNavigation.commit({
+    tabId: 7,
+    frameId: 0,
+    url: DEAL,
+    transitionType: "typed",
+  });
+  await settle();
+  opening.open();
+  expect(await answer).toEqual({ ok: true });
+  // The network capture and the script start on the page the tab is on now, not the blank one Record first read.
+  expect(network.calls).toEqual([`start 7 ${DEAL}`]);
+  fake.webNavigation.commit({
+    tabId: 7,
+    frameId: 0,
+    url: "https://crm.example.test/deals/43",
+    transitionType: "typed",
+  });
+  // The person moves to another tab: the pages they visited in this one go out.
+  fake.person.openTab();
+  const navigations = () =>
+    sentToDocument("offscreen.event")
+      .map((m) => (m.type === "offscreen.event" ? m.event : null))
+      .filter((recorded) => recorded?.name === "navigation");
+  await until(() => navigations().length === 2, "both page changes");
+  await settle();
+  expect(navigations().map((recorded) => recorded?.value)).toMatchObject([
+    { step: "navigate", from: "", to: DEAL, transitionType: "typed" },
+    {
+      step: "navigate",
+      from: DEAL,
+      to: "https://crm.example.test/deals/43",
+      transitionType: "typed",
+    },
+  ]);
+  expect(await state()).toMatchObject({ actions: 2 });
+});
+
 test("a failure once the document started rolls everything back, and the document clears what it holds", async () => {
   network.failStart = true;
   fake.tabs.set(7, { id: 7, url: DEAL } as chrome.tabs.Tab);
@@ -999,7 +1045,7 @@ test("Stop queues the outcome in the document, and the recording waits as a drai
 test("a recording the document could not send at all never reads as sent: Stop says nothing reached Intelligence", async () => {
   const id = await record();
   const NOT_SENT =
-    "Nothing of this recording reached Intelligence: the Recorder could not start sending it. Try recording again.";
+    "Nothing of this recording reached OpenBot's backend: the Recorder could not start sending it. Try recording again.";
   holdStop = true;
   const stopping = page({ type: "page.stop" });
   await until(
@@ -1647,7 +1693,7 @@ test("Start over on the notice records a new recording whose count starts again"
 
 // ---- Start over ------------------------------------------------------------------------------
 
-test("Start over sends the recording it leaves to Intelligence with a failed outcome and records into a new trajectory", async () => {
+test("Start over sends the recording it leaves to OpenBot's backend with a failed outcome and records into a new trajectory", async () => {
   const old = await record();
   const oldTrajectory = trajectoryOf(old);
   const content = contentPort(7);
@@ -1773,7 +1819,7 @@ test("once Intelligence takes events again the popup says Streaming, and nothing
   const id = await record();
   const trajectory = trajectoryOf(id);
   const busy =
-    "Intelligence is busy or unreachable. Retrying; nothing is lost.";
+    "OpenBot's backend is busy or unreachable. Retrying; nothing is lost.";
   doc?.postMessage({
     type: "offscreen.status",
     capture: {
@@ -1965,6 +2011,11 @@ test("a signed-out answer the popup gets from OpenBot forgets the connection and
     kind: "signed-out",
     reason: "revoked",
   });
+  // Stopped once the document says it stored the outcome, so it is not closed mid-store.
+  await until(
+    async () => (await state()).phase === "idle",
+    "the recording stops",
+  );
   expect(await state()).toMatchObject({ phase: "idle", error: SIGNED_OUT });
   expect(network.running.size).toBe(0);
   expect(drains()).toMatchObject([
@@ -1979,7 +2030,10 @@ test("a signed-out answer to the Learning space does the same", async () => {
   const answer = await page({ type: "page.learning" });
   expect(answer.ok).toBe(false);
   expect(storedConnection()).toBeUndefined();
-  expect((await state()).phase).toBe("idle");
+  await until(
+    async () => (await state()).phase === "idle",
+    "the recording stops",
+  );
   expect(drains()[0]?.kept?.waitingForReconnect).toBe(true);
 });
 
@@ -2300,6 +2354,73 @@ test("a discard the document could not be sent still lets the live recording's e
 });
 
 // ---- Disconnect ------------------------------------------------------------------------------
+
+test("Stop on the recording mark, answered Save, ends the recording as the popup's Stop does", async () => {
+  fake.tabs.set(7, { id: 7, url: "chrome://newtab/" } as chrome.tabs.Tab);
+  const recordingId = await record();
+  const top = contentPort(7, 0);
+  top.postMessage({ type: "content.event", event: event("click", { i: 0 }) });
+  await until(async () => (await state()).actions === 1, "one action");
+  top.postMessage({ type: "content.stop", save: true });
+  await until(
+    () => sentToDocument("offscreen.stop").length === 1,
+    "offscreen.stop",
+  );
+  expect(sentToDocument("offscreen.stop")[0]).toEqual({
+    type: "offscreen.stop",
+    outcome: "succeeded",
+  });
+  expect(sentToDocument("offscreen.discard")).toEqual([]);
+  doc?.postMessage({ type: "offscreen.stopped", recordingId });
+  await until(async () => (await state()).phase === "idle", "stopped");
+  expect((await state()).lastStopped).toMatchObject({
+    recordingId,
+    actions: 1,
+  });
+  expect((await state()).lastStopped?.discarded).toBeUndefined();
+});
+
+test("Stop on the recording mark, answered Discard, ends the recording failed and clears what it had not sent", async () => {
+  fake.tabs.set(7, { id: 7, url: "chrome://newtab/" } as chrome.tabs.Tab);
+  const recordingId = await record();
+  const top = contentPort(7, 0);
+  // The document is closed once nothing is left for it to send: what it was told is read from the one that was open.
+  const document = doc;
+  top.postMessage({ type: "content.stop", save: false });
+  await until(
+    () => sentToDocument("offscreen.discard", document).length === 1,
+    "offscreen.discard",
+  );
+  // What it streamed live is in Intelligence already: its outcome says the person discarded it.
+  expect(sentToDocument("offscreen.stop", document).at(-1)).toEqual({
+    type: "offscreen.stop",
+    outcome: "failed",
+    reason: "discarded",
+  });
+  expect(sentToDocument("offscreen.discard", document)[0]).toEqual({
+    type: "offscreen.discard",
+    recordingIds: [recordingId],
+  });
+  await until(async () => (await state()).phase === "idle", "stopped");
+  expect(drains()).toEqual([]);
+  // Named, so OpenBot says it was discarded rather than saved; the connection stays.
+  expect((await state()).lastStopped).toMatchObject({
+    recordingId,
+    discarded: true,
+  });
+  expect((await state()).error).toBeUndefined();
+  expect(storedConnection()).toBeDefined();
+});
+
+test("a frame inside the page cannot stop the recording from a mark it does not have", async () => {
+  fake.tabs.set(7, { id: 7, url: "chrome://newtab/" } as chrome.tabs.Tab);
+  await record();
+  const frame = contentPort(7, 3);
+  frame.postMessage({ type: "content.stop", save: false });
+  await settle();
+  expect(sentToDocument("offscreen.stop")).toEqual([]);
+  expect((await state()).phase).toBe("recording");
+});
 
 test("Disconnect discards the kept recordings and the one recording, and nothing else does", async () => {
   fake.tabs.set(7, { id: 7, url: "chrome://newtab/" } as chrome.tabs.Tab);

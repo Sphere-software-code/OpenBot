@@ -559,7 +559,8 @@ type Live = {
 type StopMode =
   | { kind: "person" } // Stop: the outcome is queued, then the outbox drains
   | { kind: "signed-out"; reason: LostReason; forgot: boolean } // kept for the person (only this recording when the connection was not forgotten)
-  | { kind: "disconnect" }; // the person's Disconnect: discarded right after
+  | { kind: "disconnect" } // the person's Disconnect: discarded right after
+  | { kind: "discard" }; // the person's Stop on the recording mark, answered Discard: discarded right after
 
 const signedOutReason = (error: unknown): SignedOutReason | null =>
   error instanceof OpenBotError && error.signedOut
@@ -660,8 +661,18 @@ export function installRecording(
   /** Set from Record's first step until it finished starting (or rolled back). A stop (Stop, Disconnect, a sign-out)
    * and Start over wait for it. A stop that comes before the recording is live cancels it: Record checks just before
    * making the recording live and rolls back. One that comes later stops the recording once Record finished, so the
-   * network capture and the tab's script Record starts are there for the stop to end. */
-  let starting: { done: Promise<void>; cancelled: boolean } | null = null;
+   * network capture and the tab's script Record starts are there for the stop to end.
+   *
+   * `pageChanges` holds the page changes of the tab Record starts in that come while it starts: the tab is the person's
+   * from the moment they press Record, and OpenBot's own address bar or a link can take it to a website before the
+   * recording is live. Record reads the tab's address once, early, and they would otherwise be neither its first page
+   * nor a step of it; it records them as steps once the recording is live, and starts on the page they reached. */
+  let starting: {
+    done: Promise<void>;
+    cancelled: boolean;
+    tabId: number;
+    pageChanges: { details: NavigationDetails; kind: "commit" | "history" }[];
+  } | null = null;
   /** The stop under way, from the moment it takes the live recording until it finished: Disconnect waits for it, so the
    * recording it moves into the drains is discarded with the rest. */
   let stopInFlight: Promise<void> | null = null;
@@ -842,6 +853,8 @@ export function installRecording(
   /** Recordings the document could not send at all, with the sentence that says so. */
   const failedSends = new Map<string, string>();
   const earlyKept = new Map<string, KeptEvents>();
+  /** Retrying sentences (`offscreen.retrying`) for the live recording, applied when it reaches `drains`. */
+  const earlyRetrying = new Map<string, string>();
 
   /** Opening and closing the document never cross. */
   let documentQueue: Promise<unknown> = Promise.resolve();
@@ -1100,6 +1113,11 @@ export function installRecording(
           report("finishing a drain"),
         );
         return;
+      case "offscreen.retrying":
+        void noteRetrying(message.recordingId, message.reason).catch(
+          report("noting a retry"),
+        );
+        return;
       case "offscreen.kept":
         void keepEvents(message.recordingId, {
           reason: message.reason,
@@ -1213,6 +1231,34 @@ export function installRecording(
     });
     if (updated) publishDrains(updated);
     await maybeCloseDocument();
+  }
+
+  /** Why a recording's events are not going out while the document retries, or none once they go again: on its drain,
+   * or held for the live recording until Stop makes it one. */
+  async function noteRetrying(
+    recordingId: string,
+    reason: string | undefined,
+  ): Promise<void> {
+    const updated = await serially(async () => {
+      const drains = (await readLocal("drains")) ?? [];
+      const drain = drains.find((entry) => entry.recordingId === recordingId);
+      if (drain) {
+        if (drain.retrying === reason) return null;
+        const next = drains.map((entry) => {
+          if (entry.recordingId !== recordingId) return entry;
+          const { retrying: _was, ...rest } = entry;
+          return reason === undefined ? rest : { ...rest, retrying: reason };
+        });
+        await writeDrains(next);
+        return next;
+      }
+      if ((await readLocal("activeRecording"))?.recordingId === recordingId) {
+        if (reason === undefined) earlyRetrying.delete(recordingId);
+        else earlyRetrying.set(recordingId, reason);
+      }
+      return null;
+    });
+    if (updated) publishDrains(updated);
   }
 
   // ---- Record -------------------------------------------------------------------------------
@@ -1551,11 +1597,13 @@ export function installRecording(
       learning: learningSpace,
     });
     let finish = () => {};
-    const attempt = {
+    const attempt: NonNullable<typeof starting> = {
       done: new Promise<void>((resolve) => {
         finish = resolve;
       }),
       cancelled: false,
+      tabId: message.tabId,
+      pageChanges: [],
     };
     starting = attempt;
     try {
@@ -1580,7 +1628,7 @@ export function installRecording(
   async function start(
     message: Extract<PageToBackground, { type: "page.record" }>,
     connection: ConnectionRecord,
-    attempt: { cancelled: boolean },
+    attempt: NonNullable<typeof starting>,
   ): Promise<PageResponse> {
     const { title, tabId } = message;
     let tab: chrome.tabs.Tab;
@@ -1694,17 +1742,22 @@ export function installRecording(
       injected = true;
       openSteps(recordingId);
       startStep(tabId, url ?? "");
+      // The pages the tab reached while Record started are its first steps, after the page it was on: the same address
+      // as that page is not recorded twice. What follows starts on the page the tab is on now.
+      for (const change of attempt.pageChanges.splice(0))
+        recordTopNavigation(change.details, change.kind);
+      const top = state.topUrls[tabId] || url || "";
       // A page the Recorder may not read refuses the script; its first commit to a website injects it. On a site the
       // person keeps out, the script only shows the mark saying so.
       await injectRecordingScripts(tabId, recordingId, undefined, {
-        active: !excludedUrl(url),
+        active: !excludedUrl(top),
       }).catch(() => undefined);
       // The capture owns the fallback: it alone starts, extends, resumes and stops it.
       capture = deps.createNetworkCapture(networkDeps, {
         fallback: deps.createPageFallback(),
       });
       network = capture;
-      networkMode = await capture.start(tabId, url ?? "");
+      networkMode = await capture.start(tabId, top);
       dispatch({ type: "capture", capture: { network: networkMode } });
       postToContentPorts([tabId], captureFor(tabId));
       return { ok: true };
@@ -1748,10 +1801,13 @@ export function installRecording(
       if (record?.recordingId !== recordingId) return current;
       const kept = earlyKept.get(recordingId);
       earlyKept.delete(recordingId);
+      const retrying = earlyRetrying.get(recordingId);
+      earlyRetrying.delete(recordingId);
       const drain: DrainRecord = defined({
         ...record,
         discarding: flags.discarding ? true : undefined,
         kept: flags.discarding ? undefined : kept,
+        retrying: flags.discarding ? undefined : retrying,
         held: flags.held?.length ? flags.held : undefined,
       });
       const next = [
@@ -1820,8 +1876,10 @@ export function installRecording(
     // A stop this service worker finishes for one before it: what that one held is sent as this one's would be.
     const restored = steps ? undefined : takeRestored(recordingId);
     if (restored) openSteps(recordingId, restored);
-    // The phrase being said is placed among the held steps, before they go (not for a Disconnect, which discards it).
-    if (mode.kind !== "disconnect") await endVoiceFirst(recordingId);
+    // The phrase being said is placed among the held steps, before they go (not for a Disconnect or a discard, which
+    // throw it away).
+    if (mode.kind !== "disconnect" && mode.kind !== "discard")
+      await endVoiceFirst(recordingId);
     // The steps still held go before the outcome, with the saves they have; storage forgets them at once.
     closeSteps();
     // The recording's voice has ended with it: a phrase it was hearing holds nothing of the next recording, and a phrase
@@ -1829,8 +1887,8 @@ export function installRecording(
     speechHold = null;
     external = null;
     await writeHeld();
-    // Only the person's Stop succeeds. A Disconnect or a sign-out ends the recording midway: what it streamed live is in
-    // Intelligence already, and its outcome says why it ended.
+    // Only the person's Stop succeeds. A Disconnect, a discard or a sign-out ends the recording midway: what it streamed
+    // live is in Intelligence already, and its outcome says why it ended.
     const message: BackgroundToOffscreen =
       mode.kind === "person"
         ? { type: "offscreen.stop", outcome: "succeeded" }
@@ -1839,11 +1897,13 @@ export function installRecording(
             outcome: "failed",
             // Only OpenBot signs a connection out; a policy move and a replaced connection disconnect it here.
             reason:
-              mode.kind === "disconnect" ||
-              mode.reason === "policy" ||
-              mode.reason === "replaced"
-                ? "disconnected"
-                : "signed-out",
+              mode.kind === "discard"
+                ? "discarded"
+                : mode.kind === "disconnect" ||
+                    mode.reason === "policy" ||
+                    mode.reason === "replaced"
+                  ? "disconnected"
+                  : "signed-out",
           };
     // The document went away (with the service worker, or on its own): the person's Stop reopens it on the stored
     // session, however long ago the stop began, so the outcome is queued and the rest is sent now rather than at the
@@ -1868,9 +1928,17 @@ export function installRecording(
       } finally {
         pendingStop = null;
       }
+    } else if (mode.kind === "signed-out" && disconnecting === 0) {
+      /*
+       * A recording kept for its person waits for the document to say it stored the outcome, as Stop does, but is never
+       * reopened for it. The drain is marked waiting next, and a document whose drains all wait is closed: closed
+       * before it answered, it was closed mid-store, so the outcome that says the recording was signed out was lost
+       * (Chrome ends a closed document's work) and the reconnect's recover ended the recording as interrupted instead.
+       */
+      await awaitStopped(recordingId, since, message);
     } else {
-      // A recording kept for its person, or discarded (a Disconnect is under way), waits only for a reconnecting
-      // document to hear of it.
+      // A recording discarded, or ended while a Disconnect is under way, waits only for a reconnecting document to hear
+      // of it.
       await sendToDocument(message);
     }
 
@@ -1888,12 +1956,19 @@ export function installRecording(
     await moveIntoDrains(recordingId);
     await removeSession("stream");
     const failed = failedSends.get(recordingId);
+    // The person's discard: what it had not sent yet is cleared now, and never goes to Intelligence.
+    if (mode.kind === "discard")
+      await discardDrains([recordingId]).catch(
+        report("discarding a recording"),
+      );
     dispatch({
       type: "finished",
       // A recording a Disconnect stops is discarded right after: what it had not sent yet never goes to Intelligence, so
-      // the popup does not say it was sent (what it streamed live is there, ended with a failed outcome).
+      // the popup does not say it was sent (what it streamed live is there, ended with a failed outcome). One the person
+      // discarded is named, so OpenBot can say it was discarded.
       lastStopped:
-        mode.kind === "disconnect" || failed !== undefined
+        mode.kind === "disconnect" ||
+        (failed !== undefined && mode.kind !== "discard")
           ? undefined
           : {
               recordingId,
@@ -1902,8 +1977,13 @@ export function installRecording(
               // What it held, for OpenBot to say: the badge's count and the phrases placed, both final now.
               actions: state.actions,
               phrases: state.phrases ?? 0,
+              ...(mode.kind === "discard" ? { discarded: true } : {}),
             },
-      error: signedOut ? stoppedSentence(signedOut) : failed,
+      error: signedOut
+        ? stoppedSentence(signedOut)
+        : mode.kind === "discard"
+          ? undefined
+          : failed,
     });
     if (signedOut)
       // A sign-out that forgot nothing (the person connected again) leaves their other drains to the new connection.
@@ -2183,11 +2263,13 @@ export function installRecording(
       if (!previous) return existing;
       const kept = earlyKept.get(previous.recordingId);
       earlyKept.delete(previous.recordingId);
+      const retrying = earlyRetrying.get(previous.recordingId);
+      earlyRetrying.delete(previous.recordingId);
       const changed = [
         ...existing.filter(
           (drain) => drain.recordingId !== previous.recordingId,
         ),
-        defined({ ...previous, kept }),
+        defined({ ...previous, kept, retrying }),
       ];
       await writeLocal("activeRecording", {
         ...previous,
@@ -2825,6 +2907,13 @@ export function installRecording(
       case "content.notice":
         void noticeChoice(message.choice).catch(report("the notice choice"));
         return;
+      case "content.stop":
+        // The mark is drawn in the top frame alone; a frame inside the page cannot stop the recording.
+        if (port.sender?.frameId !== 0) return;
+        void stopRecording(
+          message.save ? { kind: "person" } : { kind: "discard" },
+        ).catch(report("stopping from the recording mark"));
+        return;
     }
   }
 
@@ -2870,6 +2959,15 @@ export function installRecording(
     details: NavigationDetails,
     kind: "commit" | "history",
   ): void {
+    // The tab Record is starting in, reaching a page before the recording is live: Record records it once it is.
+    if (
+      state.phase === "starting" &&
+      starting?.tabId === details.tabId &&
+      details.frameId === 0
+    ) {
+      starting.pageChanges.push({ details, kind });
+      return;
+    }
     if (state.phase !== "recording" || !live) return;
     const { tabId, frameId, url } = details;
     if (!state.tabIds.includes(tabId)) {

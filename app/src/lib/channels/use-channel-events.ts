@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
+import { noticeChannelEvent } from "@/lib/notifications/reply-notice";
 import { socketUrl as buildSocketUrl } from "@/lib/socket-url";
 import {
   type AgentChannel,
@@ -78,8 +79,19 @@ export type ChannelActivityEvent = {
   lastMessage: string | null;
   lastMessageAt: string | null;
   lastMessageAgentId: string | null;
-  /** The channel's newly written summary. Absent on an ordinary activity event. */
-  summary?: string;
+  /**
+   * A Bot's reply, its first line as plain text, for the notice a reply raises while OpenBot is out
+   * of sight. `lastMessage` runs every line into one. Only on a Bot's message, and absent from a
+   * server older than this.
+   */
+  firstLine?: string;
+  /**
+   * What the channel is called now: a newly written summary, or a rename. Null when a cleared name
+   * leaves it with no summary yet. Absent on an ordinary activity event.
+   */
+  summary?: string | null;
+  /** A person's first words, newly written: the row's name until its summary. Absent otherwise. */
+  opening?: string;
   /** The channel is gone from every member's roster. Absent on an ordinary activity event. */
   deleted?: true;
   /**
@@ -161,6 +173,19 @@ export function applyChannelEvent(
     if (previous.summary === activity.summary) return data;
     const channels = page.channels.slice();
     channels[index] = { ...previous, summary: activity.summary };
+    const pages = data.pages.slice();
+    pages[holdingPage] = { ...page, channels };
+    return { ...data, pages };
+  }
+
+  /*
+   * An opening patches the one field too, for the same reason. It can come from a person's message
+   * the server found stale as the last message, so the spread below would carry nulls onto the row.
+   */
+  if (activity.opening !== undefined) {
+    if (previous.opening === activity.opening) return data;
+    const channels = page.channels.slice();
+    channels[index] = { ...previous, opening: activity.opening };
     const pages = data.pages.slice();
     pages[holdingPage] = { ...page, channels };
     return { ...data, pages };
@@ -350,6 +375,14 @@ export function useChannelEvents() {
             return data;
           },
         );
+
+        // A Bot's reply, while OpenBot is out of sight: the notice, when the person allowed them.
+        noticeChannelEvent(activity, queryClient, (channelId) => {
+          void router.navigate({
+            to: "/channel/$channelId",
+            params: { channelId },
+          });
+        });
 
         if (activity.work !== undefined) {
           queryClient.setQueryData(

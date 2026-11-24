@@ -27,13 +27,13 @@ export function matchesToken(expected: string, offered: string): boolean {
 /**
  * The secret a caller offered, however it could carry it.
  *
- * WebSocket clients cannot set upgrade headers, so the stream also accepts the token as a query
- * parameter.
+ * WebSocket clients cannot set upgrade headers, so the stream and the terminal also accept the
+ * token as a query parameter.
  */
 export function offeredToken(headers: Headers, url: URL): string {
   // The header path trims; the query path must too, or `?token=%20SECRET` 401s while the same
   // value in a header succeeds and the failure looks stream-specific.
-  if (url.pathname === "/stream")
+  if (url.pathname === "/stream" || url.pathname === "/terminal")
     return url.searchParams.get("token")?.trim() ?? "";
   const header = headers.get("x-openbot-computer-token")?.trim();
   if (header) return header;
@@ -82,7 +82,13 @@ export function actsOnTheComputer(pathname: string): boolean {
   return ACTING_PATHS.has(pathname);
 }
 
-/** Only page mutations need a fresh browser snapshot after handback. */
+/**
+ * Which actions work on the page in front of the Bot, and so need a fresh snapshot after a handback.
+ *
+ * Opening an address is not one of them. It replaces the page the person handed back and reads the
+ * new one, so looking at the old page first tells the Bot nothing. Gated, it turned away the first
+ * thing a later conversation does, which is open a page, with an instruction meant for the Bot.
+ */
 export function mutatesBrowser(pathname: string): boolean {
-  return ["/navigate", "/click", "/type", "/key", "/scroll"].includes(pathname);
+  return ["/click", "/type", "/key", "/scroll"].includes(pathname);
 }

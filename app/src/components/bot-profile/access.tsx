@@ -42,13 +42,15 @@ import {
   giveableAppsQueryOptions,
 } from "@/lib/app-access/queries";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
+import { useManagePaths } from "@/lib/manage-paths";
 import { setPluginGrantMutationOptions } from "@/lib/plugins/mutations";
 import {
   agentPluginsQueryOptions,
   type GrantedPlugins,
   pluginsPageQueryOptions,
 } from "@/lib/plugins/queries";
-import { readToolName } from "@/lib/plugins/tool-name";
+import { toolName } from "@/lib/plugins/tool-words";
 import { queryClient } from "@/query-client";
 
 /**
@@ -68,6 +70,10 @@ function connectorName(key: string): string {
 /**
  * Connector key → the labels of the tools this Bot holds on it.
  *
+ * Named as the app's own page lists them (`toolName`), each as a command: "Create goal", where
+ * Activity says what was done, "Created a goal". A list that said some of each read as a list of
+ * two kinds of thing.
+ *
  * Vendors prefix every tool with their own name — "Notion create pages" — which next to a row
  * already titled Notion reads as a stutter. Stripped only as a leading word, and re-cased, so
  * "Notion search" becomes "Search" while "Search notion pages" is left alone.
@@ -76,7 +82,7 @@ function connectorTools(plugins: GrantedPlugins): Map<string, string[]> {
   const connectors = new Map<string, string[]>();
   for (const tool of plugins.tools) {
     const key = tool.ref.split("/")[0] ?? tool.ref;
-    let label = readToolName(tool.toolName).label;
+    let label = toolName(key, tool.ref.slice(key.length + 1) || tool.ref);
     const prefix = `${key.toLowerCase()} `;
     if (label.toLowerCase().startsWith(prefix)) {
       const rest = label.slice(prefix.length);
@@ -94,12 +100,16 @@ export function connectorCount(plugins: GrantedPlugins): number {
 
 /** What this Bot may reach: your skills on it, everything granted to it, and who it may ask. */
 export function AccessSections({ agent }: { agent: AgentProfile }) {
+  // Every Bot has every connected app in the personal edition, so there is no switch per app here.
+  const personal =
+    useQuery(deploymentCapabilitiesQueryOptions()).data?.edition === "personal";
   return (
     <>
-      {agent.mine ? <YourApps agent={agent} /> : null}
+      {agent.mine && !personal ? <YourApps agent={agent} /> : null}
       {agent.mine ? <YourSkills agentId={agent.id} /> : null}
       <Granted agentId={agent.id} mine={agent.mine} />
-      <HandoffPanel agentId={agent.id} />
+      {/* Every Bot can ask every other in the personal edition, so there is no switch per Bot. */}
+      {personal ? null : <HandoffPanel agentId={agent.id} />}
     </>
   );
 }
@@ -226,14 +236,22 @@ function YourApps({ agent }: { agent: AgentProfile }) {
 /**
  * Your own skills, one switch each. Only on your own Bot: the server lets a person put their own
  * skill on a Bot they own, and neither half alone is enough.
+ *
+ * WHICH SKILLS ARE YOURS COMES FROM THE SKILLS PAGE; WHETHER THIS BOT CARRIES ONE, FROM THE BOT'S OWN
+ * GRANTS (`GET /api/plugins/for/:agentId`, the read "What it can use" draws from too). That read is
+ * where the personal edition gives a Bot every skill the first time it is listed, so it is what
+ * gives a Bot made a moment ago its skills. The skills page, read alongside it or earlier, still said
+ * the Bot had none, and every switch was drawn off until the page was opened again.
  */
 function YourSkills({ agentId }: { agentId: string }) {
   const me = useQuery(currentUserQueryOptions()).data;
   const page = useQuery(pluginsPageQueryOptions());
+  const held = useQuery(agentPluginsQueryOptions(agentId));
   const grant = useMutation(setPluginGrantMutationOptions(queryClient));
   const skills = (page.data?.skills ?? []).filter(
     (skill) => me && skill.ownerUserId === me.id,
   );
+  const carried = new Set((held.data?.skills ?? []).map((skill) => skill.slug));
   return (
     <PageSection
       description="Turn on a skill to use it with this Bot. Type / in a conversation to run it."
@@ -244,7 +262,7 @@ function YourSkills({ agentId }: { agentId: string }) {
           {grant.error.message}
         </p>
       ) : null}
-      {page.isPending ? null : page.error ? (
+      {page.isPending || held.isPending ? null : page.error || held.error ? (
         <p className="mt-4 text-destructive text-sm" role="alert">
           Couldn't load your skills. Reload the page.
         </p>
@@ -274,14 +292,15 @@ function YourSkills({ agentId }: { agentId: string }) {
                 <ItemMedia variant="icon">
                   <IconBox />
                 </ItemMedia>
+                {/* By its title, as What it can use names it below; the section says how to run it. */}
                 <ItemContent>
-                  <ItemTitle>/{skill.slug}</ItemTitle>
+                  <ItemTitle>{skill.title}</ItemTitle>
                   <ItemDescription>{skill.summary}</ItemDescription>
                 </ItemContent>
                 <ItemActions>
                   <Switch
-                    aria-label={skill.slug}
-                    checked={skill.grantedTo.includes(agentId)}
+                    aria-label={skill.title}
+                    checked={carried.has(skill.slug)}
                     disabled={grant.isPending}
                     onCheckedChange={(granted) =>
                       grant.mutate({
@@ -319,6 +338,8 @@ function YourSkills({ agentId }: { agentId: string }) {
  */
 function Granted({ agentId, mine }: { agentId: string; mine: boolean }) {
   const me = useQuery(currentUserQueryOptions()).data;
+  const edition =
+    useQuery(deploymentCapabilitiesQueryOptions()).data?.edition ?? "team";
   const plugins = useQuery(agentPluginsQueryOptions(agentId));
   const apps = useQuery(botAppsQueryOptions(agentId));
   // Both, so no row is drawn without its state and then redrawn with one a moment later.
@@ -377,10 +398,10 @@ function Granted({ agentId, mine }: { agentId: string; mine: boolean }) {
                      */}
                     <ItemDescription className="line-clamp-none">
                       {app.state === "ready"
-                        ? [appAccessSentence(app)]
+                        ? [appAccessSentence(app, undefined, edition)]
                             .concat(labels.length > 0 ? [toolList(labels)] : [])
                             .join(" ")
-                        : appAccessSentence(app)}
+                        : appAccessSentence(app, undefined, edition)}
                     </ItemDescription>
                   </ItemContent>
                   <ItemActions>
@@ -477,15 +498,11 @@ function ManageLink({
   appKey: string;
   title: string;
 }) {
+  const paths = useManagePaths();
   return (
     <Button
       aria-label={`Manage ${title} on this Bot`}
-      render={
-        <Link
-          params={{ agentId, key: appKey }}
-          to="/admin/plugins/$key/bots/$agentId"
-        />
-      }
+      render={<Link {...paths.pluginBot(appKey, agentId)} />}
       size="icon-sm"
       variant="ghost"
     >

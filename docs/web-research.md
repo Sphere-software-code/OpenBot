@@ -1,6 +1,6 @@
 # Public-web research
 
-OpenBot ships three public-web research providers in the plugin catalogue: **Parallel**, **Exa** and **Firecrawl**. Each one gives a Bot a search tool, which finds sources for a query, and a fetch tool, which reads pages by URL. A Bot holding both tools from one provider is told how to research with them. None of this uses the Bot's browser, and no existing Bot gets new access automatically.
+OpenBot ships three public-web research providers in the plugin catalogue: **Parallel**, **Exa** and **Firecrawl**. Each one gives a Bot a search tool, which finds sources for a query, and a fetch tool, which reads pages by URL. A Bot holding both tools from one provider is told how to research with them. None of this uses the Bot's browser. In the team edition no Bot gets new access automatically. The personal edition turns on Parallel Search once, the first time it starts, and every Bot gets its two tools (see [Personal edition](personal-edition.md#web-search-is-on-from-the-start)).
 
 | Catalogue entry           | Search tool        | Fetch tool         | Credential                                           |
 | ------------------------- | ------------------ | ------------------ | ---------------------------------------------------- |
@@ -14,7 +14,7 @@ OpenBot ships three public-web research providers in the plugin catalogue: **Par
 ## Enable research
 
 1. As an administrator, open Plugins and add a provider from the catalogue. For the keyed entries, enter the provider's API key; it is stored in the server-side credential vault.
-2. Grant that provider's search and fetch tools to the Bots that should research the public web. For the shipped fintech package, select **Research Desk**.
+2. Grant that provider's search and fetch tools to the Bots that should research the public web. The fintech package's **Research Desk** is written for this; it ships in `examples/fintech/catalog/` and is loaded only once its file is copied into `examples/fintech/agents/`.
 3. Ask the Bot to research a topic. It searches, reads selected sources and cites their URLs. Run `/research-public-web` to select the example skill explicitly if your deployment has many tools.
 
 For production or higher limits, use a keyed entry and remove the grants on the free one. If a Bot holds a vendor's free and keyed entries, it is told about the keyed one.
@@ -31,7 +31,7 @@ A Bot holding more than one provider is told about each and uses the one the per
 
 Exa and Firecrawl name the tools that only read (`readTools` in the catalogue), and every other tool they advertise counts as a write. Firecrawl publishes tool families such as `firecrawl_monitor_*`, and Exa's agent tools spend credits, so neither can be safely described by a list of writes alone.
 
-The provider receives model-selected objectives, search queries, requested public URLs and, for Parallel, a conversation session identifier. These can contain information from the person's request, so the Bot is told not to send private context public research does not need. Full conversations are not forwarded. Failures stay visible and are not silently retried through another provider.
+The provider receives model-selected objectives, search queries, requested public URLs and, for Parallel, a conversation session identifier. In the personal edition that is the case from the first start: the search queries and the page URLs a Bot asks for go to Parallel until the person turns Parallel Search off. These can contain information from the person's request, so the Bot is told not to send private context public research does not need. Full conversations are not forwarded. Failures stay visible and are not silently retried through another provider.
 
 ## Adding a provider
 

@@ -1,13 +1,45 @@
 import { z } from "zod";
 import type { AuditInitiator } from "./initiator";
+import { providerSafeSchema } from "./tool-schema";
+
+/** Where a call came from, for a tool that needs more than its arguments. */
+export type ToolExecution = { toolCallId?: string; signal?: AbortSignal };
 
 /** A tool a Bot holds, as the built-in runtime is handed it and executes it on the server. */
 export type GrantedTool = {
   name: string;
   description: string;
   parameters: z.ZodType;
-  execute: (args: unknown) => Promise<string>;
+  /**
+   * The call's id and its run's abort signal come second, where the runner has them: the AI SDK's
+   * own execute options on a built-in Bot, the headless middleware's context on a remote one. A tool
+   * that only needs its arguments ignores them.
+   */
+  execute: (args: unknown, execution?: ToolExecution) => Promise<string>;
   initiator?: AuditInitiator;
+  /**
+   * May run beside the other calls of its step instead of after them. The AI SDK already runs a
+   * built-in Bot's calls together; this is for the headless middleware, which runs one at a time so
+   * that a browser's clicks keep their order.
+   */
+  concurrent?: true;
+  /**
+   * May wait behind `search_tools` instead of being sent on every model step.
+   *
+   * Set on an app's tools, which are the ones that arrive by the hundred: one Composio approval
+   * granted a Bot 239 Shopify actions. Left off the tools a Bot needs to be itself, such as its
+   * memory, its follow-ups and the card that asks for an app, because a Bot that has to search for
+   * its own memory before using it will not use it. See `server/src/agents/tool-search.ts`.
+   */
+  searchable?: true;
+  /**
+   * The app's action only reads: classified a read by the same rule a call is gated with
+   * (`classifyTool`). Absent is a write, or an action nobody classified.
+   *
+   * Read when a run can be sent only some of an app's actions (`fitToolLimit`), so the ones that
+   * read come first and the Bot can always look before it is offered what changes things.
+   */
+  reads?: true;
   /**
    * `<serverId>/<toolName>`, carried alongside the name the model is offered.
    *
@@ -28,7 +60,11 @@ export type GrantedTool = {
  */
 export function parametersFor(inputSchema: Record<string, unknown>): z.ZodType {
   try {
-    const converted = z.fromJSONSchema(inputSchema as never);
+    // Every app's schema reaches every harness and the built-in runtime through here, so this is
+    // the one place it is cut down to what the model providers accept (see `./tool-schema`).
+    const converted = z.fromJSONSchema(
+      providerSafeSchema(inputSchema) as never,
+    );
     if (converted instanceof z.ZodObject) return converted;
   } catch {}
   return z.object({}).catchall(z.unknown());

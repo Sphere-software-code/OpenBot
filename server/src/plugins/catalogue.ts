@@ -33,6 +33,8 @@ import {
 // The one place browsing and this check agree on: the addresses that hold the deployment's own
 // cloud credentials. `target.ts` imports nothing itself, so asking it here adds no dependency.
 import { isNeverAllowedHostname } from "../computer/target";
+// `edition.ts` imports only types, so asking it which edition is running adds no cycle.
+import { currentEdition } from "../edition";
 // Type-only, so naming the transport here creates no import cycle with the registry that resolves it.
 import type { CuratedTransportKind } from "./transport";
 
@@ -93,6 +95,12 @@ export type CatalogueEntry = {
   title: string;
   vendor: string;
   summary: string;
+  /**
+   * The summary the personal edition shows, where the summary above is written for a team ("of
+   * whoever is asking", "this deployment's key"). The personal edition has one person, so it says
+   * "your". Absent where the summary already reads right for one person. See {@link summaryFor}.
+   */
+  personalSummary?: string;
   /**
    * The one host this server lives on. Null for a vendor that gives every customer their own
    * hostname, where {@link CatalogueEntry.hostPattern} decides instead.
@@ -208,10 +216,9 @@ const FIRECRAWL_READ_TOOLS = Object.freeze([
  * branch it falls into.
  *
  * Routines is the first entry here that is not a remote vendor at all — no host to dial, nothing
- * outside this process to trust. It is in the catalogue anyway, on purpose rather than by oversight:
- * the catalogue is where a deployment decides which Bots may do what, and a Bot that can schedule its
- * own future runs is a capability worth that same deliberate grant, even though there is no vendor on
- * the other end of it.
+ * outside this process to trust. It is in the catalogue so its tools reach a Bot the same way every
+ * other app's do, as grants. Unlike every other entry it is always on: the server adds it at startup
+ * and gives every Bot all of its tools. See `personal-defaults.ts`.
  */
 export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
   {
@@ -232,6 +239,8 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     vendor: "Parallel",
     summary:
       "Public-web search and extraction using this deployment's Parallel API key.",
+    personalSummary:
+      "Public-web search and extraction using your Parallel API key.",
     host: "https://search.parallel.ai",
     path: "/mcp",
     auth: { kind: "deployment-bearer" },
@@ -257,6 +266,8 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     vendor: "Exa",
     summary:
       "Public-web search and page reading using this deployment's Exa API key.",
+    personalSummary:
+      "Public-web search and page reading using your Exa API key.",
     host: "https://mcp.exa.ai",
     path: "/mcp",
     // Exa reads its key from `x-api-key`, not from `Authorization`.
@@ -284,6 +295,8 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     vendor: "Firecrawl",
     summary:
       "Public-web search and page scraping using this deployment's Firecrawl API key.",
+    personalSummary:
+      "Public-web search and page scraping using your Firecrawl API key.",
     host: "https://mcp.firecrawl.dev",
     path: "/v2/mcp",
     auth: { kind: "deployment-bearer" },
@@ -297,6 +310,7 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     title: "Google Drive",
     vendor: "Google",
     summary: "Files in the Drive of whoever is asking.",
+    personalSummary: "Files in your Drive.",
     /*
      * Google publishes one MCP server per Workspace product, each on its own host: Gmail, Docs,
      * Sheets, Slides, Calendar, Chat and People have their own. Drive is here because it is the one
@@ -350,6 +364,18 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
      * into something the policy engine has never heard of.
      */
     writeTools: Object.freeze(["create_file", "copy_file"]),
+    /*
+     * Every tool the REST adapter offers (`TOOLS` in google-drive-rest.ts), each of which only reads.
+     * Named so a read is a reviewed one, which is what a task started from a check-in runs without
+     * asking (`reviewedRead`), and so a tool added to the adapter later is a write until it is
+     * listed here. Chat's answer for these four is the read it already was.
+     */
+    readTools: Object.freeze([
+      "search_files",
+      "list_recent_files",
+      "get_file_metadata",
+      "read_file_content",
+    ]),
     docsUrl:
       "https://developers.google.com/workspace/guides/configure-mcp-servers",
   },
@@ -358,6 +384,7 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     title: "Notion",
     vendor: "Notion",
     summary: "Pages and databases of whoever is asking.",
+    personalSummary: "Your pages and databases.",
     /*
      * The hosted MCP server Notion runs, on the default MCP transport — the first entry to use
      * it. Drive's REST adapter is a workaround for a preview-gated vendor; Notion's server is
@@ -382,14 +409,9 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
       registrationUrl: "https://mcp.notion.com/register",
     },
     /*
-     * The writing tools as the hosted server advertises them today. The hosted server advertises
-     * its tools, so a name here that does not match an advertised tool is not the risk — an
-     * advertised tool that is missing from this list is: {@link classifyTool} reads an unlisted
-     * but advertised name as a read, never as a write. Notion's MCP listing carries no per-action
-     * effect, so this list is the only thing that can say otherwise and nothing backstops it. That
-     * makes under-inclusion the failure mode, so this list has to lean over-inclusive rather than
-     * minimal, and reconciling it against the live tool list on the first Refresh tools is
-     * required, not cosmetic.
+     * The writing tools as the hosted server advertised them when this entry was reviewed. Kept
+     * beside the read list below because a name here is a write whatever the server's own labels
+     * say about it, in chat and in a check-in alike.
      */
     writeTools: Object.freeze([
       "notion-convert-page-to-skill",
@@ -407,6 +429,61 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
       "notion-update-page",
       "notion-update-view",
     ]),
+    /*
+     * THE READS, NAMED, so a tool Notion adds later is a write until somebody reads it and lists it
+     * here.
+     *
+     * The write list above used to stand alone, and {@link classifyTool} reads an advertised name
+     * that list omits as a read. Notion has no read-only scope behind it, and its hosted server
+     * grows: by 2026-10-30 it advertised deletes, comment edits, calendar events and agent sessions,
+     * none of them on the write list, so every one was offered to a Bot as a read. Naming the reads
+     * turns that around, the same way Firecrawl's entry does: an unlisted name is a write.
+     *
+     * Copied from Notion's published tool reference
+     * (https://developers.notion.com/docs/mcp-supported-tools, read 2026-10-30): the tools it
+     * describes as searching, fetching, listing, querying or reading, and nothing that creates,
+     * changes, moves, deletes, sends or starts anything.
+     */
+    readTools: Object.freeze([
+      "notion-search",
+      "notion-connector-search",
+      "notion-memory-search",
+      "notion-get-tool-access",
+      "notion-get-self",
+      "notion-download-skill",
+      "notion-get-enabled-skills",
+      "notion-fetch",
+      "notion-get-file-download-urls",
+      "notion-list-private-pages",
+      "notion-list-shared-pages",
+      "notion-list-favorite-pages",
+      "notion-list-recent-pages",
+      "notion-list-page-backlinks",
+      "notion-view-version",
+      "notion-get-version-changes",
+      "notion-download-attachment",
+      "notion-get-comments",
+      "notion-get-suggested-edit",
+      "notion-get-teams",
+      "notion-get-groups",
+      "notion-get-users",
+      "notion-get-async-task",
+      "notion-query-data-sources",
+      "notion-query-multiple-data-sources",
+      "notion-query-meeting-notes",
+      "notion-search-agents",
+      "notion-query-sessions",
+      "notion-search-sessions",
+      "notion-get-session-status",
+      "notion-wait-session",
+      "notion-list-session-events",
+      "notion-read-session-event",
+      "notion-calendar-list-calendars",
+      "notion-calendar-list-events",
+      "notion-calendar-list-coworkers-events",
+      "notion-calendar-list-calendar-resources",
+      "notion-calendar-list-contacts",
+    ]),
     docsUrl: "https://developers.notion.com/guides/mcp/build-mcp-client",
   },
   {
@@ -415,11 +492,8 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     vendor: "OpenBot",
     summary:
       "Standing instructions a Bot runs on a schedule, as whoever scheduled them.",
-    /*
-     * First-party and in-process: no host to dial, no credential to hold. In the catalogue anyway,
-     * because the catalogue is where a deployment decides WHICH Bots may do WHAT — and scheduling
-     * future work is a capability an administrator should grant as deliberately as a vendor.
-     */
+    personalSummary: "Standing instructions your Bots run on a schedule.",
+    // First-party and in-process: no host to dial, no credential to hold. Always on, for every Bot.
     host: "builtin://routines",
     path: "/",
     transport: "builtin-routines",
@@ -432,6 +506,12 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
       "pause_trigger",
       "resume_trigger",
       "delete_trigger",
+      "create_goal",
+      "update_goal",
+      "run_goal",
+      "pause_goal",
+      "resume_goal",
+      "complete_goal",
     ]),
     docsUrl: "https://github.com/CopilotKit/OpenBot/blob/main/docs/routines.md",
   },
@@ -473,6 +553,17 @@ export function tokenHeaderFor(
 
 export function catalogueEntry(key: string): CatalogueEntry | null {
   return BY_KEY.get(key) ?? null;
+}
+
+/**
+ * The summary a person reads in this edition: the personal one where the entry has one and the
+ * personal edition is running, the team one everywhere else. For the browser only; nothing a model
+ * reads goes through here.
+ */
+export function summaryFor(entry: CatalogueEntry): string {
+  return currentEdition() === "personal"
+    ? (entry.personalSummary ?? entry.summary)
+    : entry.summary;
 }
 
 /**
@@ -581,6 +672,84 @@ export function classifyTool(
   // Advertised, not on the reviewed write list, and nothing recorded. Two sources had the chance to
   // call it a write and neither did.
   return "read";
+}
+
+/**
+ * Whether an advertised tool says it only reads: the question a check-in asks, and only a check-in.
+ *
+ * A CHECK-IN IS NOBODY'S TURN. It runs in the background and acts on nothing, so the one thing it
+ * needs to know about a tool is whether calling it can change anything. Chat asks a different
+ * question, which is whether to ask the person first, and {@link classifyTool} answers that one. The
+ * two are kept apart on purpose: a check-in only ever reaches an app the person connected with their
+ * own account (see `ServerAccess.ownCredential`), and for those the tool's own label is trusted here
+ * while chat goes on answering exactly as it did.
+ *
+ * WHICH LABELS COUNT, in the order they are read:
+ * - The server said it destroys something (`destructiveHint`, a broker's destructive flag), or a
+ *   broker said nothing about it at all (`unclassified`): never. This wins over everything,
+ *   including a read-only label beside it. See {@link mightDestroy}.
+ * - A reviewed write list names it: never. A person read that list; a label is the vendor's.
+ * - {@link classifyTool} calls it a read: a broker's own read label (Composio, Arcade), or a
+ *   reviewed list that names it a read or declined to call it a write.
+ * - The server marked it `readOnlyHint` (`declaredRead`, recorded at refresh and believed only here).
+ *
+ * Anything else has no read-only label, and a check-in is not offered it: it raises what it would
+ * need done as an item for the person instead.
+ */
+export function labelledRead(
+  entry: CatalogueEntry | null,
+  toolName: string,
+  tool: {
+    /** What the vendor recorded for it, as `classifyTool` reads it. */
+    effect: string | null;
+    destructive: boolean;
+    unclassified?: boolean;
+    /** The server's own `readOnlyHint`, as the listing recorded it. */
+    declaredRead: boolean;
+  },
+): boolean {
+  if (mightDestroy(tool)) return false;
+  if (entry?.writeTools.includes(toolName)) return false;
+  if (classifyTool(entry, toolName, true, tool.effect) === "read") return true;
+  return tool.declaredRead;
+}
+
+/**
+ * Whether a background read must keep away from this tool: its vendor said it destroys something,
+ * or a broker listed it and said nothing about what it does (`mcpTools.unclassified`). The second is
+ * not a claim that it destroys anything, so it doesn't make a call always ask; it is only not a
+ * claim that it doesn't.
+ */
+export function mightDestroy(tool: {
+  destructive: boolean;
+  unclassified?: boolean;
+}): boolean {
+  return tool.destructive || tool.unclassified === true;
+}
+
+/**
+ * Whether a person reviewed this tool as a read: the one kind of call a task started from a
+ * check-in makes without asking.
+ *
+ * A TASK ASKS BEFORE EVERY CHANGE, so what it runs unasked has to be a read by construction, not by
+ * anybody's description of it. That leaves only the reviewed `readTools` list. Every other source
+ * {@link labelledRead} accepts is a label: a server's `readOnlyHint` is the server describing itself,
+ * and the MCP specification says a client must treat annotations as untrusted unless the server is
+ * trusted; a broker's read tag is assigned best-effort from the action's description (Composio's
+ * tool-tags page says so); and a name missing from a write list is an omission, which is how a tool
+ * a vendor adds later would pass. Each of those is still a read for a check-in, which only reads.
+ * In a task they ask, like any change.
+ *
+ * A destructive label, a broker's silence or a reviewed write still wins over the read list.
+ */
+export function reviewedRead(
+  entry: CatalogueEntry | null,
+  toolName: string,
+  tool: { destructive: boolean; unclassified?: boolean },
+): boolean {
+  if (mightDestroy(tool) || !entry?.readTools) return false;
+  if (entry.writeTools.includes(toolName)) return false;
+  return entry.readTools.includes(toolName);
 }
 
 /**

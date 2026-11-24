@@ -5,6 +5,13 @@ import {
   standardUI,
 } from "@copilotkit/react-core/v2/generative-ui";
 import { SERIES_COLOURS } from "@/components/gallery/palette";
+import {
+  A2UIBreakdown,
+  BREAKDOWN_DESCRIPTION,
+  breakdownProps,
+} from "./a2ui-breakdown";
+import { A2UITextField } from "./a2ui-text-field";
+import { A2UICode, A2UIMarkdown } from "./a2ui-markdown";
 
 /**
  * The standard components a Bot is not given.
@@ -25,11 +32,34 @@ export const OMITTED_STANDARD_COMPONENTS = [
  * The components a Bot can draw an interface from: CopilotKit's standard catalog, which carries the
  * A2UI 1.0 basic components under their A2UI names, less the ones above. These are declarative
  * primitives, not the separately granted OpenBot gallery components.
+ *
+ * `Code` and `Markdown` are drawn by OpenBot rather than the SDK, through the renderer a reply uses,
+ * so code and prose in an interface look exactly as they do in a reply; see a2ui-markdown.tsx. An
+ * override replaces only the React component: the model sees the standard `Code` and `Markdown` with
+ * their descriptions and props unchanged, so what a Bot already writes keeps drawing.
+ *
+ * `TextField` is the standard one, except that a number field writes a number into the data model,
+ * so a total a Bot computes from the fields adds rather than joins text; see a2ui-text-field.tsx.
+ *
+ * `Breakdown` is OpenBot's own: amounts that add up to a total, each editable and in its own colour,
+ * with a bar of how the total splits; see a2ui-breakdown.tsx.
  */
 export const OPENBOT_UI = createGenerativeUI({
   id: "openbot/ui@1",
   extends: [standardUI.omit([...OMITTED_STANDARD_COMPONENTS])],
-  components: {},
+  overrides: {
+    Code: { component: A2UICode },
+    Markdown: { component: A2UIMarkdown },
+    TextField: { component: A2UITextField },
+  },
+  components: {
+    Breakdown: {
+      description: BREAKDOWN_DESCRIPTION,
+      component: A2UIBreakdown,
+      props: breakdownProps,
+      writable: ["items"],
+    },
+  },
 });
 
 const radius = (scale: number) => `calc(var(--radius) * ${scale})`;

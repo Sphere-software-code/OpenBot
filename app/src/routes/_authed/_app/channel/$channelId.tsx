@@ -4,6 +4,7 @@ import { createFileRoute, Navigate } from "@tanstack/react-router";
 import { motion, useReducedMotion } from "motion/react";
 import { z } from "zod";
 import { AgentProfile } from "@/components/agents/agent-profile";
+import { ConversationApprovals } from "@/components/approvals/inline-approval";
 import { BotPausedBanner } from "@/components/bot-profile/pause-banner";
 import { ChannelAvatar } from "@/components/channels/avatar";
 import { ChannelChat } from "@/components/channels/channel-chat";
@@ -16,6 +17,7 @@ import { SidebarToggle } from "@/components/layout/sidebar-toggle";
 import { Button } from "@/components/ui/button";
 import { useMarkOpenChannelRead } from "@/lib/channels/mark-read";
 import { type AgentChannel, channelQueryOptions } from "@/lib/channels/queries";
+import { useOpenComputerOnRequest } from "@/lib/computers/panel-view";
 
 const chatSearchSchema = z.object({
   settings: z.boolean().optional(),
@@ -28,8 +30,11 @@ const EASE_OUT = [0.23, 1, 0.32, 1] as const;
 const HEADING_ENTRANCE_SECONDS = 0.18;
 const HEADING_ENTRANCE_OFFSET = "translateY(4px)";
 
-/** Shared detail pane width for the live screen view. */
-const SCREEN_PANEL_WIDTH = 400;
+/**
+ * Shared detail pane width for the live screen view. A glimpse, not a place to read the page: it shows that the Bot is
+ * browsing and roughly what, and the full-size view (one click on the picture) is where the page is read.
+ */
+const SCREEN_PANEL_WIDTH = 360;
 
 export const Route = createFileRoute("/_authed/_app/channel/$channelId")({
   validateSearch: chatSearchSchema,
@@ -66,6 +71,9 @@ function RouteComponent() {
       navigate({ search: (previous) => ({ ...previous, watch: undefined }) }),
   });
 
+  // A command in the chat clicked opens the Computer on its terminal.
+  useOpenComputerOnRequest(agentId, () => show("watch"));
+
   // Settings and watch share one pane; opening either clears the other URL flag.
   const show = (next: "settings" | "watch" | null) => {
     // Dismissal applies only to the current browser-activity run.
@@ -85,6 +93,11 @@ function RouteComponent() {
       open={(isSettingsOpen || isWatching) && agentId !== undefined}
       detailWidth={isWatching ? SCREEN_PANEL_WIDTH : undefined}
       title={isWatching ? "Computer" : undefined}
+      waiting={
+        channel.data ? (
+          <ConversationApprovals threadId={channel.data.threadId} />
+        ) : null
+      }
       detail={
         agentId === undefined ? null : isWatching ? (
           // Manual watch remains active even when there is no current browser action.

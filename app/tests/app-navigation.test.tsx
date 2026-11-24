@@ -17,12 +17,14 @@ import {
 import { cleanup, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AppSidebar } from "@/components/app-sidebar/app-sidebar";
+import { TeamFeaturesDialog } from "@/components/edition/team-features-dialog";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { agentKeys } from "@/lib/agents/queries";
 import { authKeys } from "@/lib/auth/queries";
 import { botLifecycleKeys } from "@/lib/bot-lifecycle/queries";
 import { channelKeys } from "@/lib/channels/queries";
-import { NAVIGATION, navigationFor } from "@/lib/navigation";
+import { deploymentKeys } from "@/lib/deployment/queries";
+import { isNavigationLink, NAVIGATION, navigationFor } from "@/lib/navigation";
 import { userPreferencesQueryOptions } from "@/lib/settings/message-list";
 import { settleReactWork } from "./settle-react-work";
 
@@ -73,23 +75,46 @@ afterAll(async () => {
   GlobalRegistrator.unregister();
 });
 
-function renderSidebar(role: "admin" | "user") {
+function renderSidebar(
+  role: "admin" | "user",
+  edition: "team" | "personal" = "team",
+  /** Serve `/api/me` with this body instead of seeding the person, so the real read runs. */
+  me?: Record<string, unknown>,
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   });
   clients.push(queryClient);
-  queryClient.setQueryData(authKeys.currentUser(), {
+  queryClient.setQueryData(deploymentKeys.capabilities(), {
+    generativeUi: true,
+    selfHostBanner: false,
+    localEvaluation: edition === "personal",
+    edition,
+  });
+  const person = {
     id: "maya",
     name: "Maya Chen",
     email: "maya@example.com",
     role,
     onboarding: null,
-  });
+  };
+  if (me) {
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) =>
+        new URL(String(input), "http://localhost/").pathname === "/api/me"
+          ? Response.json({ user: person, ...me })
+          : Response.json({ error: "not served" }, { status: 404 }),
+      { preconnect: originalFetch.preconnect },
+    );
+  } else {
+    queryClient.setQueryData(authKeys.currentUser(), person);
+  }
   queryClient.setQueryData(userPreferencesQueryOptions("maya").queryKey, {
     messageListEmphasis: "thread",
     selfHostBannerDismissed: true,
     narration: null,
     skin: "openbot",
+    proactive: "on",
   });
   queryClient.setQueryData(agentKeys.list(false), []);
   queryClient.setQueryDefaults(botLifecycleKeys.attention, {
@@ -97,18 +122,23 @@ function renderSidebar(role: "admin" | "user") {
     refetchInterval: false,
   });
   // One question waiting, so the Bots entry carries its badge.
-  queryClient.setQueryData(botLifecycleKeys.attention, [
-    {
-      agentId: "expenses",
-      name: "Expenses",
-      questions: 1,
-      approvals: 0,
-      handoffs: 0,
-      unread: 0,
-      paused: false,
-      notify: "all",
-    },
-  ]);
+  queryClient.setQueryData(botLifecycleKeys.attention, {
+    bots: [
+      {
+        agentId: "expenses",
+        name: "Expenses",
+        questions: 1,
+        approvals: 0,
+        handoffs: 0,
+        unread: 0,
+        paused: false,
+        notify: "all",
+        items: 0,
+        tasks: { needsInput: 0, ready: 0, failed: 0 },
+      },
+    ],
+    lastPingId: null,
+  });
   queryClient.setQueryData(channelKeys.list(), {
     pages: [{ channels: [], nextCursor: null }],
     pageParams: [""],
@@ -118,6 +148,8 @@ function renderSidebar(role: "admin" | "user") {
       component: () => (
         <SidebarProvider>
           <AppSidebar />
+          {/* Mounted once by the signed-in layout; here so the entry has something to open. */}
+          <TeamFeaturesDialog />
         </SidebarProvider>
       ),
     }),
@@ -141,6 +173,7 @@ function links(root: HTMLElement) {
 
 function expected(role: "admin" | "user", section: "primary" | "account") {
   return navigationFor(role)
+    .filter(isNavigationLink)
     .filter((item) => item.section === section)
     .map((item) => ({ label: item.label, to: item.to }));
 }
@@ -162,6 +195,12 @@ test.each(["user", "admin"] as const)(
         to,
       })),
     ).toEqual(expected(role, "primary"));
+    // Scheduled work has its own place beside Bots, where somebody looking for it looks first.
+    expect(
+      within(footer)
+        .getByRole("link", { name: "Routines" })
+        .getAttribute("href"),
+    ).toBe("/routines");
     // Bots keeps its count of what waits on the person, and only Bots has one.
     const badge = within(footer).getByRole("img", {
       name: "1 thing needs you",
@@ -181,6 +220,32 @@ test.each(["user", "admin"] as const)(
   },
 );
 
+test("the running OpenBot version sits to the right of the person's name, in one row, from /api/me", async () => {
+  const { view } = renderSidebar("user", "team", { version: "v0.3.1" });
+  const version = await view.findByText("v0.3.1");
+  const account = view.getByRole("button", { name: /Maya Chen/ });
+  expect(account.contains(version)).toBe(true);
+  // The name, then the version, side by side in one row that splits its width 80/20.
+  const name = within(account).getByText("Maya Chen");
+  expect(name.nextElementSibling).toBe(version);
+  const row = name.parentElement;
+  expect(row).toBe(version.parentElement);
+  expect(row?.className).toContain("grid-cols-[4fr_1fr]");
+  expect(version.className).toContain("text-right");
+});
+
+test.each([
+  ["null", { version: null }],
+  ["absent", {}],
+])("no version line when the server has none (%s)", async (_label, me) => {
+  const { view } = renderSidebar("user", "team", me);
+  const account = await view.findByRole("button", { name: /Maya Chen/ });
+  expect(
+    view.container.ownerDocument.querySelector('[data-slot="openbot-version"]'),
+  ).toBeNull();
+  expect(account.textContent).not.toMatch(/v\d/);
+});
+
 test("Admin is in the list for admins only", () => {
   const ids = (role: string | undefined) =>
     navigationFor(role).map((item) => item.id);
@@ -189,8 +254,60 @@ test("Admin is in the list for admins only", () => {
   expect(ids(undefined)).not.toContain("admin");
   expect(ids("user")).toEqual([
     "bots",
+    "routines",
     "capabilities",
     "connections",
     "settings",
   ]);
+});
+
+test("the personal edition has no Admin or Capabilities, and a feature list in Admin's place", () => {
+  const personal = navigationFor("admin", "personal");
+  expect(
+    personal.some((item) => item.kind !== "dialog" && item.to === "/admin"),
+  ).toBe(false);
+  const dialogs = personal.filter((item) => item.kind === "dialog");
+  expect(dialogs.map((item) => item.id)).toEqual(["team-features"]);
+  // Skills and Memory open from the Bots page instead.
+  expect(personal.map((item) => item.id)).toEqual([
+    "bots",
+    "routines",
+    "connections",
+    "team-features",
+    "settings",
+  ]);
+  // The team edition is unchanged.
+  expect(navigationFor("admin")).toEqual(navigationFor("admin", "team"));
+  expect(navigationFor("admin").map((item) => item.id)).toContain("admin");
+});
+
+test("in the personal edition the menu opens OpenBot for Business instead of Admin", async () => {
+  const { view, user } = renderSidebar("admin", "personal");
+  await user.click(await view.findByRole("button", { name: /Maya Chen/ }));
+  const menu = await view.findByRole("menu");
+  expect(within(menu).queryByRole("menuitem", { name: "Admin" })).toBeNull();
+  const entry = within(menu).getByRole("menuitem", {
+    name: "OpenBot for Business",
+  });
+  // As wide as the links beside it, and marked with OpenBot's own logo.
+  expect(entry.className).toContain("w-full");
+  expect(entry.querySelector("svg image")).toBeTruthy();
+  await user.click(entry);
+  const dialog = await view.findByRole("dialog");
+  expect(
+    within(dialog).getByRole("heading", {
+      level: 2,
+      name: "OpenBot for Business",
+    }),
+  ).toBeTruthy();
+});
+
+test("a single-person install has no Sign out, because nobody signed in", async () => {
+  // OpenBot Desktop: no identity provider, so Sign out could only ever fail with "No identity
+  // provider is configured." and leave the person where they were.
+  const { view, user } = renderSidebar("admin", "personal");
+  await user.click(await view.findByRole("button", { name: /Maya Chen/ }));
+  const menu = await view.findByRole("menu");
+  expect(within(menu).queryByRole("menuitem", { name: "Sign out" })).toBeNull();
+  expect(within(menu).getAllByRole("menuitem").length).toBeGreaterThan(0);
 });

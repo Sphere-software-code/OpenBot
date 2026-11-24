@@ -27,8 +27,18 @@ export type ChannelActivityEvent = {
   lastMessage: string | null;
   lastMessageAt: string | null;
   lastMessageAgentId: string | null;
-  /** Newly written summary, on its own event: the sweep runs seconds after the activity it follows. */
-  summary?: string;
+  /**
+   * A Bot's reply, its first line as plain text: what a notification says when the reply lands while
+   * OpenBot is out of sight. `lastMessage` runs every line into one. Only on a Bot's message.
+   */
+  firstLine?: string;
+  /**
+   * What the conversation is called now, on its own event: the sweep's summary, written seconds after
+   * the activity it follows, or a rename. Null when a cleared name leaves it with no summary yet.
+   */
+  summary?: string | null;
+  /** A person's first words, newly written, on its own event: the row's name until `summary`. */
+  opening?: string;
   /** The channel is hidden from every member's roster. Absent on an ordinary activity event. */
   deleted?: true;
   /**

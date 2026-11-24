@@ -188,6 +188,26 @@ describe("the computer boundary overlay", () => {
     );
   });
 
+  test("the MCP allowlist never refuses Routines, which is built in and on for every Bot", () => {
+    const current = snapshot({
+      settings: {
+        ...DEFAULT_ENTERPRISE_SETTINGS,
+        mcpAllowlist: { enabled: true, servers: ["jira"] },
+      },
+    });
+    expect(
+      decideFromSnapshot(
+        current,
+        context({
+          tool: { name: "routines__create_routine" },
+          intent: "write_tool",
+          page: { url: "", host: "" },
+          mcp: { server: "routines", tool: "create_routine", effect: "write" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   test("a navigation off the allowlist is refused before it reaches the computer", () => {
     const current = snapshot({
       network: [
@@ -209,6 +229,39 @@ describe("the computer boundary overlay", () => {
         context({ page: { url: "https://evil.test/", host: "evil.test" } }),
       )?.matched,
     ).toBe("network:organization");
+  });
+
+  test("a navigation to an allowed host on a non-default port is checked by host and port", () => {
+    // `page.host` is `URL.host`, which carries a non-default port. The allowlist is matched on the
+    // host alone, with the port checked against the rule's ports.
+    const current = snapshot({
+      network: [
+        {
+          scopeKind: "organization",
+          scopeId: "",
+          mode: "allowlist_only",
+          rules: [
+            { type: "domain", value: "erp.internal", ports: "8080" },
+            { type: "domain", value: "example.com" },
+          ],
+          locked: false,
+          updatedBy: null,
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    });
+    const at = (url: string) =>
+      decideFromSnapshot(
+        current,
+        context({ page: { url, host: new URL(url).host } }),
+      );
+    expect(at("http://erp.internal:8080/invoices")).toBeNull();
+    expect(at("https://example.com:8443/")).toBeNull();
+    // The rule's ports still bind.
+    expect(at("http://erp.internal:9090/")?.matched).toBe(
+      "network:organization",
+    );
+    expect(at("http://evil.test:8080/")?.matched).toBe("network:organization");
   });
 
   test("installed, it is final even over a permissive dry-run boundary", () => {

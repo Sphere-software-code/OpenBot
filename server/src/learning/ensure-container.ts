@@ -1,13 +1,14 @@
 /**
  * Create this project's `openbot` Learning container with whatever credential can.
  *
- * THE RUNTIME KEY CANNOT. Intelligence serves `POST /api/learning/projects/:projectId/containers`
- * to three callers only: a person's browser session (from a trusted origin), a CopilotKit CLI login
+ * THE RUNTIME KEY FIRST. A current Intelligence creates a container in the key's own project on
+ * `POST /api/v1/learning/containers`, and nothing else is needed. Intelligence 0.15.1 and earlier
+ * have no such route (404), and serve `POST /api/learning/projects/:projectId/containers` to three
+ * callers only: a person's browser session (from a trusted origin), a CopilotKit CLI login
  * (exchanged for a fifteen-minute product credential), and a service token, which counts only on a
- * CopilotKit local evaluation install. A project key reaches the `/api/v1` routes and nothing here.
- * So every path below goes through one of those three, and each proves its result with the runtime
- * key afterwards: a container the key still cannot see is in another project, and is reported rather
- * than assigned.
+ * CopilotKit local evaluation install. So on those, every path below goes through one of the three,
+ * and each proves its result with the runtime key afterwards: a container the key still cannot see
+ * is in another project, and is reported rather than assigned.
  *
  * - A service token (INTELLIGENCE_SERVICE_TOKEN with INTELLIGENCE_PROJECT_ID), on any Intelligence:
  *   Intelligence decides whether it counts.
@@ -24,12 +25,13 @@
  * called by learning/personal-space.ts).
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { intelligenceApiKey } from "@openbot/shared/intelligence-key";
+import { transientStatus } from "../intelligence-startup";
 import {
   type ContainerProbe,
   type KeyIdentity,
@@ -52,22 +54,105 @@ export const OPENBOT_CONTAINER: LearningContainerSpec = {
 export type CliResult = { exitCode: number; stdout: string };
 export type RunCli = (args: string[], directory: string) => Promise<CliResult>;
 
-/** What the configured runtime key can answer about its own project. */
+/** What the configured runtime key can answer about its own project, and do in it. */
 export type KeyIntelligence = {
   probe: (containerId: string) => Promise<ContainerProbe>;
   project: () => Promise<KeyIdentity | undefined>;
+  /**
+   * Create `container` in the key's own project. `unsupported`: this Intelligence has no such route
+   * for a project key, so another credential has to.
+   */
+  create?: (
+    container: LearningContainerSpec,
+  ) => Promise<"created" | "present" | "unsupported">;
 };
 
 export function keyIntelligence(
   apiUrl: string,
   apiKey: string,
   wsUrl?: string,
+  fetchImpl: typeof fetch = fetch,
 ): KeyIntelligence {
   const client = runtimeKeyClient(apiUrl, apiKey, wsUrl);
   return {
     probe: (containerId) => probeLearningContainer(client, containerId),
     project: () => keyIdentity(client),
+    create: (container) =>
+      createWithRuntimeKey({ apiUrl, apiKey, fetch: fetchImpl, container }),
   };
+}
+
+/**
+ * Create a container with the runtime key, in the project Intelligence reads off that key: the body
+ * names no project, so the key cannot make one anywhere else.
+ *
+ * 201 is a new container and 200 the one already stored under that id, unchanged, so replicas and
+ * people racing to ensure the same container all end with it. A 409 from an Intelligence that
+ * reports a taken id instead is present too. 404 is an Intelligence without the route (0.15.1 and
+ * earlier, or Learning switched off), and the caller tries its other credentials. A failure that may
+ * pass in a moment (nothing answering, a 5xx, a 408 or 429) is thrown marked `retryable`, which the
+ * server's automatic assignment reads as Intelligence still starting rather than as its one try.
+ */
+export async function createWithRuntimeKey(input: {
+  apiUrl: string;
+  apiKey: string;
+  fetch: typeof fetch;
+  container: LearningContainerSpec;
+}): Promise<"created" | "present" | "unsupported"> {
+  const { container } = input;
+  let response: Response;
+  try {
+    response = await input.fetch(
+      `${input.apiUrl.replace(/\/+$/, "")}/api/v1/learning/containers`,
+      {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${input.apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ id: container.id, name: container.name }),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+  } catch (error) {
+    throw Object.assign(
+      new Error(
+        `The backend did not answer the runtime key's request to create the ${container.id} Learning container (${error instanceof Error ? error.message : String(error)}).`,
+      ),
+      { retryable: true },
+    );
+  }
+  const body: unknown = await response.json().catch(() => null);
+  const code =
+    object(body) && object(body.error) && typeof body.error.code === "string"
+      ? body.error.code
+      : undefined;
+  if (response.status === 201 || response.status === 200) {
+    if (
+      object(body) &&
+      object(body.container) &&
+      body.container.id === container.id
+    )
+      return response.status === 201 ? "created" : "present";
+    throw new Error(
+      `The backend answered the runtime key's container request with something other than the ${container.id} container. Nothing was assigned.`,
+    );
+  }
+  if (response.status === 409 && code === "LEARNING_CONTAINER_ALREADY_EXISTS")
+    return "present";
+  if (response.status === 404) return "unsupported";
+  if (code === "LEARNING_NOT_ENABLED")
+    throw new Error(
+      "The backend's licence does not include Learning, so no container was created.",
+    );
+  throw Object.assign(
+    new Error(
+      `The backend could not create the ${container.id} Learning container with the runtime key (HTTP ${response.status}${code ? `, ${code}` : ""}). OpenBot tries again.`,
+    ),
+    { retryable: transientStatus(response.status) },
+  );
 }
 
 /** `present`: it was already there. `created`: made here. `skipped`: nothing here could make it. */
@@ -93,7 +178,7 @@ export function intelligenceApiOrigin(value: string): string {
   try {
     url = new URL(value);
   } catch {
-    throw new Error("Enter the Intelligence API origin as a complete URL.");
+    throw new Error("Enter the backend's API origin as a complete URL.");
   }
   if (
     url.username ||
@@ -108,7 +193,7 @@ export function intelligenceApiOrigin(value: string): string {
       ))
   ) {
     throw new Error(
-      "Use an HTTPS Intelligence API origin, or HTTP on localhost for local development. Paths and embedded credentials are not supported.",
+      "Use an HTTPS backend API origin, or HTTP on localhost for local development. Paths and embedded credentials are not supported.",
     );
   }
   return url.origin;
@@ -130,18 +215,69 @@ export function cliEnvironment(
   return kept;
 }
 
-/** Run `npx --yes copilotkit@latest <args>` in `directory`, for at most two minutes. */
-export const runCli: RunCli = (args, directory) =>
+/**
+ * How to start `npx` on a platform. Windows ships it as `npx.cmd`, and since CVE-2024-27980 Node and
+ * Bun refuse to spawn a `.cmd` without a shell: `spawn` throws EINVAL before anything runs.
+ */
+export function npxCommand(platform: NodeJS.Platform = process.platform): {
+  command: string;
+  shell: boolean;
+} {
+  return platform === "win32"
+    ? { command: "npx.cmd", shell: true }
+    : { command: "npx", shell: false };
+}
+
+/**
+ * Whether every argument reaches the program as written through `cmd.exe`. The shell joins them into
+ * one unquoted command line, so `&` or `|` in one would start another command and `%` would expand a
+ * variable. Not every argument is a literal: `setup-learning.ts` passes the project id it reads from
+ * `.copilotkit/project.json`.
+ */
+export function cmdLineSafe(args: string[]): boolean {
+  return args.every((arg) => /^[A-Za-z0-9@._:/+-]+$/.test(arg));
+}
+
+/**
+ * `child.kill()` on Windows ends `cmd.exe` and leaves the command under it running, holding the
+ * pipes, so `close` waits for that command however long it takes. `taskkill /T` ends the tree.
+ * Once `cmd.exe` has exited its id may belong to another process, so it is not used after that.
+ */
+export function stopProcessTree(child: ChildProcess, shell: boolean): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (!shell || child.pid === undefined) {
+    child.kill();
+    return;
+  }
+  // By full path: a bare name is looked up in the working directory first.
+  const taskkill = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "taskkill.exe",
+  );
+  spawn(taskkill, ["/pid", String(child.pid), "/T", "/F"], {
+    stdio: "ignore",
+  })
+    .on("error", () => child.kill())
+    .on("exit", (code) => {
+      if (code !== 0) child.kill();
+    });
+}
+
+/** Run `npx <args>` in `directory`, for at most two minutes. */
+export const runNpx = (args: string[], directory: string): Promise<CliResult> =>
   new Promise((resolvePromise) => {
-    const child = spawn(
-      process.platform === "win32" ? "npx.cmd" : "npx",
-      ["--yes", "copilotkit@latest", ...args],
-      {
-        cwd: directory,
-        env: cliEnvironment(),
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const { command, shell } = npxCommand();
+    if (shell && !cmdLineSafe(args)) {
+      resolvePromise({ exitCode: 1, stdout: "" });
+      return;
+    }
+    const child = spawn(command, args, {
+      cwd: directory,
+      env: cliEnvironment(),
+      shell,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -149,7 +285,7 @@ export const runCli: RunCli = (args, directory) =>
     });
     // CLI output on stderr can carry account or credential details. Never relay it.
     child.stderr.resume();
-    const timeout = setTimeout(() => child.kill(), 120_000);
+    const timeout = setTimeout(() => stopProcessTree(child, shell), 120_000);
     const finish = (exitCode: number) => {
       clearTimeout(timeout);
       resolvePromise({ exitCode, stdout });
@@ -157,6 +293,10 @@ export const runCli: RunCli = (args, directory) =>
     child.on("error", () => finish(127));
     child.on("close", (code) => finish(code ?? 1));
   });
+
+/** Run `npx --yes copilotkit@latest <args>` in `directory`, for at most two minutes. */
+export const runCli: RunCli = (args, directory) =>
+  runNpx(["--yes", "copilotkit@latest", ...args], directory);
 
 /**
  * Whether a CopilotKit CLI login is on this machine, without running the CLI.
@@ -211,7 +351,7 @@ export function verifiedContainer(
     String(value.container.projectId) !== projectId
   ) {
     throw new Error(
-      `The ${containerId} container could not be verified in the selected project. Check Learning access in Intelligence, then run this helper again.`,
+      `The ${containerId} container could not be verified in the selected project. Check Learning access in the backend dashboard, then run this helper again.`,
     );
   }
 }
@@ -228,7 +368,7 @@ export function containerMissing(found: Record<string, unknown>) {
 }
 
 export const CREATE_IN_INTELLIGENCE =
-  'or create a Learning container with ID "openbot" in that project in Intelligence. OpenBot assigns it as the default on its next start.';
+  'or create a Learning container with ID "openbot" in that project in the backend dashboard. OpenBot assigns it as the default on its next start.';
 
 /**
  * Exactly what an operator runs when nothing here could create the container. One sentence set,
@@ -236,10 +376,10 @@ export const CREATE_IN_INTELLIGENCE =
  */
 export function learningSetupInstructions(apiUrl: string): string {
   const create =
-    'Or create a Learning container with ID "openbot" in this project in Intelligence. OpenBot assigns it within ten minutes either way.';
+    'Or create a Learning container with ID "openbot" in this project in the backend dashboard. OpenBot assigns it within ten minutes either way.';
   return apiUrl === MANAGED_API
     ? `Sign in once with npx --yes copilotkit@latest login, then run bun scripts/setup-learning.ts from the OpenBot checkout (bun run start does this too). On Kubernetes, put that login in a Secret and name it in config.learning.setup.cliLoginSecret; the chart's setup Job creates the container. ${create}`
-    : `Run bun scripts/setup-learning.ts from the OpenBot checkout and sign in to Intelligence in the browser it opens. On a CopilotKit local evaluation install, set INTELLIGENCE_SERVICE_TOKEN and INTELLIGENCE_PROJECT_ID instead and OpenBot creates it by itself. ${create}`;
+    : `Run bun scripts/setup-learning.ts from the OpenBot checkout and sign in to CopilotKit in the browser it opens. On a CopilotKit local evaluation install, set INTELLIGENCE_SERVICE_TOKEN and INTELLIGENCE_PROJECT_ID instead and OpenBot creates it by itself. ${create}`;
 }
 
 /**
@@ -277,7 +417,7 @@ async function createWithServiceToken(input: {
     )
       return "created";
     throw new Error(
-      `Intelligence answered the service token's container request with something other than the ${container.id} container. Nothing was assigned.`,
+      `The backend answered the service token's container request with something other than the ${container.id} container. Nothing was assigned.`,
     );
   }
   if (
@@ -289,10 +429,10 @@ async function createWithServiceToken(input: {
     return "present";
   if (response.status === 401 || response.status === 403)
     throw new Error(
-      "Intelligence refused the service token for Learning. Service tokens create Learning containers only on a CopilotKit local evaluation install; anywhere else, sign in instead (bun scripts/setup-learning.ts).",
+      "The backend refused the service token for Learning. Service tokens create Learning containers only on a CopilotKit local evaluation install; anywhere else, sign in instead (bun scripts/setup-learning.ts).",
     );
   throw new Error(
-    `Intelligence could not create the ${container.id} Learning container with the service token (HTTP ${response.status}). Nothing was assigned.`,
+    `The backend could not create the ${container.id} Learning container with the service token (HTTP ${response.status}). Nothing was assigned.`,
   );
 }
 
@@ -456,7 +596,11 @@ export async function createLearningContainer(
   const orCreateIt =
     container.id === OPENBOT_CONTAINER.id
       ? CREATE_IN_INTELLIGENCE
-      : `or create a Learning container with ID "${container.id}" in that project in Intelligence.`;
+      : `or create a Learning container with ID "${container.id}" in that project in the backend dashboard.`;
+  if (input.key.create) {
+    const created = await input.key.create(container);
+    if (created !== "unsupported") return created;
+  }
   if (input.serviceToken) {
     return createWithServiceToken({
       apiUrl: input.apiUrl,
@@ -521,7 +665,7 @@ export async function createLearningContainer(
     if (!listing) {
       if (input.nonInteractive) return "skipped";
       throw new Error(
-        `This runtime key's Intelligence project has no ${container.id} Learning container, and no CopilotKit CLI login is here to create one with. Sign in with npx --yes copilotkit@latest login and run this helper again, ${orCreateIt}`,
+        `This runtime key's project has no ${container.id} Learning container, and no CopilotKit CLI login is here to create one with. Sign in with npx --yes copilotkit@latest login and run this helper again, ${orCreateIt}`,
       );
     }
     const project = owner
@@ -561,12 +705,21 @@ export async function ensureLearningContainer(
   if (found === "present") return "present";
   if (found === "not_entitled") {
     throw new Error(
-      "This Intelligence project's plan does not include Learning. Nothing was created.",
+      "This project's plan does not include Learning. Nothing was created.",
+    );
+  }
+  if (found === "learning_off") {
+    throw new Error(
+      "Learning is switched off in the backend (learning.enabled in its Helm chart). Turn it on there, then run this again. Nothing was created.",
     );
   }
   if (found === "unavailable") {
-    throw new Error(
-      "Intelligence could not be asked about the openbot Learning container with the configured runtime key. Check INTELLIGENCE_API_URL and INTELLIGENCE_API_KEY, then run this helper again.",
+    // Retryable: the server gets here only after its own probe answered, so Intelligence is starting or flapping.
+    throw Object.assign(
+      new Error(
+        "The backend could not be asked about the openbot Learning container with the configured runtime key. Check INTELLIGENCE_API_URL and INTELLIGENCE_API_KEY, then run this helper again.",
+      ),
+      { retryable: true },
     );
   }
   const created = await createLearningContainer(input);
@@ -577,7 +730,7 @@ export async function ensureLearningContainer(
     throw new Error(
       reused
         ? "The openbot container exists in the project that was used, but this runtime key cannot see it, so the key belongs to another project. Nothing was assigned."
-        : "Created an openbot container, but this runtime key still cannot see it, so it is in another project. Nothing was assigned; remove that container in Intelligence if it is not wanted.",
+        : "Created an openbot container, but this runtime key still cannot see it, so it is in another project. Nothing was assigned; remove that container in the backend dashboard if it is not wanted.",
     );
   }
   return created;
@@ -590,7 +743,21 @@ export async function ensureLearningContainer(
  */
 async function jobMain() {
   const environment = process.env;
-  const apiUrl = intelligenceApiOrigin(environment.INTELLIGENCE_API_URL ?? "");
+  // The runtime key goes wherever the server sends it (a Service in the cluster, over HTTP, with the
+  // bundled Intelligence). A service token or a CLI login only over HTTPS, or HTTP on loopback.
+  const keyUrl = (environment.INTELLIGENCE_API_URL ?? "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!/^https?:\/\//.test(keyUrl))
+    throw new Error("INTELLIGENCE_API_URL must be an http(s) URL.");
+  const origin = (() => {
+    try {
+      return intelligenceApiOrigin(keyUrl);
+    } catch {
+      return undefined;
+    }
+  })();
+  const apiUrl = origin ?? keyUrl;
   const apiKey = intelligenceApiKey(environment);
   if (!apiKey)
     throw new Error(
@@ -607,11 +774,14 @@ async function jobMain() {
     apiUrl,
     nonInteractive: true,
     key: keyIntelligence(
-      apiUrl,
+      keyUrl,
       apiKey,
       environment.INTELLIGENCE_GATEWAY_WS_URL?.trim() || undefined,
     ),
-    ...(token && projectId ? { serviceToken: { token, projectId } } : {}),
+    ...(token && projectId && origin
+      ? { serviceToken: { token, projectId } }
+      : {}),
+    ...(origin ? {} : { cliLogin: false }),
   });
   console.log(
     result === "skipped"

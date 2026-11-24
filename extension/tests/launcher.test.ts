@@ -81,6 +81,10 @@ let learning: LearningSpaceState | null = null;
 /** The token OpenBot mints for OpenBot Desktop's code, and the tokens the Recorder asked OpenBot to revoke. */
 const DESKTOP_TOKEN = "obr_desktop-made";
 let revokedTokens: string[] = [];
+/** While set, the runtime's capture pass refuses with this status and body, as an Intelligence with Trajectories
+ * turned off does (404 TRAJECTORIES_UNAVAILABLE). */
+let passRefusal: { status: number; body: Record<string, unknown> } | null =
+  null;
 /** While set, OpenBot answers the exchange of OpenBot Desktop's code only once it resolves. */
 let exchangeHeld: Promise<void> | null = null;
 let exchangeArrived = () => {};
@@ -131,6 +135,8 @@ function route(request: Request): Response | Promise<Response> | null {
   const pass = /^\/api\/copilotkit\/trajectory\/([^/]+)\/connect$/.exec(path);
   if (!pass || request.method !== "POST") return null;
   const trajectoryId = decodeURIComponent(pass[1] ?? "");
+  if (passRefusal)
+    return Response.json(passRefusal.body, { status: passRefusal.status });
   return Response.json({
     joinToken: gateway.mintToken(trajectoryId),
     realtime: {
@@ -190,11 +196,22 @@ let microphone = fakeMicrophone();
  */
 let documentGeneration = 0;
 let documentPorts: chrome.runtime.Port[] = [];
+/** How long the document's outbox takes to store an event: a loaded machine's IndexedDB, when a test sets it. */
+let storeDelayMs = 0;
 function runDocument(): void {
   const generation = documentGeneration;
   fake.runAs("offscreen-document", () =>
     createOffscreenController({
-      openOutbox: () => openOutbox(databaseName),
+      openOutbox: async () => {
+        const outbox = await openOutbox(databaseName);
+        return {
+          ...outbox,
+          put: async (item, stepKey) => {
+            if (storeDelayMs > 0) await sleep(storeDelayMs);
+            return outbox.put(item, stepKey);
+          },
+        };
+      },
       connectPort: () => {
         if (generation !== documentGeneration)
           throw new Error("This document was closed.");
@@ -326,6 +343,7 @@ beforeEach(async () => {
   databaseName = `launcher-${Date.now()}-${databaseCounter++}`;
   due = [];
   documentTimers = [];
+  storeDelayMs = 0;
   // The last test's document is gone with its browser.
   documentGeneration += 1;
   documentPorts = [];
@@ -339,6 +357,7 @@ beforeEach(async () => {
   revokedTokens = [];
   exchangeHeld = null;
   exchangeArrived = () => {};
+  passRefusal = null;
   gateway = await startFakeGateway({ extraRoutes: route });
   fake = installChromeFake({
     extensionId: EXTENSION_ID,
@@ -412,11 +431,13 @@ test("connect stores the connection as an approved Connect does, with no Connect
       via: "openbot-browser",
     },
   });
-  // With the connection it holds by id, which OpenBot keeps rather than making another at every open.
+  // With the connection it holds by id and the address it reaches OpenBot at, which OpenBot keeps rather than making
+  // another at every open while that is still its address.
   expect(await launcher().state()).toEqual({
     connected: true,
     userId: ada.id,
     connectionId: connection().connectionId,
+    openbotUrl: gateway.httpUrl,
     phase: "idle",
     actions: 0,
     narration: "external",
@@ -560,71 +581,89 @@ test("disconnect forgets the connection OpenBot revoked at once and reports sign
   expect(openbotAsked.slice(asked)).toEqual([]);
 });
 
-test("a recording disconnect finds running stops as a sign-out stops one, kept for its person, and goes to Intelligence once the browser is connected again", async () => {
-  await launcher().connect({ connection: connection(), narration: "external" });
-  const click = rows.archiveClick;
-  const trajectoryId = await record(
-    click.timestamp - 7_000,
-    "Archive order 1043",
-  );
-  const port = contentPort();
-  clock = click.timestamp;
-  port.postMessage({ type: "content.event", event: click });
-  await settle();
-  expect((await launcher().state()).actions).toBe(1);
-
-  liveTokens.delete(TOKEN);
-  clock = click.timestamp + 1_000;
-  expect(await launcher().disconnect()).toEqual({ ok: true });
-  expect(await launcher().state()).toMatchObject({
-    connected: false,
-    phase: "idle",
-    actions: 0,
-  });
-  expect(fake.badge.text).toBe("");
-  // Kept, waiting for its person to connect this browser again, as a recording a sign-out stopped is.
-  expect(fake.storage.local.get("drains")).toMatchObject([
-    {
-      trajectoryIds: [trajectoryId],
-      userId: ada.id,
-      kept: { waitingForReconnect: true },
-    },
-  ]);
-  expect(names(trajectoryId)).not.toContain("click");
-
-  // Record after Disconnect: OpenBot connects the browser again first, and the kept recording goes, its outcome saying
-  // the browser was signed out.
-  const NEXT = "obr_openbot-browser-token-next";
-  liveTokens.add(NEXT);
-  expect(
+/*
+ * With a slow store as well: on a loaded runner the document took longer to store the signed-out outcome than the
+ * service worker took to mark the drain waiting and close the document. Closed mid-store, the outcome was lost, and the
+ * reconnect's recover ended the recording as interrupted, or, with the closed document still writing beside the new
+ * one, never sent it at all. The service worker now waits for the document to say it stored the outcome.
+ */
+test.each([
+  ["", 0],
+  [", even when the document is slow to store the outcome", 30],
+])(
+  "a recording disconnect finds running stops as a sign-out stops one, kept for its person, and goes to OpenBot's backend once the browser is connected again%s",
+  async (_, delayMs) => {
     await launcher().connect({
-      connection: connection({ token: NEXT, connectionId: `c-${NEXT}` }),
+      connection: connection(),
       narration: "external",
-    }),
-  ).toEqual({ ok: true });
-  await until(
-    () => names(trajectoryId).filter((name) => name === "outcome").length === 2,
-    "the kept recording in Intelligence",
-  );
-  expect(names(trajectoryId)).toEqual([
-    "recording.started",
-    "outcome",
-    "navigation",
-    "click",
-    "outcome",
-  ]);
-  expect(sent(trajectoryId).at(-1)?.value).toMatchObject({
-    workflow: "Archive order 1043",
-    phase: "failed",
-    reason: "signed-out",
-  });
-  await until(
-    () =>
-      ((fake.storage.local.get("drains") as unknown[] | undefined) ?? [])
-        .length === 0,
-    "the kept recording sent",
-  );
-}, 15_000);
+    });
+    const click = rows.archiveClick;
+    const trajectoryId = await record(
+      click.timestamp - 7_000,
+      "Archive order 1043",
+    );
+    const port = contentPort();
+    clock = click.timestamp;
+    port.postMessage({ type: "content.event", event: click });
+    await settle();
+    expect((await launcher().state()).actions).toBe(1);
+
+    liveTokens.delete(TOKEN);
+    clock = click.timestamp + 1_000;
+    storeDelayMs = delayMs;
+    expect(await launcher().disconnect()).toEqual({ ok: true });
+    expect(await launcher().state()).toMatchObject({
+      connected: false,
+      phase: "idle",
+      actions: 0,
+    });
+    expect(fake.badge.text).toBe("");
+    // Kept, waiting for its person to connect this browser again, as a recording a sign-out stopped is.
+    expect(fake.storage.local.get("drains")).toMatchObject([
+      {
+        trajectoryIds: [trajectoryId],
+        userId: ada.id,
+        kept: { waitingForReconnect: true },
+      },
+    ]);
+    expect(names(trajectoryId)).not.toContain("click");
+
+    // Record after Disconnect: OpenBot connects the browser again first, and the kept recording goes, its outcome saying
+    // the browser was signed out.
+    const NEXT = "obr_openbot-browser-token-next";
+    liveTokens.add(NEXT);
+    expect(
+      await launcher().connect({
+        connection: connection({ token: NEXT, connectionId: `c-${NEXT}` }),
+        narration: "external",
+      }),
+    ).toEqual({ ok: true });
+    await until(
+      () =>
+        names(trajectoryId).filter((name) => name === "outcome").length === 2,
+      "the kept recording in Intelligence",
+    );
+    expect(names(trajectoryId)).toEqual([
+      "recording.started",
+      "outcome",
+      "navigation",
+      "click",
+      "outcome",
+    ]);
+    expect(sent(trajectoryId).at(-1)?.value).toMatchObject({
+      workflow: "Archive order 1043",
+      phase: "failed",
+      reason: "signed-out",
+    });
+    await until(
+      () =>
+        ((fake.storage.local.get("drains") as unknown[] | undefined) ?? [])
+          .length === 0,
+      "the kept recording sent",
+    );
+  },
+  15_000,
+);
 
 test("an OpenBot browser shows no setup tab and no Connect page: none on a later launch, and the first launch's are closed", async () => {
   // OpenBot Desktop's native host answers in this profile too, and hands over a code its OpenBot takes.
@@ -1062,6 +1101,81 @@ test("Stop says the recording is still sending until the last of it has reached 
   expect(after).not.toHaveProperty("sending");
 }, 15_000);
 
+test("a recording Intelligence refused is reported kept, never sent or still sending, for OpenBot to say it was not saved", async () => {
+  // OpenBot Desktop, 2026-11-06: the local Intelligence has Trajectories turned off and refused the capture pass, and
+  // OpenBot said the recording was saved to the person's Learning space.
+  passRefusal = {
+    status: 404,
+    body: {
+      error:
+        "This Intelligence deployment does not serve Trajectory capture; enable Trajectories for this deployment",
+      code: "TRAJECTORIES_UNAVAILABLE",
+    },
+  };
+  await launcher().connect({ connection: connection(), narration: "external" });
+  openOrder();
+  const started = await launcher().record({
+    action: "start",
+    title: "Check example.com heading",
+  });
+  expect(started).toMatchObject({ ok: true, state: { phase: "recording" } });
+  const recordingId = (await launcher().state()).recordingId;
+  clock += 10_000;
+  expect(await launcher().record({ action: "stop" })).toMatchObject({
+    ok: true,
+    state: { phase: "idle" },
+  });
+  await until(
+    async () => (await launcher().state()).lastStopped?.kept !== undefined,
+    "the refusal to reach the stopped recording",
+  );
+  const stopped = (await launcher().state()).lastStopped;
+  expect(stopped).toMatchObject({
+    recordingId: recordingId ?? "",
+    title: "Check example.com heading",
+    kept: "refused",
+  });
+  expect(stopped).not.toHaveProperty("sending");
+  expect(stopped).not.toHaveProperty("discarded");
+}, 15_000);
+
+test("a stopped recording whose capture pass keeps failing reports why while it retries, and goes once OpenBot answers", async () => {
+  // OpenBot Desktop, 2026-11-07: the capture pass could not reach OpenBot, the Recorder retried it for half an hour
+  // before holding it, and the whole time Teach a Bot said "Saving … to your Learning space" with no reason.
+  passRefusal = { status: 503, body: {} };
+  await launcher().connect({ connection: connection(), narration: "external" });
+  openOrder();
+  const started = await launcher().record({
+    action: "start",
+    title: "Check example.com heading",
+  });
+  expect(started).toMatchObject({ ok: true, state: { phase: "recording" } });
+  const recordingId = (await launcher().state()).recordingId;
+  clock += 10_000;
+  expect(await launcher().record({ action: "stop" })).toMatchObject({
+    ok: true,
+    state: { phase: "idle" },
+  });
+  await until(
+    async () => (await launcher().state()).lastStopped?.retrying !== undefined,
+    "the retry to reach the stopped recording",
+  );
+  expect((await launcher().state()).lastStopped).toMatchObject({
+    recordingId: recordingId ?? "",
+    sending: true,
+    retrying:
+      "OpenBot's backend is busy or unreachable. Retrying; nothing is lost.",
+  });
+  // OpenBot answers again: the reason goes, and so does the rest of the recording.
+  passRefusal = null;
+  const drains = () =>
+    (fake.storage.local.get("drains") as DrainRecord[] | undefined) ?? [];
+  await until(() => drains().length === 0, "the recording to be sent");
+  const after = (await launcher().state()).lastStopped;
+  expect(after).not.toHaveProperty("retrying");
+  expect(after).not.toHaveProperty("sending");
+}, 15_000);
+
 test("a stopped recording a disconnect catches part sent is kept for its person, and no longer said to be sending", async () => {
   await launcher().connect({ connection: connection(), narration: "external" });
   await record(clock, "Archive order 1043");
@@ -1078,6 +1192,7 @@ test("a stopped recording a disconnect catches part sent is kept for its person,
     drains.find((drain) => drain.recordingId === recordingId)?.kept,
   ).toMatchObject({ waitingForReconnect: true });
   expect((await launcher().state()).lastStopped?.sending).toBeUndefined();
+  expect((await launcher().state()).lastStopped?.kept).toBe("signed-out");
 }, 15_000);
 
 test("Stop reports what the recording held: narration alone is something, and actions and phrases are both counted", async () => {

@@ -12,6 +12,7 @@ export type GrantVerdict =
   | { kind: "retry"; reason: string; retryAfterMs?: number }
   | { kind: "hold"; code: string; hint: string } // stop (hold): keep events, try again every 5 minutes
   | { kind: "park"; code: string; hint: string } // stop (park): keep events, try again at the next browser start
+  | { kind: "proxy"; hint: string } // keep events, take a fresh pass within seconds a few times, then hold
   | { kind: "signed-out"; reason: "revoked" | "removed" | "organization" };
 
 export class GrantError extends Error {
@@ -21,41 +22,44 @@ export class GrantError extends Error {
   }
 }
 
-const BUSY = "Intelligence is busy or unreachable. Retrying; nothing is lost.";
+const BUSY =
+  "OpenBot's backend is busy or unreachable. Retrying; nothing is lost.";
 const AUTHORITY =
   "OpenBot could not reach your organization's sign-in. Retrying; nothing is lost.";
 const MARKETPLACE =
-  "Intelligence needs its marketplace licence before it can capture. Retrying; nothing is lost.";
+  "OpenBot's backend needs its marketplace licence before it can capture. Retrying; nothing is lost.";
 
 /** Fixed sentences per code, never the server's text. `<status>` is replaced with the HTTP status. */
 export const PASS_HINTS: Record<string, string> = {
   INVALID_REQUEST:
-    "Learning capture is off: the Recorder sent Intelligence a request it could not read.",
+    "Learning capture is off: the Recorder sent OpenBot's backend a request it could not read.",
   FORBIDDEN:
     "Learning capture is off: your OpenBot account has no role that may record.",
   NOT_FOUND:
     "Learning capture is off: OpenBot says this recording belongs to another person.",
   IDENTITY_REQUIRED:
-    "Learning capture is paused: OpenBot could not tell Intelligence who you are.",
+    "Learning capture is paused: OpenBot could not tell its backend who you are.",
   INTELLIGENCE_RUNTIME_REQUIRED:
-    "Learning capture is off: this OpenBot is not connected to Intelligence.",
+    "Learning capture is off: this OpenBot is not connected to its backend.",
   INVALID_GRANT:
-    "Learning capture is paused: Intelligence answered the capture pass in a form the Recorder cannot use.",
+    "Learning capture is paused: OpenBot's backend answered the capture pass in a form the Recorder cannot use.",
   REFUSED:
-    "Learning capture is paused: Intelligence refused the capture pass (<status>).",
+    "Learning capture is paused: OpenBot's backend refused the capture pass (<status>).",
   TRAJECTORIES_UNAVAILABLE:
-    "Learning capture is off: Product Trajectories are turned off in Intelligence (FF_LEARNING_TRAJECTORIES).",
+    "Learning capture is off: Product Trajectories are turned off in OpenBot's backend (FF_LEARNING_TRAJECTORIES).",
   TRAJECTORIES_NOT_ENABLED:
-    "Learning capture is paused: Intelligence says this organization's licence does not include Product Trajectories, that its billing is blocked, or that it could not check right now.",
+    "Learning capture is paused: OpenBot's backend says this organization's licence does not include Product Trajectories, that its billing is blocked, or that it could not check right now.",
   VALIDATION_ERROR:
-    "Learning capture is off: Intelligence refused the recording's request.",
+    "Learning capture is off: OpenBot's backend refused the recording's request.",
   TRAJECTORY_APP_USER_CONFLICT:
-    "Learning capture is off: Intelligence already holds this recording for someone else.",
+    "Learning capture is off: OpenBot's backend already holds this recording for someone else.",
   LEARNING_CONTAINER_NOT_FOUND:
-    "Learning capture is paused: Intelligence could not find your Learning space.",
+    "Learning capture is paused: OpenBot's backend could not find your Learning space.",
   UNAUTHORIZED: "Learning capture is paused: OpenBot refused the capture pass.",
   GATEWAY_NOT_ALLOWED:
-    "Learning capture is off: the capture pass pointed at an Intelligence address your organization does not allow.",
+    "Learning capture is off: the capture pass pointed at a backend address your organization does not allow.",
+  PROXY_AUTHENTICATION:
+    "Learning capture is paused: this browser's network proxy has not let the capture pass through yet (407).",
   UNKNOWN_ANSWER:
     "Learning capture is paused: the capture pass got an answer the Recorder does not know (<status>).",
 };
@@ -127,7 +131,7 @@ export function classifyGrantError(
   }
   if (code === "CONNECTION_FAILED") {
     // Row 8.
-    if (message.includes("Could not connect to Intelligence")) {
+    if (message.includes("Could not connect to OpenBot's back end")) {
       return retry(BUSY);
     }
     // Row 9.
@@ -171,6 +175,15 @@ export function classifyGrantError(
   if (status === 500 && !code) return retry(BUSY);
   // Row 22: any other 401.
   if (status === 401) return stop("hold", "UNAUTHORIZED");
+  /*
+   * Row 23b: the proxy this browser goes through asked for its credentials. On an OpenBot computer that is the egress
+   * filter, which answers 407 until the browser holds them, and the computer has the browser take them as it launches
+   * (agent-computer's `holdFilterCredentials`). A pass sent in the moment before (one a browser start resends) gets the
+   * 407, and the next, seconds later, goes with them: so a few quick passes rather than the five-minute hold of row 23a,
+   * and the hold only after those.
+   */
+  if (status === 407)
+    return { kind: "proxy", hint: PASS_HINTS.PROXY_AUTHENTICATION };
   // Row 23 is the streamer's own policy check on the grant (`isAllowedGatewayUrl`).
   // Row 23a: anything no row names.
   return status >= 500 ? retry(BUSY) : stop("hold", "UNKNOWN_ANSWER");

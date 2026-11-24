@@ -1,3 +1,4 @@
+import { itsAppPage } from "../../edition";
 import {
   type BrokerField,
   BrokerRefusalError,
@@ -14,6 +15,7 @@ import {
   unreadableForm,
   VENDOR_SHAPE_REMEDY,
 } from "../composio-vendor";
+import { DEPLOYMENT_CLIENT_SCHEME } from "../deployment-clients";
 import type { ClientContext } from "./context";
 import { STATUSES_NAMED } from "./model";
 
@@ -194,7 +196,7 @@ export function fieldMethods(context: ClientContext) {
        */
       if (mode === undefined || mode === null) {
         throw new BrokerRefusalError(
-          `Composio no longer publishes a ${authScheme} connection for ${toolkit}, and ${toolkit}'s authorization config here was created as ${authScheme}, so there is nothing to ask this person for — and an empty form is a box they cannot fill in and a connection carrying no credential at all. An administrator removing the app on its Plugins page and adding it again is what records the scheme Composio publishes for it now.`,
+          `Composio no longer publishes a ${authScheme} connection for ${toolkit}, and ${toolkit}'s authorization config here was created as ${authScheme}, so there is nothing to ask this person for — and an empty form is a box they cannot fill in and a connection carrying no credential at all. An administrator removing the app on ${itsAppPage()} and adding it again is what records the scheme Composio publishes for it now.`,
         );
       }
       /*
@@ -444,6 +446,37 @@ export function fieldMethods(context: ClientContext) {
     },
 
     /**
+     * The provider's page for making this app's key, where Composio publishes one.
+     *
+     * Two places can carry it: `auth_hint_url` on the connection mode the app was added with, and
+     * `auth_guide_url` on the app. Both are empty for nearly every app, so null is the ordinary
+     * answer. Anything that is not text is read as no link: this is a link shown beside a form,
+     * and a shape this file cannot read is no reason to refuse the form a person came for.
+     */
+    async connectionGuideUrl({ toolkit, authScheme }): Promise<string | null> {
+      const detail = await askVendor(
+        {
+          outcome: `where to get ${toolkit}'s key could not be read`,
+          app: toolkit,
+        },
+        () => vendor.toolkits.retrieve(toolkit),
+      );
+      if (typeof detail !== "object" || detail === null) return null;
+      const modes = Array.isArray(detail.auth_config_details)
+        ? detail.auth_config_details
+        : [];
+      const mode = modes.find(
+        (entry: unknown) =>
+          typeof entry === "object" &&
+          entry !== null &&
+          textOf((entry as { mode?: unknown }).mode) === authScheme,
+      ) as { auth_hint_url?: unknown } | undefined;
+      return (
+        textOf(mode?.auth_hint_url) ?? textOf(detail.auth_guide_url) ?? null
+      );
+    },
+
+    /**
      * One person's account made from what they typed, and the ONE call here that drops its error.
      *
      * THIS IS THE SINGLE PLACE THIS FILE'S CAUSE-CARRYING RULE REVERSES, AND IT SAYS SO ON PURPOSE.
@@ -514,7 +547,7 @@ export function fieldMethods(context: ClientContext) {
           );
         }
         throw new BrokerRefusalError(
-          `This deployment has no authorization config at Composio for ${toolkit}, so there is nothing to connect an account against and nothing was sent. An administrator removing the app on its Plugins page and adding it again creates one.`,
+          `This deployment has no authorization config at Composio for ${toolkit}, so there is nothing to connect an account against and nothing was sent. An administrator removing the app on ${itsAppPage()} and adding it again creates one.`,
         );
       }
 
@@ -555,7 +588,7 @@ export function fieldMethods(context: ClientContext) {
         const disabled = ours.length - unsettled.length;
         if (disabled > 0) {
           left.push(
-            `Composio calls ${disabled} of this deployment's ${ours.length} authorization configs for ${toolkit} disabled, and an administrator can enable it in Composio's dashboard, or remove the app on its Plugins page and add it again.`,
+            `Composio calls ${disabled} of this deployment's ${ours.length} authorization configs for ${toolkit} disabled, and an administrator can enable it in Composio's dashboard, or remove the app on ${itsAppPage()} and add it again.`,
           );
         }
         if (unsettled.length > 0) {
@@ -624,10 +657,24 @@ export function fieldMethods(context: ClientContext) {
              * value under that name cannot come from a form, and the connect route sends only names
              * that list published. This method is callable without either, and what it protects is
              * the one field here that cannot be recovered from anything else in the request.
+             *
+             * EXCEPT A SERVER-TO-SERVER GRANT, WHICH CARRIES NO STATUS AT ALL. `ACTIVE` claims the
+             * token is already in hand, and for `S2S_OAUTH2` it is not: Composio refuses that
+             * request for the missing `access_token`. Left out, Composio exchanges the config's
+             * client (the deployment's, `deployment-clients.ts`) for the token itself. A value
+             * arriving under the name `status` is dropped rather than sent, so this branch keeps
+             * the second guard too: no typed value can say what state Composio is asked for.
              */
             state: {
               authScheme,
-              val: { ...values, status: "ACTIVE" },
+              val:
+                authScheme === DEPLOYMENT_CLIENT_SCHEME
+                  ? Object.fromEntries(
+                      Object.entries(values).filter(
+                        ([name]) => name !== "status",
+                      ),
+                    )
+                  : { ...values, status: "ACTIVE" },
             },
           },
         });
@@ -641,7 +688,7 @@ export function fieldMethods(context: ClientContext) {
         throw new BrokerRefusalError(
           said === null
             ? `Composio did not accept the connection to ${toolkit} and said nothing this deployment can pass on. The failure arrived through this deployment's @composio/core with no sentence of Composio's on it, which is what an outage, a cancelled request and a reply the package could not read all look like from here — and the failure itself was dropped rather than recorded, because on this one call the object carrying it also carries what was typed into the form. Nothing was attached. Composio's own dashboard logs the attempt, and asking again is what settles whether the request ever landed.`
-            : `Composio refused the connection to ${toolkit}: ${said} Nothing was attached. Nothing further about this attempt is kept here, because what the failure carried was the value typed into the form — the request id in Composio's own words above is what their dashboard searches on.`,
+            : `${toolkit} didn't accept what you entered: ${said} Nothing was connected. Check what you entered and try again.`,
         );
       }
 
@@ -661,5 +708,10 @@ export function fieldMethods(context: ClientContext) {
 
       return { accountId };
     },
-  } satisfies Pick<ComposioBroker, "connectionFields" | "connectWithFields">;
+  } satisfies Required<
+    Pick<
+      ComposioBroker,
+      "connectionFields" | "connectionGuideUrl" | "connectWithFields"
+    >
+  >;
 }

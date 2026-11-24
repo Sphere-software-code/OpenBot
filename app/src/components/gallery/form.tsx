@@ -1,3 +1,4 @@
+import type { DecisionToolName } from "@openbot/shared/decision-tools";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { z } from "zod";
 import { Button } from "@/components/ui/button";
@@ -381,9 +382,11 @@ function FormEntry({
 
 export const GALLERY: GalleryComponent[] = [
   {
-    name: "askForm",
+    name: "askForm" satisfies DecisionToolName,
     title: "Form",
     kind: "decision",
+    summary:
+      "Asks you to fill in a short form. The Bot waits for your answers.",
     description:
       "Ask the person to fill in a short form and WAIT for their answers. Use when several related details are needed together. Provide up to eight labeled text, email, number, select, or textarea fields with unique IDs. Mark required fields and give options for selects. Never request passwords or secrets. The result has status submitted and values keyed by field ID; numbers are returned as numbers and blank optional fields are omitted.",
     parameters: FormCardArgs,

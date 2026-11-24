@@ -49,6 +49,8 @@ describe("runtime capabilities", () => {
       selfHostBanner: true,
       // Off: this deployment has an identity provider, so it is not somebody's local trial.
       localEvaluation: false,
+      // Which product this is. The app trims its screens for the personal edition.
+      edition: "team",
       transcription: false,
       voice: false,
       // Names only. The sign-in screen reads this to know which buttons to draw.
@@ -76,6 +78,7 @@ describe("runtime capabilities", () => {
       "generativeUi",
       "selfHostBanner",
       "localEvaluation",
+      "edition",
       "transcription",
       "voice",
       "authProviders",
@@ -120,9 +123,62 @@ describe("runtime capabilities", () => {
     expect(response.status).toBe(200);
     expect((await response.json()).selfHostBanner).toBe(false);
   });
+
+  // One person running it for themselves is not somebody to offer help running it for a company.
+  test("reports the personal edition, with no self-host banner", async () => {
+    const personal = createApp(
+      loadConfig(
+        testEnvironment({
+          GOOGLE_OAUTH_CLIENT_ID: undefined,
+          GOOGLE_OAUTH_CLIENT_SECRET: undefined,
+          BETTER_AUTH_SECRET: undefined,
+          BETTER_AUTH_URL: undefined,
+          INITIAL_ADMIN_EMAILS: undefined,
+          OPENBOT_EDITION: "personal",
+          OPENBOT_SINGLE_USER: "true",
+          AGENT_COMPUTER_URL: "http://127.0.0.1:7000",
+        }),
+      ),
+    );
+
+    const body = await (
+      await personal.request("http://openbot.local/api/capabilities")
+    ).json();
+    expect(body.edition).toBe("personal");
+    expect(body.selfHostBanner).toBe(false);
+  });
 });
 
 describe("authentication availability", () => {
+  test("a single-person install answers Sign out as done, since it has no sign-in to end", async () => {
+    // OpenBot Desktop: one person, no identity provider, no sessions. A page that still offers Sign
+    // out must not be told "No identity provider is configured." for a button that cannot fail.
+    const single = createApp(
+      loadConfig(
+        testEnvironment({
+          OPENBOT_SINGLE_USER: "true",
+          BETTER_AUTH_URL: undefined,
+          BETTER_AUTH_SECRET: undefined,
+          GOOGLE_OAUTH_CLIENT_ID: undefined,
+          GOOGLE_OAUTH_CLIENT_SECRET: undefined,
+          INITIAL_ADMIN_EMAILS: undefined,
+        }),
+      ),
+    );
+    const signOut = await single.request(
+      "http://127.0.0.1:3001/api/auth/sign-out",
+      { method: "POST" },
+    );
+    expect(signOut.status).toBe(200);
+    await expect(signOut.json()).resolves.toEqual({ success: true });
+    // Only Sign out: anything else that needs a provider still says there is none.
+    const signIn = await single.request(
+      "http://127.0.0.1:3001/api/auth/sign-in/social",
+      { method: "POST" },
+    );
+    expect(signIn.status).toBe(503);
+  });
+
   test("fails loudly when no identity provider has been configured", async () => {
     const response = await app.request(
       "http://openbot.local/api/auth/sign-in/social",

@@ -5,10 +5,12 @@ import {
   type BrowserOpenResponse,
   type BrowserTabsRequest,
   browserApiPaths,
+  type RealBrowser,
   type RealBrowserOpenResponse,
 } from "@openbot/shared/openbot-browser";
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
+import { computerKeys } from "@/lib/computers/queries";
 import { browserKeys } from "./queries";
 
 function invalidateBrowser(queryClient: QueryClient) {
@@ -16,52 +18,109 @@ function invalidateBrowser(queryClient: QueryClient) {
 }
 
 /**
- * Opens the person's browser, or brings it forward when it is already open: on OpenBot Desktop a window on their
- * desktop, on hosted OpenBot a browser the page shows. The answer says which, and names the computer the live screen
+ * Opens the person's browser, or brings it forward when it is already open: a window on their desktop where a
+ * host-side computer runs people's browsers, and elsewhere (hosted OpenBot, OpenBot Desktop) a browser the page shows. The answer says which, and names the computer the live screen
  * streams.
  *
- * On OpenBot Desktop it may instead be the person's own everyday Chrome or Edge (`opened`): brought forward when the
+ * With a host-side computer it may instead be the person's own everyday Chrome or Edge (`opened`): brought forward when the
  * Recorder in it is connected, or showing the Recorder's store page for them to add it.
  */
 export function openBrowserMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
-    mutationFn: async (): Promise<
-      BrowserOpenResponse | RealBrowserOpenResponse
-    > =>
-      (
-        await client(browserApiPaths.open, {
-          method: "POST",
-          fallback: "Couldn't open your browser. Try again.",
-        })
-      ).json(),
+    mutationFn: openBrowser,
     onSuccess: () => invalidateBrowser(queryClient),
   });
+}
+
+async function openBrowser(): Promise<
+  BrowserOpenResponse | RealBrowserOpenResponse
+> {
+  return (
+    await client(browserApiPaths.open, {
+      method: "POST",
+      fallback: "Couldn't open your browser. Try again.",
+    })
+  ).json();
+}
+
+export type BrowserRecordingStart = {
+  title: string;
+  language?: string;
+  /** Whether the person narrates this recording, as they chose: the Recorder opens a microphone only when true. */
+  narrate?: boolean;
+};
+
+async function startBrowserRecording(
+  variables: BrowserRecordingStart,
+): Promise<BrowserApiState> {
+  return (
+    await client(browserApiPaths.recording, {
+      method: "POST",
+      body: {
+        action: "start",
+        title: variables.title,
+        ...(variables.language ? { language: variables.language } : {}),
+        ...(variables.narrate !== undefined
+          ? { narrate: variables.narrate }
+          : {}),
+      },
+      fallback: "Couldn't start recording. Try again.",
+    })
+  ).json();
 }
 
 /** Starts recording the tab the person is on, named for the task. `language` is the one narration is heard in. */
 export function startBrowserRecordingMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
-    mutationFn: async (variables: {
-      title: string;
-      language?: string;
-      /** Whether the person narrates this recording, as they chose: the Recorder opens a microphone only when true. */
-      narrate?: boolean;
-    }): Promise<BrowserApiState> =>
-      (
-        await client(browserApiPaths.recording, {
-          method: "POST",
-          body: {
-            action: "start",
-            title: variables.title,
-            ...(variables.language ? { language: variables.language } : {}),
-            ...(variables.narrate !== undefined
-              ? { narrate: variables.narrate }
-              : {}),
-          },
-          fallback: "Couldn't start recording. Try again.",
-        })
-      ).json(),
+    mutationFn: startBrowserRecording,
     onSuccess: () => invalidateBrowser(queryClient),
+  });
+}
+
+const REAL_BROWSER_NAMES: Record<RealBrowser, string> = {
+  chrome: "Google Chrome",
+  msedge: "Microsoft Edge",
+};
+
+/**
+ * What the person is told when Open put the Recorder's page in the store of their own browser, rather than opening a
+ * browser with the Recorder in it: the page is there, in the browser named, and adding it is what lets them record in
+ * that browser.
+ */
+export function storeOpenedSentence(browser: RealBrowser): string {
+  return `The OpenBot Recorder's page is open in ${REAL_BROWSER_NAMES[browser]}. Add it there to record in your own browser.`;
+}
+
+/** What the person is told when Start recording found their own everyday browser rather than the one OpenBot opens:
+ * OpenBot cannot start the Recorder there, so they start it with its own button. */
+export const RECORD_THERE =
+  "Your browser is open. Start recording with the Recorder's button in its toolbar.";
+
+/**
+ * Start recording where the browser is a window on the person's desktop: opens it, or brings it forward,
+ * and starts recording in it, so the person is doing the task as soon as the window is in front of them. Open answers
+ * once the Recorder in it is connected, so the start that follows finds it ready.
+ *
+ * Where Open brought forward the person's own everyday Chrome or Edge instead (`opened`), OpenBot cannot start the
+ * Recorder in it: the person is told to press its button there.
+ */
+export function openAndStartBrowserRecordingMutationOptions(
+  queryClient: QueryClient,
+) {
+  return mutationOptions({
+    mutationFn: async (
+      variables: BrowserRecordingStart,
+    ): Promise<BrowserApiState> => {
+      const opened = await openBrowser();
+      if ("opened" in opened)
+        throw new Error(
+          opened.opened === "store"
+            ? storeOpenedSentence(opened.browser)
+            : RECORD_THERE,
+        );
+      return startBrowserRecording(variables);
+    },
+    onSettled: () => invalidateBrowser(queryClient),
   });
 }
 
@@ -124,7 +183,12 @@ export function clearBrowserMutationOptions(queryClient: QueryClient) {
           fallback: "Couldn't clear your browser. Try again.",
         })
       ).json(),
-    onSettled: () => invalidateBrowser(queryClient),
+    // Settings > Computer lists the browser too, with whether it runs.
+    onSettled: () =>
+      Promise.all([
+        invalidateBrowser(queryClient),
+        queryClient.invalidateQueries({ queryKey: computerKeys.fleet() }),
+      ]),
   });
 }
 

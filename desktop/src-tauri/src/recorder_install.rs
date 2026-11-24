@@ -331,6 +331,59 @@ pub fn stable_host_path(
     current_exe: &Path,
     appimage: Option<&Path>,
 ) -> Result<PathBuf, Problem> {
+    stable_host_path_with(os, current_exe, appimage, translocation_mount)
+}
+
+/// The mount a translocated app runs from, as `statfs` reports it for `path`: where it is mounted
+/// (`f_mntonname`) and what is mounted there (`f_mntfromname`). Gatekeeper's App Translocation
+/// mounts the app's real folder read-only, with `nullfs`, at a random folder under
+/// `AppTranslocation`, and the app runs from `<that folder>/d/<App>.app`. Apple's own Security code
+/// finds a translocated app's original path the same way (`libsecurity_translocate`).
+#[cfg(target_os = "macos")]
+fn translocation_mount(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut mount = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `mount` is a valid place for one `statfs` to be written.
+    if unsafe { libc::statfs(path.as_ptr(), mount.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` returned 0, so it filled `mount`.
+    let mount = unsafe { mount.assume_init() };
+    let text = |chars: &[libc::c_char]| {
+        // SAFETY: both fields are fixed arrays the kernel NUL-terminates.
+        let said = unsafe { std::ffi::CStr::from_ptr(chars.as_ptr()) };
+        PathBuf::from(std::ffi::OsStr::from_bytes(said.to_bytes()))
+    };
+    Some((text(&mount.f_mntonname), text(&mount.f_mntfromname)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn translocation_mount(_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    None
+}
+
+/// Where a translocated Mac app really is: `/Applications/OpenBot.app/Contents/MacOS/openbot-desktop`
+/// for `<mount>/d/OpenBot.app/Contents/MacOS/openbot-desktop`, when `<mount>` holds the app copied
+/// from `/Applications/OpenBot.app`. None when the path is not inside that mount.
+fn untranslocated(current_exe: &Path, mounted_on: &Path, mounted_from: &Path) -> Option<PathBuf> {
+    let inside = current_exe.strip_prefix(mounted_on).ok()?;
+    let mut parts = inside.components();
+    // `d`, then the bundle itself, which the mount's source names.
+    let (Some(_), Some(bundle)) = (parts.next(), parts.next()) else {
+        return None;
+    };
+    (mounted_from.file_name() == Some(bundle.as_os_str()) && mounted_from.is_absolute())
+        .then(|| mounted_from.join(parts.as_path()))
+}
+
+/// `stable_host_path`, with how a path's mount is read given, so a test can name a translocation.
+fn stable_host_path_with(
+    os: Os,
+    current_exe: &Path,
+    appimage: Option<&Path>,
+    mount_of: impl Fn(&Path) -> Option<(PathBuf, PathBuf)>,
+) -> Result<PathBuf, Problem> {
     let exe = current_exe.to_string_lossy();
     match os {
         Os::Linux => {
@@ -344,9 +397,18 @@ pub fn stable_host_path(
                 Ok(current_exe.to_path_buf())
             }
         }
-        Os::Mac if exe.contains("/AppTranslocation/") => Err(Problem::plain(
-            "Move OpenBot Desktop to Applications to let the Recorder find it.",
-        )),
+        /*
+         * Gatekeeper runs a downloaded app that still carries its quarantine from a random,
+         * read-only copy until Finder moves it: one copied into Applications with `cp` or `ditto`
+         * runs translocated too. That copy is gone once the app quits, so the manifest names the
+         * app where it really is. Only a copy still on the disk image it came on asks to be moved.
+         */
+        Os::Mac if exe.contains("/AppTranslocation/") => mount_of(current_exe)
+            .and_then(|(on, from)| untranslocated(current_exe, &on, &from))
+            .filter(|original| !original.starts_with("/Volumes"))
+            .ok_or_else(|| {
+                Problem::plain("Move OpenBot Desktop to Applications to let the Recorder find it.")
+            }),
         Os::Mac | Os::Windows => Ok(current_exe.to_path_buf()),
     }
 }
@@ -435,7 +497,7 @@ where
             Err(problem) => {
                 let said = format!("{} {}", problem.said, problem.detail.unwrap_or_default());
                 if last_failure.as_ref() != Some(&said) {
-                    eprintln!("[recorder] host install failed: {said}");
+                    log::warn!("[recorder] host install failed: {said}");
                     last_failure = Some(said);
                 }
             }
@@ -455,6 +517,33 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Where the host-side browser earlier Desktops ran kept its data, the profile the person signed
+    /// in to by hand among it: what the uninstallers still take away. The defaults
+    /// `scripts/start-local-chrome-computer.ts` uses; a relative `$XDG_DATA_HOME` is ignored, as the
+    /// XDG Base Directory specification says it must be.
+    fn earlier_browser_data_root(
+        os: Os,
+        home: &Path,
+        var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> PathBuf {
+        match os {
+            Os::Mac => home
+                .join("Library")
+                .join("Application Support")
+                .join("OpenBot"),
+            Os::Windows => var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData").join("Local"))
+                .join("OpenBot"),
+            Os::Linux => var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.to_string_lossy().starts_with('/'))
+                .unwrap_or_else(|| home.join(".local").join("share"))
+                .join("openbot"),
+        }
+        .join("local-computer")
+    }
 
     const ID: &str = "icpcnhgjghecmklnjbccdgdicklblcgd";
 
@@ -901,6 +990,65 @@ mod tests {
         );
     }
 
+    /// OpenBot Desktop 1.0.0, copied into Applications with `ditto` from its disk image and opened:
+    /// Gatekeeper ran it translocated, and the Recorder said "Move OpenBot Desktop to Applications"
+    /// to an app that was in Applications. The mount is as `mount` showed it that night. Unix paths,
+    /// which Windows does not count as absolute.
+    #[cfg(unix)]
+    #[test]
+    fn a_translocated_app_that_is_in_applications_names_its_real_path() {
+        let mount = "/private/var/folders/15/cbm93f0549jbtwnp4vn063r00000gn/T/AppTranslocation/E35D6529-FB65-4C85-BC60-D38960D7E85A";
+        let exe = PathBuf::from(format!(
+            "{mount}/d/OpenBot.app/Contents/MacOS/openbot-desktop"
+        ));
+        let mounted = |from: &'static str| {
+            move |path: &Path| {
+                assert!(path.starts_with(mount), "{}", path.display());
+                Some((PathBuf::from(mount), PathBuf::from(from)))
+            }
+        };
+        assert_eq!(
+            stable_host_path_with(Os::Mac, &exe, None, mounted("/Applications/OpenBot.app"))
+                .unwrap(),
+            PathBuf::from("/Applications/OpenBot.app/Contents/MacOS/openbot-desktop")
+        );
+        assert_eq!(
+            stable_host_path_with(
+                Os::Mac,
+                &exe,
+                None,
+                mounted("/Users/a/Applications/OpenBot.app")
+            )
+            .unwrap(),
+            PathBuf::from("/Users/a/Applications/OpenBot.app/Contents/MacOS/openbot-desktop")
+        );
+        // Still on the disk image, which goes when it is ejected: that one is asked to move.
+        assert_eq!(
+            stable_host_path_with(Os::Mac, &exe, None, mounted("/Volumes/OpenBot/OpenBot.app"))
+                .unwrap_err()
+                .said,
+            "Move OpenBot Desktop to Applications to let the Recorder find it."
+        );
+        // A mount that is not this app's, or none at all, is never guessed through.
+        for unrelated in [
+            stable_host_path_with(Os::Mac, &exe, None, mounted("/Applications/Other.app")),
+            stable_host_path_with(Os::Mac, &exe, None, |_| None),
+        ] {
+            assert!(unrelated.is_err());
+        }
+    }
+
+    /// The real `statfs` on this Mac: a folder that is not translocated is its own mount's, never
+    /// an AppTranslocation one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn statfs_reads_the_mount_a_path_is_on() {
+        let (on, from) = translocation_mount(Path::new("/Applications")).unwrap();
+        assert!(on.is_absolute(), "{}", on.display());
+        assert!(!from.as_os_str().is_empty());
+        assert!(!on.to_string_lossy().contains("AppTranslocation"));
+    }
+
     #[test]
     fn installed_paths_are_returned_unchanged() {
         let mac = Path::new("/Applications/OpenBot.app/Contents/MacOS/openbot-desktop");
@@ -1015,6 +1163,147 @@ mod tests {
             .all(|c| c[7] == manifest.to_string_lossy().as_ref()));
     }
 
+    // The CLI's detached sign-in service runs the bundled node.exe after the app quits; an install
+    // or uninstall that does not stop it first cannot replace or delete that file.
+    #[test]
+    fn installing_and_uninstalling_on_windows_first_stop_only_this_installations_bundled_cli() {
+        let hooks = include_str!("../windows/hooks.nsh");
+        let body = |hook: &str| {
+            hooks
+                .split(&format!("!macro {hook}\n"))
+                .nth(1)
+                .and_then(|rest| rest.split("!macroend").next())
+                .unwrap_or_else(|| panic!("hooks.nsh has no {hook}"))
+                .to_string()
+        };
+        for hook in ["NSIS_HOOK_PREINSTALL", "NSIS_HOOK_PREUNINSTALL"] {
+            assert!(
+                body(hook).contains("!insertmacro OPENBOT_STOP_BUNDLED_CLI"),
+                "{hook}"
+            );
+        }
+        let stop = body("OPENBOT_STOP_BUNDLED_CLI");
+        assert!(
+            stop.contains(
+                r#"SetEnvironmentVariable(t, t)i ("OPENBOT_CLI_BUNDLE", "$INSTDIR\cli-bundle")"#
+            ),
+            "{stop}"
+        );
+        assert!(stop.contains("Stop-Process -Force"));
+    }
+
+    /// The text of `hooks.nsh`'s macro `name`, between `!macro name` and `!macroend`.
+    fn nsis_macro(name: &str) -> String {
+        include_str!("../windows/hooks.nsh")
+            .split(&format!("!macro {name}\n"))
+            .nth(1)
+            .and_then(|rest| rest.split("!macroend").next())
+            .unwrap_or_else(|| panic!("hooks.nsh has no {name}"))
+            .to_string()
+    }
+
+    /// The PowerShell script the bundled CLI's stop runs, as NSIS writes it (`$$` for `$`).
+    fn bundled_cli_stop_script() -> String {
+        let stop = nsis_macro("OPENBOT_STOP_BUNDLED_CLI");
+        stop.split("-Command \"")
+            .nth(1)
+            .and_then(|rest| rest.split("\"`").next())
+            .unwrap_or_else(|| panic!("no PowerShell command in {stop}"))
+            .to_string()
+    }
+
+    /// A person whose Windows profile folder has an apostrophe in it (`C:\Users\O'Brien`) has
+    /// OpenBot installed under it. Put inside the script, the folder ended the script's string
+    /// early, PowerShell refused the whole command, and the uninstaller failed on the locked
+    /// node.exe again. `[` and `]` are wildcards to `-like`. The folder reaches the script as data.
+    #[test]
+    fn the_installation_folder_reaches_the_bundled_cli_stop_as_data_not_as_script() {
+        let script = bundled_cli_stop_script();
+        assert!(!script.contains("$INSTDIR"), "{script}");
+        assert!(!script.contains("-like"), "{script}");
+        assert!(script.contains("$$env:OPENBOT_CLI_BUNDLE"), "{script}");
+    }
+
+    /// The script itself, run by PowerShell against a folder with an apostrophe and brackets in
+    /// its name: what runs from that folder's cli-bundle stops, and what runs beside it does not.
+    #[cfg(windows)]
+    #[test]
+    fn the_bundled_cli_stop_ends_only_what_runs_from_this_installations_cli_bundle() {
+        bundled_cli_stop_under("System32");
+    }
+
+    /// The installer is a 32-bit program, so the powershell.exe its hook starts is the 32-bit one
+    /// in SysWOW64, and the bundled node.exe is a 64-bit process. Get-Process in a 32-bit
+    /// PowerShell has no Path for a 64-bit process: the stop matched nothing, node.exe stayed
+    /// locked, and an upgrade of a Desktop that had run Intelligence stopped at "Error opening file
+    /// for writing". The fixture here is 64-bit too, as cargo builds it on x64 Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_bundled_cli_stop_works_from_the_32_bit_powershell_the_installer_starts() {
+        bundled_cli_stop_under("SysWOW64");
+    }
+
+    /// Runs the hook's script with the Windows PowerShell in %SystemRoot%\`system`. When it
+    /// returns, the process from cli-bundle must already be gone and its file free to replace: the
+    /// installer writes node.exe right after the hook, and a process still exiting keeps it locked.
+    #[cfg(windows)]
+    fn bundled_cli_stop_under(system: &str) {
+        let script = bundled_cli_stop_script().replace("$$", "$");
+        let powershell = Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join(system)
+            .join(r"WindowsPowerShell\v1.0\powershell.exe");
+        assert!(powershell.is_file(), "{}", powershell.display());
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("hook-test-{system}-{}", std::process::id()))
+            .join("O'Brien [OpenBot]");
+        let runtime = base.join("cli-bundle").join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let source = base.join("waiter.rs");
+        std::fs::write(
+            &source,
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(120)); }",
+        )
+        .unwrap();
+        let inside = runtime.join("node.exe");
+        let beside = base.join("node.exe");
+        crate::test_support::compile_fixture(&source, &inside);
+        std::fs::copy(&inside, &beside).unwrap();
+        let mut bundled = std::process::Command::new(&inside).spawn().unwrap();
+        let mut other = std::process::Command::new(&beside).spawn().unwrap();
+        let status = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+            ])
+            .arg(&script)
+            .env("OPENBOT_CLI_BUNDLE", base.join("cli-bundle"))
+            .status()
+            .unwrap();
+        let stopped = bundled.try_wait().unwrap().is_some();
+        let replaceable = std::fs::remove_file(&inside);
+        let spared = other.try_wait().unwrap().is_none();
+        let _ = bundled.kill();
+        let _ = other.kill();
+        let _ = bundled.wait();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+        let shell = powershell.display();
+        assert!(status.success(), "{shell}: {script}");
+        assert!(
+            stopped,
+            "{shell}: the process under cli-bundle is still running"
+        );
+        assert!(
+            replaceable.is_ok(),
+            "{shell}: the bundled node.exe is still locked: {replaceable:?}"
+        );
+        assert!(spared, "{shell}: a process outside cli-bundle was stopped");
+    }
+
     #[test]
     fn uninstalling_on_windows_removes_every_key_and_the_manifest_the_install_writes() {
         let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
@@ -1065,7 +1354,7 @@ mod tests {
             uninstall.contains(&format!("RMDir /r \"$LOCALAPPDATA\\{folder}\"")),
             "{uninstall}"
         );
-        let data = crate::local_browser::data_root(Os::Windows, Path::new("/home/a"), &|name| {
+        let data = earlier_browser_data_root(Os::Windows, Path::new("/home/a"), &|name| {
             (name == "LOCALAPPDATA").then(|| local.clone().into_os_string())
         });
         let data: Vec<String> = data
@@ -1100,7 +1389,7 @@ mod tests {
         let home = scratch.join("home/ada");
         let system = scratch.join("var/lib/daemon");
         let dirs = UserDirs::at(&home);
-        let data_root = crate::local_browser::data_root(Os::Linux, &home, &|_| None);
+        let data_root = earlier_browser_data_root(Os::Linux, &home, &|_| None);
         let mut left = vec![data_root.join("profiles/person-0123/Default/Cookies")];
         for browser in BROWSERS {
             left.push(host_manifest_location(Os::Linux, browser, dirs));
@@ -1181,7 +1470,7 @@ mod tests {
     fn the_install_runs_again_after_each_wait_and_a_failure_does_not_stop_it() {
         let calls = AtomicUsize::new(0);
         let job = || {
-            if calls.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+            if calls.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
                 Err(Problem::plain("nope"))
             } else {
                 Ok(vec![])

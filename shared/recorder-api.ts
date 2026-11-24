@@ -60,6 +60,24 @@ export type RecorderConnectionsResponse = {
   connections: ListedRecorderConnection[];
   extensionIds: string[];
 };
+export type RecordingEnded =
+  | "succeeded"
+  | "stopped"
+  | "sending"
+  | "unknown"
+  | "missing";
+export type RecordingRow = {
+  id: string;
+  title: string | null;
+  recordedAt: string;
+  ended: RecordingEnded;
+  reason: string | null;
+};
+export type RecordingsPage = {
+  recordings: RecordingRow[];
+  nextCursor: string | null;
+  unavailable?: "unavailable" | "unreachable";
+};
 export type ExchangeResponse = {
   token: string;
   connection: RecorderConnection;
@@ -162,6 +180,32 @@ export function normaliseOpenBotOrigin(raw: string): OriginCheck {
   return { ok: true, origin: url.origin };
 }
 
+/** The Recorder's rule for the Intelligence gateway a capture pass names: wss:// any host; ws:// only on a loopback
+ * address, 127.0.0.1 or [::1] (Decision 21; never a name such as localhost); and when `allowed` is not null, the origin of
+ * one of the allowed URLs. Here so the server never hands the Recorder a gateway it would refuse. */
+export function isAllowedGatewayUrl(
+  clientUrl: string,
+  allowed: readonly string[] | null,
+): boolean {
+  let url: URL;
+  try {
+    url = new URL(clientUrl);
+  } catch {
+    return false;
+  }
+  const secure = url.protocol === "wss:";
+  if (!secure && !(url.protocol === "ws:" && LOOPBACK_HOSTS.has(url.hostname)))
+    return false;
+  if (allowed === null) return true;
+  return allowed.some((entry) => {
+    try {
+      return new URL(entry).origin === url.origin;
+    } catch {
+      return false;
+    }
+  });
+}
+
 const id = (value: string) => encodeURIComponent(value);
 export const recorderPaths = {
   connectCodes: "/api/recorder/connect-codes",
@@ -170,6 +214,8 @@ export const recorderPaths = {
     `/api/recorder/connections/${id(connectionId)}`,
   currentConnection: "/api/recorder/connections/current",
   me: "/api/recorder/me",
+  /** GET, the signed-in person's own recordings, `?cursor=`. */
+  recordings: "/api/recorder/recordings",
   learning: "/api/recorder/learning",
   /** POST `RecorderActivity`, with the Recorder's bearer: what this browser's Recorder is doing now (the red dot). */
   activity: "/api/recorder/activity",

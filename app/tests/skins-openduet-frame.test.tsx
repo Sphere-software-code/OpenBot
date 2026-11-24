@@ -109,7 +109,7 @@ function api(role: "admin" | "user") {
       ],
       nextCursor: null,
     },
-    "/api/bots/attention": { bots: [] },
+    "/api/bots/attention": { bots: [], lastPingId: null },
     "/api/agents": {
       agents: [
         { id: "b-1", name: "Inbox Bot" },
@@ -205,7 +205,12 @@ function api(role: "admin" | "user") {
           schedule: "Every weekday at 9:00",
           timezone: "UTC",
           instruction: "Post the standup notes",
-          channel: { id: "g-1", name: "Ops group", gone: false },
+          channel: {
+            id: "g-1",
+            name: "Ops group",
+            title: "Weekly ops review",
+            gone: false,
+          },
           enabled: true,
           nextRunAt: "2026-10-28T09:00:00.000Z",
           lastRun: null,
@@ -216,7 +221,12 @@ function api(role: "admin" | "user") {
           schedule: "Every Monday at 8:00",
           timezone: "UTC",
           instruction: "Summarise last week's orders",
-          channel: { id: "g-1", name: "Ops group", gone: false },
+          channel: {
+            id: "g-1",
+            name: "Ops group",
+            title: "Weekly ops review",
+            gone: false,
+          },
           enabled: false,
           nextRunAt: "2026-11-02T08:00:00.000Z",
           lastRun: null,
@@ -232,11 +242,14 @@ function api(role: "admin" | "user") {
           title: "Confirm Friday ship date for the 120 mugs",
           detail: "Ana needs it confirmed by end of day.",
           sourceApp: "Gmail",
+          sourceRef: "gmail/message",
           sourceLink: null,
+          pingId: "ping-1",
           createdAt: now,
         },
       ],
     },
+    "/api/tasks": { tasks: [] },
   };
   global.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input).split("?")[0] ?? "";
@@ -509,14 +522,14 @@ describe("Tasks is OpenBot's own lists under OpenDuet's headings", () => {
     );
   });
 
-  test("Up next starts or dismisses a suggestion with OpenBot's own suggestion list", async () => {
+  test("Up next starts or hides a suggestion with OpenBot's own suggestion list", async () => {
     const sent = api("user");
     const view = renderApp("/s/tasks");
     fireEvent.click(await view.findByRole("tab", { name: "Up next" }));
     expect(
       await view.findByText("Confirm Friday ship date for the 120 mugs"),
     ).toBeTruthy();
-    fireEvent.click(view.getByRole("button", { name: "Start as task" }));
+    fireEvent.click(view.getByRole("button", { name: "Work on it" }));
     await waitFor(() =>
       expect(sent).toContainEqual({
         method: "POST",
@@ -524,7 +537,7 @@ describe("Tasks is OpenBot's own lists under OpenDuet's headings", () => {
         body: null,
       }),
     );
-    fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
+    fireEvent.click(await view.findByRole("button", { name: /^Dismiss / }));
     await waitFor(() =>
       expect(sent).toContainEqual({
         method: "POST",
@@ -573,7 +586,7 @@ describe("the frame carries the deployment's brand, not OpenDuet's", () => {
     fireEvent.click(await view.findByRole("tab", { name: "Active" }));
     await view.findByRole("region", { name: "Needs input" });
     fireEvent.click(view.getByRole("tab", { name: "Up next" }));
-    await view.findByRole("button", { name: "Start as task" });
+    await view.findByRole("button", { name: "Work on it" });
     expect(readable()).not.toContain("OpenDuet");
   });
 });

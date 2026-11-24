@@ -1,3 +1,5 @@
+import { itsAppPage } from "../edition";
+import { displayName } from "./app-names";
 import {
   BrokerAccountGoneError,
   BrokerAccountHeldError,
@@ -9,6 +11,11 @@ import {
   isFieldScheme,
 } from "./broker";
 import { type ComposioAction, vendorSentence } from "./composio";
+import {
+  DEPLOYMENT_CLIENT_SCHEME,
+  deploymentClientOf,
+  deploymentClientVariables,
+} from "./deployment-clients";
 import type { AccountRef } from "./shared-accounts";
 
 /**
@@ -141,6 +148,11 @@ export type VendorToolkit = {
  */
 export type VendorToolkitDetail = {
   auth_config_details?: unknown;
+  /**
+   * The app's own page about connecting it, where Composio publishes one. Read by
+   * {@link ComposioBroker.connectionGuideUrl} alone, and only ever as a link to show a person.
+   */
+  auth_guide_url?: unknown;
 };
 
 /**
@@ -690,7 +702,7 @@ export async function pageOf<Row>(
  * of them and not the other typechecks perfectly. An element type refuses a name that is not a
  * scheme and says nothing whatever about a scheme left out.
  *
- * AND THE ONE LEFT OUT FAILS OPEN, MORE QUIETLY HERE THAN THERE. A fifth scheme added to the names
+ * AND THE ONE LEFT OUT FAILS OPEN, MORE QUIETLY HERE THAN THERE. A new scheme added to the names
  * and not given a rank here would match nothing in the pick below, so every app publishing it would
  * fall through to `unsupported` — and the directory route hides an unsupported app, so those apps
  * would simply leave the picker: no refusal for anyone to read, no operator sentence, and no failing
@@ -700,13 +712,16 @@ export async function pageOf<Row>(
  *
  * THE ORDER ITSELF IS THE PERSON'S AND NOT THE WIRE'S, and it is unchanged: a plain key first,
  * because it is the one they are likeliest to already hold, then the other three ways of spelling a
- * secret they have to go and assemble.
+ * secret they have to go and assemble. A server-to-server grant comes last: it is offered only on
+ * the deployment's own client (see {@link connectionOf}), and an app that also takes a key the
+ * person holds is better connected with that key than through a client the operator registered.
  */
 const FIELD_SCHEME_ORDER: Record<FieldScheme, number> = {
   API_KEY: 0,
   BEARER_TOKEN: 1,
   BASIC: 2,
   BASIC_WITH_JWT: 3,
+  S2S_OAUTH2: 4,
 };
 
 /**
@@ -879,8 +894,17 @@ export function connectionOf(row: VendorToolkit): BrokerConnection {
   }
   if (offered.includes("DCR_OAUTH")) return { kind: "self-registering" };
 
+  /*
+   * A SERVER-TO-SERVER GRANT IS A FIELD SCHEME ONLY WHILE THIS DEPLOYMENT HOLDS ITS CLIENT. What
+   * Composio exchanges for the token is the client id and secret registered by whoever runs this
+   * deployment, read from the environment ({@link deploymentClientOf}). Without that pair there is
+   * nothing to exchange, so the scheme is left out here and an app publishing nothing else stays
+   * `unsupported`, hidden from the picker as before, rather than offered at an enable that fails.
+   */
+  const heldClient = deploymentClientOf(at) !== null;
   const field = offered
     .filter((scheme) => isFieldScheme(scheme))
+    .filter((scheme) => scheme !== DEPLOYMENT_CLIENT_SCHEME || heldClient)
     .sort(
       (left, right) => FIELD_SCHEME_ORDER[left] - FIELD_SCHEME_ORDER[right],
     )[0];
@@ -893,6 +917,13 @@ export function connectionOf(row: VendorToolkit): BrokerConnection {
    * nothing — about a row that published something this deployment simply cannot drive.
    */
   const published = [...new Set([...offered, ...managed])];
+  if (offered.includes(DEPLOYMENT_CLIENT_SCHEME)) {
+    const { id, secret } = deploymentClientVariables(at);
+    return {
+      kind: "unsupported",
+      reason: `${published.join(", ")} needs an OAuth application registered by whoever runs this deployment, and this deployment holds no client for ${at}. Set ${id} and ${secret} on this deployment to connect it with a server-to-server grant.`,
+    };
+  }
   return {
     kind: "unsupported",
     reason: published.length
@@ -1069,7 +1100,8 @@ export function appOf(row: VendorToolkit, position: number): BrokerApp {
 
   return {
     slug,
-    name,
+    // The brand's own spelling where the catalogue lowercased it. See `./app-names`.
+    name: displayName(slug, name),
     description,
     logo,
     categories,
@@ -1801,7 +1833,7 @@ function vendorRefusal(
      */
     case "ComposioToolNotFoundError":
       return refusal(
-        `Composio would not hand that action over at the version this deployment recorded for it, so ${outcome}. This deployment's @composio/core reports an action Composio has withdrawn and a request for one that failed — a timeout, a dropped connection, a 500, a refused key — under one condition and says nothing that tells the two apart, so neither can this deployment. Refreshing ${app}'s tools on its Plugins page records what Composio publishes now, which settles it where the action is gone; where every action of every app is failing the same way, it is the request rather than the action, and Composio's status page is where that shows.`,
+        `Composio would not hand that action over at the version this deployment recorded for it, so ${outcome}. This deployment's @composio/core reports an action Composio has withdrawn and a request for one that failed — a timeout, a dropped connection, a 500, a refused key — under one condition and says nothing that tells the two apart, so neither can this deployment. Refreshing ${app}'s tools on ${itsAppPage()} records what Composio publishes now, which settles it where the action is gone; where every action of every app is failing the same way, it is the request rather than the action, and Composio's status page is where that shows.`,
       );
 
     /*
@@ -1812,7 +1844,7 @@ function vendorRefusal(
      */
     case "ComposioToolVersionRequiredError":
       return refusal(
-        `Composio refuses a call whose toolkit version is "latest", and that is the version travelling with this one, so ${outcome}. A dated version is recorded when an app's actions are listed, so refreshing ${app}'s tools on its Plugins page replaces "latest" with a version Composio will accept.`,
+        `Composio refuses a call whose toolkit version is "latest", and that is the version travelling with this one, so ${outcome}. A dated version is recorded when an app's actions are listed, so refreshing ${app}'s tools on ${itsAppPage()} replaces "latest" with a version Composio will accept.`,
       );
 
     /*

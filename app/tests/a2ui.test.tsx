@@ -7,6 +7,7 @@ import {
 } from "@copilotkit/react-core/v2/generative-ui";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { cleanup, render } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 import {
   generativeUiProviderOptions,
@@ -35,7 +36,7 @@ function Committed() {
       rejected: [],
       operations: [
         {
-          version: "v1.0",
+          version: "1.0",
           createSurface: {
             surfaceId: "trip",
             catalogId: OPENBOT_UI.id,
@@ -43,7 +44,7 @@ function Committed() {
           },
         },
         {
-          version: "v1.0",
+          version: "1.0",
           updateComponents: {
             surfaceId: "trip",
             components: [
@@ -96,13 +97,15 @@ test("disabled and unresolved deployments do not send the catalog", () => {
   });
 });
 
-test("the catalog is the standard one, less the omitted components and without the gallery", () => {
+test("the catalog is the standard one, less the omitted components, plus Breakdown and without the gallery", () => {
   expect(OPENBOT_UI.id).toBe("openbot/ui@1");
   const expected = Object.keys(standardUI.manifestComponents).filter(
     (name) =>
       !(OMITTED_STANDARD_COMPONENTS as readonly string[]).includes(name),
   );
-  expect([...OPENBOT_UI.components.keys()].sort()).toEqual(expected.sort());
+  expect([...OPENBOT_UI.components.keys()].sort()).toEqual(
+    [...expected, "Breakdown"].sort(),
+  );
   expect(expected).toHaveLength(65);
   // The A2UI 1.0 basic components, under their A2UI names.
   for (const name of [
@@ -134,4 +137,120 @@ test("the catalog is the standard one, less the omitted components and without t
   // The gallery components keep their separate per-Bot tool and grant path.
   expect(OPENBOT_UI.components.has("showTable")).toBe(false);
   expect(OPENBOT_UI.components.has("askForm")).toBe(false);
+});
+
+/** The trip budget a starter task asks for: three number fields and a total the Bot computes. */
+function Budget() {
+  const runtime = useGenerativeUIRuntime();
+  useEffect(() => {
+    if (!runtime) return;
+    const field = (key: string, label: string) => ({
+      id: key,
+      component: "TextField",
+      label,
+      variant: "number",
+      value: { "@path": `/${key}` },
+    });
+    runtime.manager.setActiveThread(THREAD);
+    runtime.manager.ingest(THREAD, undefined, {
+      surfaceId: "budget",
+      target: "budget",
+      catalogId: OPENBOT_UI.id,
+      status: "ready",
+      rejected: [],
+      operations: [
+        {
+          version: "1.0",
+          createSurface: {
+            surfaceId: "budget",
+            catalogId: OPENBOT_UI.id,
+            dataModel: { transport: 100, lodging: 200, food: 80, note: "" },
+          },
+        },
+        {
+          version: "1.0",
+          updateComponents: {
+            surfaceId: "budget",
+            components: [
+              { id: "root", component: "Card", child: "fields" },
+              {
+                id: "fields",
+                component: "Column",
+                children: [
+                  "transport",
+                  "lodging",
+                  "food",
+                  "total",
+                  "note",
+                  "echo",
+                ],
+              },
+              field("transport", "Transport ($)"),
+              field("lodging", "Lodging ($)"),
+              field("food", "Food ($)"),
+              {
+                id: "total",
+                component: "Text",
+                text: {
+                  "@call": "calc",
+                  args: {
+                    expression: "'Total $' + (transport + lodging + food)",
+                    transport: { "@path": "/transport" },
+                    lodging: { "@path": "/lodging" },
+                    food: { "@path": "/food" },
+                  },
+                },
+              },
+              {
+                id: "note",
+                component: "TextField",
+                label: "Note",
+                value: { "@path": "/note" },
+              },
+              {
+                id: "echo",
+                component: "Text",
+                text: {
+                  "@call": "calc",
+                  args: {
+                    expression: "'Note ' + (note + 1)",
+                    note: { "@path": "/note" },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
+  }, [runtime]);
+  return null;
+}
+
+test("a number field writes a number, so a total the Bot computes adds instead of joining", async () => {
+  const view = render(
+    <CopilotKitProvider {...generativeUiProviderOptions(true)}>
+      <Budget />
+      <GenerativeUISurface id="budget" />
+    </CopilotKitProvider>,
+  );
+  expect(await view.findByText("Total $380")).toBeTruthy();
+
+  // As a person changes it: select the amount and type over it.
+  const user = userEvent.setup({ document });
+  const lodging = view.getByLabelText("Lodging ($)") as HTMLInputElement;
+  await user.clear(lodging);
+  await user.type(lodging, "250");
+  // A string "250" in the data model made this "Total $10025080".
+  expect(await view.findByText("Total $430")).toBeTruthy();
+
+  // An emptied field stays empty, so a person can start the amount again.
+  await user.clear(lodging);
+  expect(lodging.value).toBe("");
+  await user.type(lodging, "300");
+  expect(await view.findByText("Total $480")).toBeTruthy();
+
+  // Other fields still write text.
+  await user.type(view.getByLabelText("Note"), "5");
+  expect(await view.findByText("Note 51")).toBeTruthy();
 });

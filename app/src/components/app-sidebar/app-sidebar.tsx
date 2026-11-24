@@ -4,6 +4,7 @@ import { Link, type LinkOptions, useParams } from "@tanstack/react-router";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type * as React from "react";
 import { useRef, useState } from "react";
+import { BrandName } from "@/components/edition/brand-name";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -25,8 +26,11 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { useSignOutOffered } from "@/lib/auth/sign-out-offered";
+import { untitledLine } from "@/lib/channels/label";
 import {
   type ChannelSummary,
   channelListQueryOptions,
@@ -34,14 +38,16 @@ import {
 import { useChannelEvents } from "@/lib/channels/use-channel-events";
 import { appConfig } from "@/lib/generated/application-config";
 import { EASE_OUT, ENTRANCE_SECONDS } from "@/lib/motion";
-import { navigationFor } from "@/lib/navigation";
-import { relativeTime } from "@/lib/relative-time";
+import { isNavigationLink, useNavigationItems } from "@/lib/navigation";
+import { relativeTimeShort } from "@/lib/relative-time";
 import {
   type MessageListEmphasis,
   useMessageListEmphasis,
 } from "@/lib/settings/message-list";
 import { BotsNavBadge } from "../bot-profile/attention";
 import { BrowserNavItem } from "../browser/browser-nav-item";
+import { navigationRender } from "../edition/team-features-dialog";
+import { OpenBotVersion } from "../layout/openbot-version";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../ui/empty";
 import { Channel } from "./channel";
@@ -63,7 +69,7 @@ function UserAvatar() {
       .join("") ?? currentUser?.email.slice(0, 2).toUpperCase();
 
   return (
-    <div className="size-[28px] bg-muted-foreground/10 text-foreground/70 rounded-full flex items-center justify-center text-xs overflow-hidden">
+    <div className="size-[28px] shrink-0 bg-muted-foreground/10 text-foreground/70 rounded-full flex items-center justify-center text-xs overflow-hidden">
       {initials}
     </div>
   );
@@ -77,11 +83,12 @@ const MAX_ANIMATED_ROWS = 60;
 /**
  * The roster, narrowed to what the person typed.
  *
- * Matches the channel's name, its summary, and the last message, because those are the things the
- * row can actually show — searching against something invisible returns results a person cannot
- * account for. The last message is included because it is still what the second line draws until the
- * conversation has been named. Message history beyond that line is not here to search: it lives in
- * the thread store, and reaching for it is a server endpoint rather than a filter.
+ * Matches the channel's name, its summary, its opening and the last message, because those are the
+ * things the row can actually show — searching against something invisible returns results a person
+ * cannot account for. The opening and the last message are included because one of them is what the
+ * second line draws until the conversation has been named. Message history beyond that line is not
+ * here to search: it lives in the thread store, and reaching for it is a server endpoint rather than
+ * a filter.
  *
  * An empty query returns the input array unchanged rather than a copy, so typing and clearing does
  * not hand `AnimatePresence` a new array identity and restage the whole list.
@@ -98,8 +105,8 @@ export function matchingChannels(
     return channels;
   }
   return channels.filter((channel) =>
-    [channel.name, channel.summary, channel.lastMessage].some((field) =>
-      field?.toLowerCase().includes(needle),
+    [channel.name, channel.summary, channel.opening, channel.lastMessage].some(
+      (field) => field?.toLowerCase().includes(needle),
     ),
   );
 }
@@ -183,13 +190,14 @@ function ChannelRow({
         participantIds={channel.agentIds}
         name={channel.name}
         summary={channel.summary ?? undefined}
-        lastMessage={channel.lastMessage ?? undefined}
+        untitled={untitledLine(channel)}
         lastMessageAt={
           channel.lastMessageAt
-            ? relativeTime(channel.lastMessageAt)
+            ? relativeTimeShort(channel.lastMessageAt)
             : undefined
         }
         pinned={channel.pinned}
+        canRename={channel.canRename ?? false}
         unread={unread}
         // A turn running, or work the conversation waits on between turns: a hop, a routine.
         busy={(channel.busy ?? false) || (channel.work?.length ?? 0) > 0}
@@ -202,6 +210,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const emphasis = useMessageListEmphasis();
   const { data: currentUser } = useQuery(currentUserQueryOptions());
   const signOut = useSignOut();
+  const signOutOffered = useSignOutOffered();
   const channels = useInfiniteQuery(channelListQueryOptions());
   // One socket for the app, opened where the roster is kept live.
   useChannelEvents();
@@ -217,23 +226,28 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
    */
   const animateOrder =
     !searching && (channels.data?.length ?? 0) <= MAX_ANIMATED_ROWS;
-  const navigation = navigationFor(currentUser?.role);
+  const navigation = useNavigationItems();
+  const { setOpenMobile } = useSidebar();
 
   return (
-    <Sidebar {...props}>
+    <Sidebar variant="inset" {...props}>
       <SidebarHeader className="h-12 p-2">
         <SidebarMenu>
           <SidebarMenuItem className="flex flex-row gap-1.5">
+            {/* The same hover as every other row in the sidebar, not the menu button's accent tint. */}
             <SidebarMenuButton
-              className="font-semibold text-[14px] tracking-tighter h-full leading-tight"
+              className="font-semibold text-[14px] tracking-tighter h-full leading-tight hover:bg-foreground/5 hover:text-sidebar-foreground active:bg-foreground/5 active:text-sidebar-foreground"
               render={(props) => (
                 <Link {...appLinkOptions} {...props}>
-                  {appConfig.brand.productName}
+                  <BrandName>{appConfig.brand.productName}</BrandName>
                 </Link>
               )}
             />
+            {/* Square, as tall as the name beside it, with the sidebar's hover rather than `muted`, which
+                is nearly the sidebar's own colour. */}
             <Button
               aria-label="New conversation"
+              className="aspect-square h-full w-auto hover:bg-foreground/5 dark:hover:bg-foreground/5"
               size="icon"
               variant="ghost"
               render={(props) => (
@@ -325,6 +339,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       <SidebarFooter>
         <SidebarMenu className="gap-px">
           {navigation
+            .filter(isNavigationLink)
             .filter((item) => item.section === "primary")
             .map((item) => (
               <SidebarMenuItem key={item.id}>
@@ -357,8 +372,12 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                 }
               >
                 <UserAvatar />
-                <span className="text-sm trackint-tight">
-                  {currentUser?.name || currentUser?.email}
+                {/* The name and the release the server runs, side by side: 80/20 of the row. */}
+                <span className="grid min-w-0 flex-1 grid-cols-[4fr_1fr] items-center gap-2">
+                  <span className="truncate text-sm trackint-tight">
+                    {currentUser?.name || currentUser?.email}
+                  </span>
+                  <OpenBotVersion className="text-right text-[10px] leading-3 text-muted-foreground" />
                 </span>
               </DropdownMenuTrigger>
               <DropdownMenuContent
@@ -373,21 +392,31 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                     <DropdownMenuItem
                       className={userMenuItemClassName}
                       key={item.id}
-                      render={<Link to={item.to} />}
+                      nativeButton={item.kind === "dialog"}
+                      // A link closes a narrow window's sheet as it is followed; a dialog has to
+                      // close it itself, or the sheet waits behind the dialog.
+                      render={navigationRender(
+                        item,
+                        item.kind === "dialog"
+                          ? { onClick: () => setOpenMobile(false) }
+                          : {},
+                      )}
                     >
                       <item.icon />
-                      {item.label}
+                      <BrandName>{item.label}</BrandName>
                     </DropdownMenuItem>
                   ))}
-                <DropdownMenuItem
-                  className={userMenuItemClassName}
-                  disabled={signOut.pending}
-                  onClick={signOut.run}
-                  variant="destructive"
-                >
-                  <IconLogout />
-                  Sign out
-                </DropdownMenuItem>
+                {signOutOffered ? (
+                  <DropdownMenuItem
+                    className={userMenuItemClassName}
+                    disabled={signOut.pending}
+                    onClick={signOut.run}
+                    variant="destructive"
+                  >
+                    <IconLogout />
+                    Sign out
+                  </DropdownMenuItem>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </SidebarMenuItem>

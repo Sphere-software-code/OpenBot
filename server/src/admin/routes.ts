@@ -29,6 +29,7 @@ import {
   isCapability,
 } from "./capabilities";
 import { ACTION_RECORD_RETENTION_DAYS, enterpriseControls } from "./controls";
+import { parseMetricsDays, proactiveMetrics } from "./proactive-metrics";
 import type { EnterpriseSettings } from "./settings-store";
 
 /**
@@ -78,10 +79,22 @@ const networkInput = z.strictObject({
   mode: z.enum(["allow_all", "defaults_plus_allowlist", "allowlist_only"]),
   rules: z.array(z.unknown()).max(5_000),
   locked: z.boolean().default(false),
+  /**
+   * Where the list came from when it was not typed: a sentence in plain English that the
+   * deployment's model wrote as the list the admin then saved (admin/network-translate.ts). Recorded
+   * with the save, as a boundary's and a team approval rule's are.
+   */
+  authoring: z
+    .strictObject({
+      source: z.literal("english"),
+      text: z.string().trim().min(1).max(2_000),
+    })
+    .optional(),
 });
 
 const MODEL = z.string().trim().min(1).max(200);
 const SERVER = z.string().trim().min(1).max(200);
+const DAILY_RUNS_ERROR = "Enter a whole number of check-ins from 1 to 1440.";
 
 const settingInputs: {
   [K in keyof EnterpriseSettings]: z.ZodType<EnterpriseSettings[K]>;
@@ -98,6 +111,17 @@ const settingInputs: {
     servers: z.array(SERVER).max(500),
   }),
   skillSharing: z.boolean(),
+  modelSelection: z.boolean(),
+  /*
+   * At least one. Stopping check-ins altogether is the Check-ins switch, which tells the people it
+   * covers that an admin turned them off; a cap of none would tell them their Bot used its day. At
+   * most one a minute, the sweep's own pace.
+   */
+  proactiveDailyRuns: z
+    .number({ error: DAILY_RUNS_ERROR })
+    .int({ error: DAILY_RUNS_ERROR })
+    .min(1, { error: DAILY_RUNS_ERROR })
+    .max(1440, { error: DAILY_RUNS_ERROR }),
 };
 
 export function createEnterpriseAdminRoutes(
@@ -108,7 +132,7 @@ export function createEnterpriseAdminRoutes(
 
   const unavailable = (context: Context) =>
     context.json(
-      { error: "Enterprise controls are not running on this server." },
+      { error: "Admin settings aren't available on this server." },
       503,
     );
 
@@ -217,7 +241,14 @@ export function createEnterpriseAdminRoutes(
       targetType: "capability",
       targetId: input.capability,
       actorUserId: context.var.actor.id,
-      payload: { ...input, by: context.var.actor.email },
+      // The permission by its title, so the trail reads which switch without a lookup.
+      payload: {
+        ...input,
+        title: isCapability(input.capability)
+          ? CAPABILITY_LABELS[input.capability].title
+          : input.capability,
+        by: context.var.actor.email,
+      },
     });
     return context.json({ saved: input });
   });
@@ -325,16 +356,21 @@ export function createEnterpriseAdminRoutes(
     );
     if (!parsed.success) {
       return context.json(
-        { error: parsed.error.issues[0]?.message ?? "Invalid policy." },
+        {
+          error:
+            parsed.error.issues[0]?.path[0] === "authoring"
+              ? 'authoring must be { source: "english", text } with text of at most 2000 characters.'
+              : (parsed.error.issues[0]?.message ?? "Invalid policy."),
+        },
         400,
       );
     }
     const rules = parseEgressRules(parsed.data.rules);
     if (!rules.ok) return context.json({ error: rules.error }, 400);
+    const { authoring, ...policy } = parsed.data;
     const input = {
-      ...parsed.data,
-      scopeId:
-        parsed.data.scopeKind === "organization" ? "" : parsed.data.scopeId,
+      ...policy,
+      scopeId: policy.scopeKind === "organization" ? "" : policy.scopeId,
       rules: rules.rules,
     };
     if (input.scopeKind === "group" && !input.scopeId) {
@@ -357,6 +393,7 @@ export function createEnterpriseAdminRoutes(
         ruleCount: input.rules.length,
         rules: input.rules,
         by: context.var.actor.email,
+        ...(authoring ? { authoring } : {}),
       },
     });
     return context.json({ saved: input });
@@ -446,6 +483,46 @@ export function createEnterpriseAdminRoutes(
         stopped: [],
         skipped: "another server is sweeping, or the sweep is off",
       },
+    );
+  });
+
+  return routes;
+}
+
+/**
+ * `/api/admin/proactive`: the numbers behind Admin, Check-ins (`proactive-metrics.ts`). Admins only.
+ * The switch and the daily cap it shows are enterprise controls, changed through the routes above
+ * (`PUT /api/admin/enterprise/capabilities` with `proactive`, and
+ * `PUT /api/admin/enterprise/settings/proactiveDailyRuns`), so they are audited like every other.
+ */
+export function createProactiveAdminRoutes(
+  requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
+) {
+  const routes = new Hono<{ Variables: AppVariables }>();
+  routes.use("*", requireUser);
+
+  routes.get("/", async (context) => {
+    const denied = requireAdmin(context);
+    if (denied) return denied;
+    const controls = enterpriseControls();
+    if (!controls)
+      return context.json(
+        { error: "Admin settings aren't available on this server." },
+        503,
+      );
+    const parsed = parseMetricsDays(context.req.query("days") ?? null);
+    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+    // Sequential: see the note in controls.ts about concurrent statements on one connection.
+    const capabilityRows = await controls.store.capabilityRows();
+    const admins = await controls.store.adminIds();
+    const settings = await controls.store.settings();
+    return context.json(
+      await proactiveMetrics(controls.deps.database, {
+        days: parsed.days,
+        dailyRuns: settings.proactiveDailyRuns,
+        capabilityRows,
+        admins,
+      }),
     );
   });
 

@@ -1,7 +1,7 @@
 import type { Message } from "@ag-ui/core";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { useRef, useState } from "react";
 import { NewBotSheet } from "@/components/agents/new-bot-sheet";
 import AgentOrb from "@/components/agents/orb/agent-orb";
 import { ChannelAvatar } from "@/components/channels/avatar";
@@ -11,9 +11,15 @@ import {
   startsGroup,
   toFieldChange,
 } from "@/components/channels/compose-state";
+import {
+  type ComposerDraft,
+  toAgentOptions,
+} from "@/components/channels/composer";
+import { ModelPicker } from "@/components/channels/composer/model-picker";
 import { ConversationView } from "@/components/channels/conversation-view";
 import { seedMessage } from "@/components/channels/transcript-messages";
 import { SidebarToggle } from "@/components/layout/sidebar-toggle";
+import { StarterSuggestions } from "@/components/starter-tour/starter-suggestions";
 import {
   Combobox,
   ComboboxChip,
@@ -31,10 +37,9 @@ import {
   agentQueryOptions,
 } from "@/lib/agents/queries";
 import { useStartChannel } from "@/lib/channels/start";
-import {
-  skillInstructionsFor,
-  useSkillCommands,
-} from "@/lib/plugins/skill-commands";
+import { modelCatalogueQueryOptions } from "@/lib/models/queries";
+import { useDraftModel } from "@/lib/models/run-model";
+import { useSkillCommands } from "@/lib/plugins/skill-commands";
 import { searchTextEntry } from "@/lib/search-text";
 import { newId } from "../../../../lib/new-id";
 
@@ -54,10 +59,61 @@ export const Route = createFileRoute("/_authed/_app/channel/new")({
    */
   validateSearch: (search: Record<string, unknown>): { agent?: string } =>
     searchTextEntry("agent", search.agent),
+  /*
+   * Which new conversation this is. Every arrival here that this page did not make itself is a
+   * fresh one: the + button (pressed once or many times), a Bot's profile link, Back to an earlier
+   * draft. Each is given its own id here, in history state. The page's own navigations (a Bot
+   * picked or removed, a Bot made from the picker) carry the id forward, so they keep the draft
+   * they belong to.
+   *
+   * WHY NOT JUST THE URL: the picked Bots and the typed message live in this page, not the URL, and
+   * a second visit to the same route does not remount it. Pressing + while a Bot was already picked
+   * dropped `?agent=` from the URL but left the Bot in To: and the message in the box, so the screen
+   * and the URL disagreed and a reload changed who the message would go to.
+   *
+   * WHY NOT THE HISTORY ENTRY'S OWN KEY: the router makes no history entry for a navigation to the
+   * location it is already on. A second press of + on an untouched new conversation was exactly
+   * that, so nothing remounted, and the first press had already closed the To: picker as a click
+   * outside it and left focus on +. An arrival without an id is now always a different location
+   * from one with an id, so every press is a new entry and a fresh page.
+   *
+   * WHY CONTEXT AND NOT THE LOCATION: the router publishes a new location before the route's search
+   * catches up, so a page keyed on the location remounted once with the new key and the old
+   * `?agent=`, and handed the caret to the composer. Context commits with the search.
+   */
+  beforeLoad: ({ location }) => {
+    const composition = location.state.newConversation;
+    if (!composition) {
+      throw redirect({
+        replace: true,
+        search: location.search,
+        state: ownedBy(newId()),
+        to: "/channel/new",
+      });
+    }
+    return { composition };
+  },
   component: RouteComponent,
 });
 
+declare module "@tanstack/react-router" {
+  interface HistoryState {
+    /** Set by `/channel/new` on its own navigations: which new conversation they belong to. */
+    newConversation?: string;
+  }
+}
+
+/** History state marking a navigation as this page's own. */
+function ownedBy(composition: string) {
+  return { newConversation: composition };
+}
+
 function RouteComponent() {
+  const { composition } = Route.useRouteContext();
+  return <NewConversation composition={composition} key={composition} />;
+}
+
+function NewConversation({ composition }: { composition: string }) {
   const { agent } = Route.useSearch();
   const queryClient = useQueryClient();
   const [creatingBot, setCreatingBot] = useState(false);
@@ -69,6 +125,9 @@ function RouteComponent() {
   );
 
   const [error, setError] = useState<string | null>(null);
+  /** Enter or Send was pressed with nobody in To:. Said until a Bot is chosen. */
+  const [askedForBot, setAskedForBot] = useState(false);
+  const pickerInput = useRef<HTMLInputElement>(null);
   // Optimistic seed shown before the first channel record exists.
   const [sent, setSent] = useState<Message | null>(null);
 
@@ -88,8 +147,16 @@ function RouteComponent() {
     enabled: Boolean(agent) && profiles !== undefined && !listed,
     retry: false,
   });
-  // Only the URL names a recipient up front. Without one the To: field starts empty and open: a
-  // Bot picked on the person's behalf is one they have to notice and remove.
+  /*
+   * The URL names a recipient up front (a Bot's own Message link). Without one, To: starts empty
+   * with the Bot menu open, in either edition and however many Bots there are: + is a question,
+   * who is this for, and the menu is the answer to pick from. A Bot picked on the person's behalf
+   * was one they had to notice and remove.
+   *
+   * FOUND ON WINDOWS: a message typed with nobody in To: once went nowhere. The open menu says
+   * from the start that a Bot is needed, and Send with nobody picked says "Choose a Bot first."
+   * and opens it again, keeping the message.
+   */
   const chosen = listed ?? (fetched?.id === agent ? fetched : undefined);
   const needsUrlAgentDetail =
     Boolean(agent) && profiles !== undefined && !listed;
@@ -118,10 +185,65 @@ function RouteComponent() {
     name: profile.name,
   }));
   const group = startsGroup(recipients);
+  /*
+   * A model can be picked before the first message when the conversation is with one Bot that runs
+   * on OpenBot's own model. The pick is saved with the conversation, before the message runs.
+   */
+  const pickable =
+    !group && selected.length === 1 && selected[0]?.runsOnOpenBotModel === true;
+  const models = useQuery({
+    ...modelCatalogueQueryOptions(),
+    enabled: pickable,
+  });
+  const draftModel = useDraftModel(pickable ? models.data : undefined);
   // A group's first message goes to all of its Bots, so no one Bot's commands are offered.
   const skillCommands = useSkillCommands(
     group ? "" : (recipients[0]?.id ?? ""),
   );
+
+  const submit = async (draft: ComposerDraft) => {
+    const recipient = recipients[0];
+    if (!recipient || !canSend(recipients, draft.text)) return;
+    if (group) {
+      setError(null);
+      try {
+        // An `@` addresses one Bot, as it does in every later message of the group.
+        await startGroup(
+          recipients.map((entry) => entry.id),
+          draft.text,
+          draft.agentId,
+        );
+      } catch (caught) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : "Couldn't start the group. Try again.",
+        );
+        throw caught;
+      }
+      return;
+    }
+
+    setError(null);
+    setSent(seedMessage(draft.text, newId()));
+
+    try {
+      // Recorded, then started: a coworker picked here is as much a choice as an `@` on the
+      // home screen, and the trail has to say so for both.
+      // A `/` skill stays at the start of the words, where the server finds it, as it does for
+      // every later message.
+      await startChosen(recipient.id, draft.text, draftModel.requested);
+    } catch (caught) {
+      // Preserve the unsent draft when channel creation fails.
+      setSent(null);
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Couldn't start the conversation. Try again.",
+      );
+      throw caught;
+    }
+  };
 
   if (profiles === undefined && !rosterError) return null;
 
@@ -134,7 +256,7 @@ function RouteComponent() {
         <SidebarToggle className="mr-1" />
         <span className="text-sm text-muted-foreground">To:</span>
         <Combobox
-          // Do not auto-open when the recipient came from the URL; the field is already answered.
+          // Do not auto-open when a recipient is already chosen; the field is already answered.
           open={pickerOpen ?? (!chosen && !loadError && !waitingForUrlAgent)}
           onOpenChange={setPickerOpen}
           autoHighlight
@@ -148,11 +270,13 @@ function RouteComponent() {
           onValueChange={(next: AgentProfile[], details) => {
             const kept = toFieldChange(selected, next, details.reason);
             setPicked(kept);
+            setAskedForBot(false);
             // The first Bot stays in the URL so a reload keeps the conversation's recipient; the
             // rest of a group lives in the page. Not a separate navigation history entry.
             void navigate({
               replace: true,
               search: kept[0] ? { agent: kept[0].id } : {},
+              state: ownedBy(composition),
             });
           }}
           value={selected}
@@ -172,9 +296,10 @@ function RouteComponent() {
               </ComboboxChip>
             ))}
             <ComboboxChipsInput
+              ref={pickerInput}
               // The popup opening is not enough on its own: typing filters through this input, so
               // the caret starts here whenever the recipient question is still open. A recipient
-              // from the URL means the composer takes focus instead.
+              // already chosen means the composer takes focus instead.
               autoFocus={!chosen}
               placeholder={
                 selected.length
@@ -233,7 +358,11 @@ function RouteComponent() {
                   : [...existing, profile];
               });
               if (selected.length === 0)
-                void navigate({ replace: true, search: { agent: agentId } });
+                void navigate({
+                  replace: true,
+                  search: { agent: agentId },
+                  state: ownedBy(composition),
+                });
             })
             .catch(() => {
               setError(
@@ -243,66 +372,75 @@ function RouteComponent() {
         }}
       />
       <ConversationView
+        /*
+         * `@` offers the Bots in To:. The conversation does not exist until the first message is
+         * sent, so the people it is with are the ones picked here, and a first message can address
+         * one of them as every later one can.
+         */
+        agents={toAgentOptions(selected)}
         // Choosing a coworker answers the "To:" field, so the message is what remains: the caret
         // lands in the composer the moment a recipient exists, whether picked here or in the URL.
-        autoFocus
+        // Not before: an empty To: keeps the caret, even though the composer below takes words.
+        autoFocus={recipients.length > 0}
         // Commands must be loaded before the first channel message is sent.
         commands={skillCommands}
-        disabled={
-          Boolean(loadError) || waitingForUrlAgent || recipients.length === 0
+        modelPicker={
+          <ModelPicker
+            catalogue={pickable ? models.data : undefined}
+            onChange={draftModel.choose}
+            value={draftModel.value}
+          />
         }
+        disabled={Boolean(loadError) || waitingForUrlAgent}
+        /*
+         * WRITING FIRST IS FINE; SENDING WAITS FOR A BOT. The composer used to be disabled until To:
+         * had somebody in it, and a disabled composer is a dead end: it took a paste but no typing,
+         * no caret, and an Enter that went nowhere with nothing said. Now it takes words as home's
+         * does, and Enter or Send with nobody chosen opens To: and says why. The words stay put, and
+         * the caret comes back to them once a Bot is picked.
+         */
+        {...(recipients.length === 0
+          ? {
+              onSendHeld: () => {
+                setAskedForBot(true);
+                setPickerOpen(true);
+                pickerInput.current?.focus();
+              },
+            }
+          : {})}
         messages={sent ? [sent] : []}
+        starterSuggestions={
+          !group && !sent ? (
+            <StarterSuggestions
+              agentId={recipients[0]?.id}
+              disabled={pending || Boolean(loadError) || waitingForUrlAgent}
+              onSelect={(text) =>
+                submit({
+                  text,
+                  commandIds: [],
+                  attachments: [],
+                  agentId: recipients[0]?.id ?? null,
+                  isEmpty: false,
+                })
+              }
+            />
+          ) : undefined
+        }
         notice={
           loadError || error ? (
-            <p className="pb-2 text-sm text-destructive" role="alert">
+            <p className="px-3.5 pb-2 text-sm text-destructive" role="alert">
               {loadError ?? error}
+            </p>
+          ) : askedForBot && recipients.length === 0 ? (
+            <p
+              className="px-3.5 pb-2 text-sm text-muted-foreground"
+              role="status"
+            >
+              Choose a Bot first.
             </p>
           ) : null
         }
-        onSubmit={async (draft) => {
-          const recipient = recipients[0];
-          if (!recipient || !canSend(recipients, draft.text)) return;
-          if (group) {
-            setError(null);
-            try {
-              await startGroup(
-                recipients.map((entry) => entry.id),
-                draft.text,
-              );
-            } catch (caught) {
-              setError(
-                caught instanceof Error
-                  ? caught.message
-                  : "Couldn't start the group. Try again.",
-              );
-              throw caught;
-            }
-            return;
-          }
-
-          setError(null);
-          setSent(seedMessage(draft.text, newId()));
-
-          // The `/` skills this message was sent with, resolved exactly as `channel-chat` does for
-          // every later turn. Left out, the first message of a new channel offered the skill in the
-          // menu and then sent the text without it.
-          const skillInstructions = skillInstructionsFor(draft, skillCommands);
-
-          try {
-            // Recorded, then started: a coworker picked here is as much a choice as an `@` on the
-            // home screen, and the trail has to say so for both.
-            await startChosen(recipient.id, draft.text, skillInstructions);
-          } catch (caught) {
-            // Preserve the unsent draft when channel creation fails.
-            setSent(null);
-            setError(
-              caught instanceof Error
-                ? caught.message
-                : "Couldn't start the conversation. Try again.",
-            );
-            throw caught;
-          }
-        }}
+        onSubmit={submit}
         pending={pending}
       />
     </div>

@@ -5,11 +5,13 @@ import type {
 import {
   IconAlertTriangle,
   IconCircleCheck,
+  IconLoader2,
   IconPlayerRecordFilled,
+  IconTrash,
 } from "@tabler/icons-react";
 import { type UseMutationOptions, useMutation } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useState } from "react";
-import { Button } from "@/components/ui/button";
+import { type ReactNode, useEffect, useRef, useState } from "react";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Item,
@@ -20,12 +22,22 @@ import {
   ItemTitle,
 } from "@/components/ui/item";
 import {
+  Popover,
+  PopoverContent,
+  PopoverDescription,
+  PopoverHeader,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  openAndStartBrowserRecordingMutationOptions,
   startBrowserRecordingMutationOptions,
   stopBrowserRecordingMutationOptions,
 } from "@/lib/browser/mutations";
 import { cn } from "@/lib/utils";
 import { queryClient } from "@/query-client";
 import type { NarrationChoice } from "./narration-choice";
+import { useMicrophone } from "./use-microphone";
 
 /** The language narration is heard in: the person's own browser's. */
 export function narrationLanguage(): string {
@@ -75,11 +87,15 @@ export type RecordingHooks = {
 /**
  * Record and Stop for the person's browser, from the Recorder's own report in `state`. Record asks about narration
  * first when the person has never said (`useRecordingWith`).
+ *
+ * With `opens` (where the browser is a window on the person's desktop), Record opens the browser, or
+ * brings it forward, and starts recording in it, so a closed browser holds nothing back.
  */
 export function useRecording(
   state: BrowserApiState,
   choice: NarrationChoice,
   hooks: RecordingHooks = {},
+  { opens = false }: { opens?: boolean } = {},
 ) {
   return useRecordingWith({
     recorder: state.recorder,
@@ -87,8 +103,13 @@ export function useRecording(
      * A Recorder that reports itself disconnected does not hold Record back: the server connects the person's own
      * browser again before it starts (a Disconnect in Settings, Browsers leaves it signed out until then).
      */
-    waiting: !state.open ? "Your browser is closed. Open it to record." : null,
-    start: startBrowserRecordingMutationOptions(queryClient),
+    waiting:
+      !opens && !state.open
+        ? "Your browser is closed. Open it to record."
+        : null,
+    start: opens
+      ? openAndStartBrowserRecordingMutationOptions(queryClient)
+      : startBrowserRecordingMutationOptions(queryClient),
     stop: stopBrowserRecordingMutationOptions(queryClient),
     choice,
     ...hooks,
@@ -110,7 +131,9 @@ export type RecordingStart = {
  *
  * Record asks the person whether to narrate when they have never said (`choice`, their account's preference, the same
  * in every browser they record in), in a dialog whose answer records and is kept, and tells the Recorder the answer
- * with every recording, so a microphone opens only for a person who chose to narrate.
+ * with every recording, so a microphone opens only for a person who chose to narrate. On a computer with no microphone
+ * there is nothing to narrate with, so it asks nothing and records without narration, the choice left unmade for when
+ * one is plugged in.
  */
 export function useRecordingWith<Started, Stopped>({
   recorder,
@@ -131,6 +154,7 @@ export function useRecordingWith<Started, Stopped>({
   const [finishing, setFinishing] = useState(false);
   /** The narration question is on screen, for the task named when Record was pressed. */
   const [asking, setAsking] = useState(false);
+  const noMicrophone = useMicrophone() === false;
   const start = useMutation(startOptions);
   const stop = useMutation(stopOptions);
   const phase = recorder?.phase ?? "idle";
@@ -178,11 +202,13 @@ export function useRecordingWith<Started, Stopped>({
       if (!name) return;
       // Asked only of a person who never chose: a choice the page has not heard yet is read first.
       const narration = await choice.read();
-      if (narration === null) {
+      // No microphone: the page already says narration is off, so nothing is offered that could not be heard.
+      if (narration === null && !noMicrophone) {
         setAsking(true);
         return;
       }
-      // Unreadable: recorded without narration, the microphone closed, and the choice left as it is.
+      // Unreadable, or never made on a computer with no microphone: recorded without narration, the microphone
+      // closed, and the choice left as it is.
       begin(name, narration === "on");
     },
     /** The narration question, while it is asked: its dialog's props. */
@@ -237,10 +263,6 @@ export type Stopped = NonNullable<ReturnType<typeof stoppedRecording>>;
 const WHAT_IT_RECORDS =
   "The Recorder records the pages you open on websites and what you do there, with what each step saves, AI assistant conversations and your narration, in every tab you use while it records, except sites you leave out.";
 
-/** What Record does, said before it is pressed: everything a recording holds, as the disclosure says it. */
-export const RECORDING_DESCRIPTION =
-  "Do the task in your browser as you always would. The Recorder records every tab you use until you stop, and each tab shows that it is: the pages and what is on them, your clicks and typing, what each step saves, AI assistant conversations, and your narration when it's on. Passwords, card numbers, email addresses and tokens are masked first.";
-
 /** What a saved recording held: its actions, and its narrated phrases when there were any. */
 function heldIn(stopped: Stopped): string {
   return stopped.phrases > 0
@@ -248,11 +270,29 @@ function heldIn(stopped: Stopped): string {
     : actionCount(stopped.actions);
 }
 
+/**
+ * Why a recording that held something is not in the Learning space, from the Recorder's own report: Intelligence
+ * refused it, or the browser was signed out. Undefined while it is sent or on its way. The Desktop's run of 2026-11-06
+ * saw a recording an Intelligence with Trajectories turned off refused said to be saved to the Learning space.
+ */
+const NOT_SAVED: Record<NonNullable<Stopped["kept"]>, string> = {
+  refused: "It's kept in this browser and sent again later.",
+  "signed-out":
+    "It's kept in this browser until you connect it to OpenBot again.",
+};
+
 /** What the page says once Stop ended a recording, naming it. The sidebar's Browser button says the same. */
 export function stoppedSentence(stopped: Stopped): string {
-  return stopped.empty
-    ? `Nothing was recorded in “${stopped.title}”. ${WHAT_IT_RECORDS}`
-    : `Saved “${stopped.title}” to your Learning space: ${heldIn(stopped)}.`;
+  if (stopped.discarded) return `Discarded “${stopped.title}”.`;
+  if (stopped.empty)
+    return `Nothing was recorded in “${stopped.title}”. ${WHAT_IT_RECORDS}`;
+  if (stopped.kept)
+    return `“${stopped.title}” wasn't saved to your Learning space. ${NOT_SAVED[stopped.kept]}`;
+  if (stopped.sending && stopped.retrying)
+    return `“${stopped.title}” wasn't saved to your Learning space yet. ${stopped.retrying}`;
+  if (stopped.sending)
+    return `Saving “${stopped.title}” to your Learning space: ${heldIn(stopped)}.`;
+  return `Saved “${stopped.title}” to your Learning space: ${heldIn(stopped)}.`;
 }
 
 export function StoppedIcon({
@@ -262,7 +302,21 @@ export function StoppedIcon({
   stopped: Stopped;
   className?: string;
 }) {
-  return stopped.empty ? (
+  if (stopped.discarded)
+    return (
+      <IconTrash
+        aria-hidden="true"
+        className={cn("text-muted-foreground", className)}
+      />
+    );
+  if (stopped.sending && !stopped.empty && !stopped.kept && !stopped.retrying)
+    return (
+      <IconLoader2
+        aria-hidden="true"
+        className={cn("animate-spin text-muted-foreground", className)}
+      />
+    );
+  return stopped.empty || stopped.kept || stopped.retrying ? (
     <IconAlertTriangle
       aria-hidden="true"
       className={cn("text-amber-600 dark:text-amber-400", className)}
@@ -276,7 +330,7 @@ export function StoppedIcon({
 }
 
 /**
- * The recording Stop ended last, by name, on a page of rows (OpenBot Desktop, a Bot's screen), until the next one
+ * The recording Stop ended last, by name, on a page of rows (Teach a Bot's steps, a Bot's screen), until the next one
  * starts: Stop says where the recording went and what it held, or that it held nothing. `ended` comes first when
  * something other than Stop ended it, in a sentence saying what did.
  */
@@ -287,9 +341,17 @@ export function StoppedRow({
   stopped: Stopped;
   ended?: string;
 }) {
-  const held = stopped.empty
-    ? `Nothing was recorded. ${WHAT_IT_RECORDS}`
-    : `Saved to your Learning space: ${heldIn(stopped)}.`;
+  const held = stopped.discarded
+    ? "Discarded. You chose not to save it."
+    : stopped.empty
+      ? `Nothing was recorded. ${WHAT_IT_RECORDS}`
+      : stopped.kept
+        ? `Not saved to your Learning space. ${NOT_SAVED[stopped.kept]}`
+        : stopped.sending && stopped.retrying
+          ? `Not saved to your Learning space yet. ${stopped.retrying}`
+          : stopped.sending
+            ? `Saving to your Learning space: ${heldIn(stopped)}.`
+            : `Saved to your Learning space: ${heldIn(stopped)}.`;
   return (
     <Item size="sm" role="status">
       <ItemMedia variant="icon">
@@ -346,16 +408,22 @@ function progressLine(recording: Recording): string {
 }
 
 /**
- * The recording row on a page of rows (OpenBot Desktop, a Bot's screen): a task name and Record, or while recording its
+ * The recording row on a page of rows (Teach a Bot's steps, a Bot's screen): a task name and Record, or while recording its
  * name, how long it has run, its actions and Stop. `placeholder` is shorter where the row is narrow (the column beside
  * a Bot's screen), so the field says what it is for rather than half an example.
  */
 export function RecordingRow({
   recording,
   placeholder = "Name the task, like Submit an expense report",
+  recordLabel = "Record",
+  whileRecording,
 }: {
   recording: Recording;
   placeholder?: string;
+  /** What the button that starts a recording says. */
+  recordLabel?: string;
+  /** More actions beside Stop while a recording runs. */
+  whileRecording?: ReactNode;
 }) {
   if (recording.phase !== "idle") {
     return (
@@ -370,6 +438,7 @@ export function RecordingRow({
           </ItemDescription>
         </ItemContent>
         <ItemActions>
+          {whileRecording}
           <Button
             size="sm"
             disabled={recording.stopping || recording.phase !== "recording"}
@@ -412,7 +481,7 @@ export function RecordingRow({
       <ItemActions>
         {/* Base UI's Button defaults to type="button", which never submits the form. */}
         <Button disabled={!recording.canRecord} size="sm" type="submit">
-          {recording.starting ? "Starting…" : "Record"}
+          {recording.starting ? "Starting…" : recordLabel}
         </Button>
       </ItemActions>
     </Item>
@@ -420,8 +489,10 @@ export function RecordingRow({
 }
 
 /**
- * The same controls in one line, for the bar above a browser shown in the page (hosted OpenBot). `children` sits
- * before Stop while recording: the narration switch.
+ * The same controls for the toolbar of a browser shown in the page (hosted OpenBot). Idle, they are one Record button at
+ * the toolbar's end, where a browser keeps its own actions, and Record opens a small popover with the task's name and
+ * `children` (the narration switch), so the toolbar stays one line and never shows a second field beside the address.
+ * While recording, the toolbar itself holds the recording's name, its time and actions, `children` and Stop.
  */
 export function RecordingBar({
   recording,
@@ -430,6 +501,8 @@ export function RecordingBar({
   recording: Recording;
   children?: ReactNode;
 }) {
+  const [naming, setNaming] = useState(false);
+  const field = useRef<HTMLInputElement>(null);
   if (recording.phase !== "idle") {
     return (
       <div className="flex min-w-0 flex-wrap items-center gap-3">
@@ -457,28 +530,54 @@ export function RecordingBar({
     );
   }
   return (
-    <form
-      aria-label="Record a task"
-      className="flex min-w-0 items-center gap-2"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void recording.record();
-      }}
-    >
-      <Input
-        aria-label="Task name"
-        className="h-7 w-64 min-w-0"
-        maxLength={200}
-        onChange={(event) => recording.setTitle(event.target.value)}
-        placeholder="Name the task to record"
-        title={recording.waiting ?? undefined}
-        value={recording.title}
-      />
-      {children}
-      <Button disabled={!recording.canRecord} size="sm" type="submit">
-        <IconPlayerRecordFilled data-icon="inline-start" />
+    <Popover onOpenChange={setNaming} open={naming}>
+      <PopoverTrigger
+        className={buttonVariants({ size: "sm" })}
+        disabled={recording.starting}
+      >
+        <IconPlayerRecordFilled
+          className="text-red-500"
+          data-icon="inline-start"
+        />
         {recording.starting ? "Starting…" : "Record"}
-      </Button>
-    </form>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        className="w-80 gap-3 p-3"
+        initialFocus={field}
+      >
+        <PopoverHeader>
+          <PopoverTitle>Record a task</PopoverTitle>
+          <PopoverDescription>
+            {recording.waiting ??
+              "Do it once in this browser, and your Bots learn to do it."}
+          </PopoverDescription>
+        </PopoverHeader>
+        <form
+          aria-label="Record a task"
+          className="flex flex-col gap-3 [&>[data-slot=narration-switch]]:w-full"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!recording.canRecord) return;
+            // Closed first: Record may ask about narration next, in a dialog of its own.
+            setNaming(false);
+            void recording.record();
+          }}
+        >
+          <Input
+            aria-label="Task name"
+            maxLength={200}
+            onChange={(event) => recording.setTitle(event.target.value)}
+            placeholder="Name the task, like Submit an expense report"
+            ref={field}
+            value={recording.title}
+          />
+          {children}
+          <Button disabled={!recording.canRecord} size="sm" type="submit">
+            Start recording
+          </Button>
+        </form>
+      </PopoverContent>
+    </Popover>
   );
 }

@@ -8,6 +8,7 @@ import { EMPTY } from "rxjs";
 import {
   type EnterpriseControls,
   guardDeliveryStore,
+  guardHostAccess,
   installEnterpriseControls,
   skillSharingAllowed,
   skillSharingInSnapshot,
@@ -39,6 +40,11 @@ import {
   teamBotPublications,
   users,
 } from "../src/db/schema";
+import {
+  createHostAccessBroker,
+  HostAccessRefusedError,
+} from "../src/host-access/broker";
+import { hostAccessTools } from "../src/host-access/tools";
 import { createTeamBots } from "../src/team-bots/team-bots";
 import { TEST_POOL, testDatabaseUrl } from "./support/database";
 
@@ -81,6 +87,7 @@ const provider: ComputerProvider = {
 };
 
 let controls: EnterpriseControls;
+const pickedModels = new Map<string, string>();
 
 async function clean() {
   await database.delete(capabilitySettings);
@@ -128,6 +135,8 @@ beforeAll(async () => {
     auditStore,
     provider,
     builtInModel: "openai/gpt-test",
+    pickedModel: async (actorId, threadId) =>
+      actorId === member.id ? pickedModels.get(threadId) : undefined,
     duringRecording: async (botId, policy) =>
       botId === recordingBot
         ? { ...policy, rules: [...policy.rules, RECORDER_RULE] }
@@ -515,6 +524,27 @@ describe("headless turns obey the same switches", () => {
     await expect(allowed.run()).resolves.toMatchObject({ replyText: "Done." });
   });
 
+  test("headless admission judges the conversation's pick instead of the default", async () => {
+    await put(asAdmin, "/api/admin/enterprise/settings/modelAllowlist", {
+      value: { enabled: true, models: ["openai/gpt-picked"] },
+    });
+    pickedModels.set(`thread-${suite}`, "gpt-picked");
+    try {
+      const turn = headlessTurn(bot);
+      await expect(turn.run()).resolves.toMatchObject({ replyText: "Done." });
+      expect(turn.ran).toEqual([bot]);
+      pickedModels.delete(`thread-${suite}`);
+      await expect(headlessTurn(bot).run()).rejects.toThrow(
+        /isn't an allowed model/,
+      );
+    } finally {
+      pickedModels.clear();
+      await put(asAdmin, "/api/admin/enterprise/settings/modelAllowlist", {
+        value: { enabled: false, models: [] },
+      });
+    }
+  });
+
   test("a Bot-to-Bot hand-off meets the same switches", async () => {
     let ran = 0;
     const hop = createHandoffDelivery({
@@ -833,6 +863,60 @@ describe("action recording", () => {
       .where(inArray(actionRecords.botId, [bot]));
     expect(rows.map((row) => row.command)).toEqual([
       "curl -H 'Authorization: Bearer [REDACTED]' https://x.test",
+    ]);
+  });
+
+  test("a command on the person's own computer is recorded once, as local", async () => {
+    // Its Activity row is a computer action too now, which the recording tap reads; the guard
+    // around the broker records it, so the tap must not record it a second time.
+    await put(asAdmin, "/api/admin/enterprise/settings/actionRecording", {
+      value: true,
+    });
+    const broker = guardHostAccess(
+      createHostAccessBroker(),
+      (message) => new HostAccessRefusedError(message),
+    );
+    const grantId = `ent-grant-${suite}`;
+    broker.rememberGrant({
+      id: grantId,
+      botId: bot,
+      actorId: admin.id,
+      displayName: "Project",
+      revoked: false,
+    });
+    broker.nextDesktopOperation();
+    const tool = hostAccessTools({
+      broker,
+      botId: bot,
+      actorId: admin.id,
+      auditStore,
+    }).find((candidate) => candidate.name === "host_run_command");
+    const answer = tool?.execute({ grantId, command: "ls -la" });
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const operation = broker.nextDesktopOperation()?.operations[0];
+      if (operation) {
+        broker.resolveDesktopOperation({
+          operationId: operation.operationId,
+          ok: true,
+          result: { stdout: "" },
+        });
+        break;
+      }
+      await Bun.sleep(5);
+    }
+    await answer;
+    await Bun.sleep(100);
+    const rows = await database
+      .select()
+      .from(actionRecords)
+      .where(
+        and(
+          eq(actionRecords.botId, bot),
+          eq(actionRecords.toolName, "host/run_command"),
+        ),
+      );
+    expect(rows.map((row) => [row.surface, row.outcome, row.command])).toEqual([
+      ["local", "allowed", "ls -la"],
     ]);
   });
 });

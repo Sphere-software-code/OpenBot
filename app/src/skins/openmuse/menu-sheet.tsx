@@ -21,10 +21,14 @@ import {
 import { ChannelPagination } from "@/components/app-sidebar/channel-pagination";
 import { ChannelAvatar } from "@/components/channels/avatar";
 import { DeleteConversationDialog } from "@/components/channels/delete-conversation-dialog";
+import { BrandName } from "@/components/edition/brand-name";
+import { navigationRender } from "@/components/edition/team-features-dialog";
 import { Item, ItemContent, ItemTitle } from "@/components/ui/item";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import { signOutMutationOptions } from "@/lib/auth/mutations";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
+import { useSignOutOffered } from "@/lib/auth/sign-out-offered";
+import { untitledLine } from "@/lib/channels/label";
 import { setChannelPinnedMutationOptions } from "@/lib/channels/mutations";
 import {
   type ChannelSummary,
@@ -57,6 +61,7 @@ export function MenuSheet({ onClose }: { onClose: () => void }) {
   const channels = useInfiniteQuery(channelListQueryOptions());
   const navigate = useNavigate();
   const signOut = useMutation(signOutMutationOptions(queryClient));
+  const signOutOffered = useSignOutOffered();
   const navigation = useNavigationItems();
   const [search, setSearch] = useState("");
   const body = useRef<HTMLDivElement>(null);
@@ -148,26 +153,30 @@ export function MenuSheet({ onClose }: { onClose: () => void }) {
             <LinkRow
               icon={item.icon}
               key={item.id}
-              render={<Link onClick={onClose} to={item.to} />}
+              render={navigationRender(item, { onClick: onClose })}
               tint={item.section === "account" ? "plain" : "sky"}
-              title={item.label}
+              title={<BrandName>{item.label}</BrandName>}
             />
           ))}
         </div>
-        <MuseButton
-          className="self-start"
-          danger
-          disabled={signOut.isPending}
-          icon={IconLogout}
-          onClick={async () => {
-            await signOut.mutateAsync();
-            await navigate({ to: "/sign" });
-          }}
-          small
-        >
-          Sign out
-        </MuseButton>
-        <ErrorNotice error={signOut.error?.message} />
+        {signOutOffered ? (
+          <>
+            <MuseButton
+              className="self-start"
+              danger
+              disabled={signOut.isPending}
+              icon={IconLogout}
+              onClick={async () => {
+                await signOut.mutateAsync();
+                await navigate({ to: "/sign" });
+              }}
+              small
+            >
+              Sign out
+            </MuseButton>
+            <ErrorNotice error={signOut.error?.message} />
+          </>
+        ) : null}
       </div>
     </MuseSheet>
   );
@@ -196,9 +205,7 @@ function ConversationRow({
   const unread = isUnread(channel, openId);
   const busy = channel.busy || (channel.work?.length ?? 0) > 0;
   const title =
-    channel.summary?.trim() ||
-    channel.lastMessage?.trim() ||
-    "New conversation";
+    channel.summary?.trim() || untitledLine(channel) || "New conversation";
   const who = group
     ? channel.agentIds
         .map((id) => agents.data?.find((agent) => agent.id === id)?.name)

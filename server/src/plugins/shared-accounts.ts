@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { currentEdition, itsAppPage } from "../edition";
 import { brokeredProvenance } from "./access";
 import { type Decides, type SchemeKind, schemeKind } from "./broker";
 
@@ -22,12 +23,13 @@ export type AccountRef =
   | { holder: "deployment"; vendorUserId: string };
 
 /**
- * A PERSON'S ACCOUNT, AND WHY ITS TWO IDS ARE ONE VALUE.
+ * A PERSON'S ACCOUNT, AND WHY ITS TWO IDS ARE ALMOST ALWAYS ONE VALUE.
  *
  * `userId` and `vendorUserId` are different CONCEPTS — who the account belongs to here, and the
  * name the vendor files it under — and they are kept as two fields because the deployment holder
  * proves they can differ: its vendor id is minted by {@link mintDeploymentVendorUserId} and has no
- * local user at all. FOR A PERSON THEY ARE THE SAME VALUE ON PURPOSE, for both providers:
+ * local user at all. FOR A PERSON THEY ARE THE SAME VALUE ON PURPOSE, for both providers, unless
+ * `filedUnder` names another:
  *
  * - Neither vendor issues a user handle. Composio's `user_id` and Arcade's `user_id` are both a
  *   string the CALLER chooses and the vendor files connections under, so "the vendor's id for this
@@ -46,9 +48,18 @@ export type AccountRef =
  * sends `vendorUserId`, and code that crosses them is only right by coincidence. This is the one
  * place a person's ref is minted from a local id; a ref read back from a stored row goes through
  * {@link asAccountRef} and carries the row's own `vendor_user_id`.
+ *
+ * `filedUnder` IS THE ONE EXCEPTION, AND IT IS READ, NEVER DERIVED. A single-user deployment's one
+ * person is `dev-local-user` on every such deployment, so their own id is not theirs alone, and the
+ * name their accounts are filed under is the one `brokered_identities` holds for them (see
+ * `ensureSingleUserIdentity`). `null` means no row, and then the collapse above holds. Required
+ * rather than defaulted, so a caller cannot mint a person's ref without having asked.
  */
-export function personAccount(userId: string): AccountRef {
-  return { holder: "person", userId, vendorUserId: userId };
+export function personAccount(
+  userId: string,
+  filedUnder: string | null,
+): AccountRef {
+  return { holder: "person", userId, vendorUserId: filedUnder ?? userId };
 }
 
 export function asAccountMode(value: unknown): AccountMode | null {
@@ -142,7 +153,7 @@ export function accountFor(
   if (mode === "shared") return { kind: "deployment" };
   return {
     kind: "ambiguous",
-    message: `${row.title} wasn't called because nobody has chosen whether it uses each person's account or a shared one. An admin can choose on its Plugins page.`,
+    message: `${row.title} wasn't called because nobody has chosen whether it uses each person's account or a shared one. ${currentEdition() === "personal" ? "You" : "An admin"} can choose on ${itsAppPage()}.`,
   };
 }
 
@@ -166,4 +177,39 @@ export function mintDeploymentVendorUserId(
     );
   }
   return `${DEPLOYMENT_VENDOR_PREFIX}${named}:${random()}`;
+}
+
+/**
+ * What separates a person's own broker id from the id a further account of theirs is filed under.
+ *
+ * Arcade keeps one account per user id and auth provider, so a person's second Gmail there is filed
+ * under `<their id>~<suffix>`. The suffix is random and minted once, when they press Connect another
+ * account; every such id starts with their own id and this mark, which is how a call checks that an
+ * account it was pointed at is filed under the person in the session and nobody else.
+ */
+export const ANOTHER_ACCOUNT_MARK = "~";
+
+/** A fresh id to file one more of this person's accounts under, at a broker that needs one. */
+export function anotherArcadeAccount(
+  account: Extract<AccountRef, { holder: "person" }>,
+): Extract<AccountRef, { holder: "person" }> {
+  return {
+    ...account,
+    vendorUserId: `${account.vendorUserId}${ANOTHER_ACCOUNT_MARK}${randomBytes(4).toString("hex")}`,
+  };
+}
+
+/** Whether `vendorUserId` is this person's own broker id, or one of their further accounts' ids. */
+export function filedUnderPerson(
+  vendorUserId: string,
+  personVendorUserId: string,
+): boolean {
+  return (
+    vendorUserId === personVendorUserId ||
+    (vendorUserId.startsWith(`${personVendorUserId}${ANOTHER_ACCOUNT_MARK}`) &&
+      vendorUserId.length > personVendorUserId.length + 1 &&
+      !vendorUserId
+        .slice(personVendorUserId.length + 1)
+        .includes(ANOTHER_ACCOUNT_MARK))
+  );
 }

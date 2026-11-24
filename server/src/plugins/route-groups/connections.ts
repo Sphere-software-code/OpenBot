@@ -1,5 +1,7 @@
+import type { Context } from "hono";
 import type { AppVariables } from "../../auth/guards";
 import { reasonWithoutStatement } from "../../db/query-failure";
+import { appsPage, askAdminTo } from "../../edition";
 import { normalizeArcadeError } from "../arcade-adapter";
 import {
   BrokerAccountHeldError,
@@ -7,6 +9,7 @@ import {
   BrokerUnconfiguredError,
   brokerReturnUrl,
   brokerSentence,
+  type ConnectedAppBroker,
   type Decides,
   type GrantState,
   isFieldScheme,
@@ -15,25 +18,37 @@ import {
 } from "../broker";
 import { catalogueEntry } from "../catalogue";
 import {
+  sharedAccountOnly,
+  sharedAccountOnlySentence,
+} from "../deployment-clients";
+import { connectionGuide, fieldsForPerson } from "../key-guides";
+import {
   authorizationUrlFor,
   type ConnectOrigin,
   challengeFor,
   connectedAccountsUrlFor,
   createVerifier,
+  desktopReturnUrlFor,
   redirectUriFor,
   sealConnectState,
 } from "../oauth";
-import { type AccountRef, asAccountRef } from "../shared-accounts";
+import {
+  type AccountRef,
+  anotherArcadeAccount,
+  asAccountRef,
+} from "../shared-accounts";
 import {
   CatalogueEntryUnknownError,
   type OAuthClient,
+  OAuthClientReadError,
   PluginRefusedError,
 } from "../store";
 import {
   type AuthorizationRefusal,
-  brokerRefusal,
+  forPerson,
   logReturnUrlRefusal,
   type PluginRouteContext,
+  personRefusal,
   STATUS_CALL_TIMEOUT_MS,
   sameAccount,
   settledStatus,
@@ -211,6 +226,22 @@ export function mountConnectionRoutes({
       const { account } = resolved;
 
       /*
+       * AN APP ON THE DEPLOYMENT'S OWN CLIENT IS NEVER ONE PERSON'S ACCOUNT, AND IS REFUSED BEFORE
+       * THE FORM IS EVEN ASKED FOR. What such a person would type is a store subdomain; what
+       * Composio would exchange is the client whoever runs this deployment registered, so a
+       * personal account here is the organization's access under one person's name, granted by
+       * nobody (see `sharedAccountOnly`). A Shared app's account is the deployment's and is let
+       * through: only an administrator reaches it, decided by the resolver above. 403, because the
+       * person pressing Connect cannot make this request succeed by changing what they send.
+       */
+      if (account.holder === "person" && sharedAccountOnly(row.authScheme)) {
+        return context.json(
+          { error: sharedAccountOnlySentence(row.title) },
+          403,
+        );
+      }
+
+      /*
        * `composio` IS CHECKED AGAIN HERE FOR `tsc`'S BENEFIT AND NOT FOR THE REFUSAL. The function
        * above closes over the same binding and has already returned for everybody it is unset for
        * — this can only be reached once it answered — but that is a fact about the function's
@@ -239,33 +270,43 @@ export function mountConnectionRoutes({
        * could break it. For a Shared app the account is the deployment's rather than whoever is
        * signed in, decided above and never by anything the request carries.
        */
+      /*
+       * A PERSON MAY HOLD SEVERAL ACCOUNTS AT ONE APP, SO A STANDING CONNECTION IS NO REFUSAL.
+       *
+       * A press over a person's standing connection adds another account beside it: two Gmail
+       * mailboxes, a work and a personal calendar. A call names which one it runs in (see
+       * `plugin-store/accounts`), so a second account is no longer the vendor's choice to make.
+       *
+       * Composio files every account a person holds under one user id, and is told a second one is
+       * wanted (`another`). Arcade keeps one account per user id, and a Connect over a standing row
+       * there has always been the Reconnect that adds permissions to that account, so a further
+       * account is asked for in so many words (`?another=1`) and filed under a further id of the
+       * person's own (`anotherArcadeAccount`). Whose ids those are still comes from the session.
+       *
+       * A Shared app's team account is one account. Connecting a different one still means ending
+       * the one that stands first.
+       */
       const existing = await store.brokeredConnection({ toolkit, account });
-      if (existing) {
-        /*
-         * Named with the step to take rather than only refused: a second link would attach a
-         * second account behind a row that already says connected, and the way to a new one is
-         * through the connection they have.
-         *
-         * THE APP'S TITLE, NOT THE ROW'S ID. `composio-linear` is this deployment's name for a
-         * table row; "Linear" is the name of the thing the person connected and the only one of
-         * the two they have ever seen on a screen. An internal key in a sentence addressed to a
-         * person is both unhelpful and a small leak of how the rows are keyed.
-         *
-         * WHOSE ALREADY, SAID PLAINLY FOR A SHARED APP. "You already have an account" is true for
-         * a Personal app and false for a Shared one — nobody signed in holds that account, the
-         * deployment does — so a deployment account's refusal names the deployment's connection
-         * rather than putting the actor's own claim on it.
-         */
+      if (
+        existing &&
+        account.holder === "deployment" &&
+        !composio.broker.authorizations
+      ) {
         return context.json(
           {
-            error:
-              account.holder === "deployment"
-                ? `${row.title} already has a shared account connected. Disconnect it first if you want to connect a different one.`
-                : `You already have an account connected to ${row.title}. Disconnect it first if you want to connect a different one.`,
+            error: `${row.title} already has a shared account connected. Disconnect it first if you want to connect a different one.`,
           },
           409,
         );
       }
+      const another = Boolean(existing) && account.holder === "person";
+      const anotherArcade =
+        another &&
+        composio.broker.authorizations !== null &&
+        context.req.query("another") === "1" &&
+        account.holder === "person"
+          ? anotherArcadeAccount(account)
+          : null;
 
       /*
        * AN APP WHOSE SECRET THE PERSON HOLDS IS ANSWERED HERE AND NEVER SENT AT A CONSENT SCREEN.
@@ -366,14 +407,38 @@ export function mountConnectionRoutes({
             }),
           );
         } catch (error) {
-          const refusal = brokerRefusal(
+          const refusal = personRefusal(
             error,
             `Couldn't find out what ${row.title} needs to connect. Try again, or ask an admin if it keeps happening.`,
           );
           return context.json({ error: refusal.error }, refusal.status);
         }
 
-        if (submitted === null) return context.json({ fields: published });
+        /*
+         * THE FIRST PRESS ANSWERS THE FORM A PERSON CAN FOLLOW: the same boxes under the same
+         * names, labelled and explained in their words, and a guide saying where the key comes
+         * from. The names are untouched, so the second press is checked against `published`
+         * exactly as before. The broker's own link is asked for and a failure there costs only the
+         * link: the form is what the person came for, and `./key-guides` has the fallback.
+         */
+        if (submitted === null) {
+          const guideUrl = composio.broker.connectionGuideUrl?.bind(
+            composio.broker,
+          );
+          const link = guideUrl
+            ? await withVendorDeadline(() =>
+                guideUrl({ toolkit, authScheme }),
+              ).catch(() => null)
+            : null;
+          return context.json({
+            fields: fieldsForPerson(toolkit, published),
+            guide: connectionGuide({
+              toolkit,
+              title: row.title,
+              published: link,
+            }),
+          });
+        }
 
         /*
          * AN APP WITH NO BOXES CANNOT BE CONNECTED BY SOMEBODY TYPING, WHICH IS THE ONLY WAY THIS
@@ -398,7 +463,7 @@ export function mountConnectionRoutes({
         if (published.length === 0) {
           return context.json(
             {
-              error: `${row.title} doesn't ask for anything to connect with, so no account was made. Ask an admin to remove it under Plugins and add it again.`,
+              error: `${row.title} doesn't ask for anything to connect with, so no account was made. ${askAdminTo(`remove it under ${appsPage()} and add it again`)}.`,
             },
             400,
           );
@@ -476,7 +541,7 @@ export function mountConnectionRoutes({
           const optional = published.map((field) => field.name).join(", ");
           return context.json(
             {
-              error: `${row.title} marks nothing as required (only ${optional}), so no account was made. Ask an admin to remove it under Plugins and add it again.`,
+              error: `${row.title} marks nothing as required (only ${optional}), so no account was made. ${askAdminTo(`remove it under ${appsPage()} and add it again`)}.`,
             },
             400,
           );
@@ -626,13 +691,14 @@ export function mountConnectionRoutes({
            * reason the skills route gives its own refusal one: it is something the person who made
            * the request can fix, and the message says what to fix.
            */
+          const generic = `Couldn't connect ${row.title} with what you entered. Try again, or ask an admin if it keeps happening.`;
           if (error instanceof PluginRefusedError) {
-            return context.json({ error: error.message }, 400);
+            return context.json(
+              { error: forPerson(error.message, generic) },
+              400,
+            );
           }
-          const refusal = brokerRefusal(
-            error,
-            `Couldn't connect ${row.title} with what you entered. Try again, or ask an admin if it keeps happening.`,
-          );
+          const refusal = personRefusal(error, generic);
           return context.json({ error: refusal.error }, refusal.status);
         }
       }
@@ -658,7 +724,7 @@ export function mountConnectionRoutes({
       if (kind === "unreadable") {
         return context.json(
           {
-            error: `OpenBot can't tell how ${row.title} connects, so no account was made. Ask an admin to remove it under Plugins and add it again.`,
+            error: `OpenBot can't tell how ${row.title} connects, so no account was made. ${askAdminTo(`remove it under ${appsPage()} and add it again`)}.`,
           },
           400,
         );
@@ -727,6 +793,105 @@ export function mountConnectionRoutes({
             : "settings";
 
       /*
+       * THE VENDOR ALREADY HOLDS THIS ACCOUNT, AND THIS DEPLOYMENT HAS NO ROW FOR IT: RECORD IT,
+       * DON'T REFUSE IT.
+       *
+       * On Composio the one-account guard above already refused wherever a row stands here, so
+       * this can only be the other half of that rule: an account the vendor holds that this
+       * deployment lost track of. On Arcade a row may stand, and the confirm leaves it as it is. A fresh or upgraded install meets it, and so did every local install in
+       * single-user mode while they all signed in as the same person against one vendor key.
+       * Refused, the person read a sentence telling them to disconnect an account on a page
+       * that drew the app as not connected and offered no Disconnect. Nothing they could press
+       * would ever end it.
+       *
+       * WHAT IS DONE INSTEAD IS EXACTLY WHAT CONFIRM DOES, THROUGH THE SAME STORE CALL. The
+       * vendor is asked whether this account is connected, and a yes writes the row and files
+       * `mcp.account_connected` for it, once, as a confirm on page load would have. The account
+       * is the one `brokeredAccountFor` resolved at the top of this branch and the actor is the
+       * session's, so a Shared app's account is still only ever adopted by an administrator,
+       * and nothing the request carries can name whose account is recorded.
+       *
+       * `{ connected: true }` IS THE STORE'S ANSWER, PASSED BACK WHOLE, which is the shape
+       * confirm answers with and the one the browser already reads as connected. No link was
+       * minted, so there is no url to hand back and nothing for the person to finish anywhere.
+       *
+       * A NO IS STILL A REFUSAL, AND IT SAYS WHAT HAPPENED. The vendor refused a second link
+       * and then answered that it holds no active account, which is a race with somebody
+       * ending it or a vendor that disagrees with itself. The row confirm deletes on a no was
+       * never here, so the person is not sent to disconnect anything; asking again is the step
+       * that settles it. 409, the status of the one-account guard above, because it is that
+       * guard's conflict seen from the vendor's side.
+       *
+       * A CONFIRM THAT THROWS IS ANSWERED AS CONFIRM ANSWERS IT, with the vendor's or this
+       * deployment's sentence and never with a guess about the account in either direction.
+       *
+       * BOTH BROKERS RAISE IT. Composio's adapter does when the vendor refuses a second link for
+       * an account it holds, and Arcade's does when a whole-app consent answers that the account
+       * already allows everything the app asks for. Each is the same drift, healed the same way.
+       */
+      const adoptHeld = async (): Promise<Response> => {
+        let confirmed: { connected: boolean };
+        try {
+          confirmed = await store.confirmBrokeredConnection({
+            toolkit,
+            account,
+            by: context.var.actor.id,
+            pressed: "connect",
+          });
+        } catch (confirmFailure) {
+          const refusal = personRefusal(
+            confirmFailure,
+            `Couldn't check whether ${row.title} is already connected. Try again, or ask an admin if it keeps happening.`,
+          );
+          return context.json({ error: refusal.error }, refusal.status);
+        }
+        if (confirmed.connected) return context.json(confirmed);
+        return context.json(
+          {
+            error: `OpenBot was told an account for ${row.title} is already connected, but found none when it checked. Nothing was connected. Press Connect again, or ask an admin if it keeps happening.`,
+          },
+          409,
+        );
+      };
+
+      /*
+       * One address for both brokers' Connect, checked before anything is minted. See
+       * {@link consentReturnUrl}.
+       */
+      const back = consentReturnUrl(
+        connect.appUrl,
+        serverId,
+        returnTo,
+        `Couldn't start connecting ${row.title}. Try again, or ask an admin if it keeps happening.`,
+        context.req.query("from") === "desktop",
+      );
+      if ("refusal" in back) {
+        return context.json({ error: back.refusal.error }, back.refusal.status);
+      }
+      const { returnUrl } = back;
+
+      /*
+       * A BROKER THAT RUNS A CORRELATED FLOW CONNECTS THROUGH IT, AS ITS AUTHORIZE DOES.
+       *
+       * Arcade's consent comes back through the verifier, and the verifier binds a return to the
+       * attempt claimed before the mint and records the connection only then. So Connect claims an
+       * attempt too, and asks the broker for the whole app rather than for one action. Without it,
+       * an Arcade app had no Connect at all: Settings offered none, and the Connect on a Bot's card
+       * met the adapter's refusal. A presence test on the declared flow, never the vendor's name.
+       */
+      if (composio.broker.authorizations) {
+        return startAuthorization(context, {
+          broker: composio.broker,
+          serverId,
+          account: anotherArcade ?? account,
+          toolkit,
+          action: null,
+          returnUrl,
+          held: adoptHeld,
+        });
+      }
+
+      /*
        * THE URL IS A BEARER CAPABILITY. Whoever opens it attaches an account to the connection
        * resolved above — this person's own for a Personal app, or the deployment's for a Shared
        * one — so it is answered to the browser that asked and to nothing else: not logged, not
@@ -741,88 +906,14 @@ export function mountConnectionRoutes({
           composio.broker.authorize({
             account,
             toolkit,
-            /*
-             * THE REFUSAL ABOVE CHECKS THAT A SETTING IS SET; THIS CHECKS THAT IT IS AN ADDRESS.
-             * `appUrl` is an environment string — `OPENBOT_APP_URL`, or the first `TRUSTED_ORIGINS`
-             * entry — and nothing between there and Composio has ever looked at it, so
-             * `openbot.example.com` with the scheme left off builds a callback that is not a
-             * callback. That failure lands after somebody has consented, on the vendor's page, where
-             * this deployment cannot tell them anything; the guard moves it to before the link is
-             * minted, where nobody has spent a consent on it yet.
-             *
-             * WHO IS READING DECIDES WHAT IS SAID, AND HERE THAT IS A PERSON. This route is
-             * `requireUser`: whoever pressed Connect gets the refusal's own sentence, which names no
-             * vendor and no variable because they can act on neither. The operator's half of it is
-             * logged below instead, where an operator looks and a person does not.
-             */
-            returnUrl: brokerReturnUrl(
-              connectedAccountsUrlFor(connect.appUrl, { serverId }, returnTo),
-              activeProvider,
-            ),
+            returnUrl,
+            ...(another ? { another: true } : {}),
           }),
         ));
       } catch (error) {
-        /*
-         * THE VENDOR ALREADY HOLDS THIS ACCOUNT, AND THIS DEPLOYMENT HAS NO ROW FOR IT: RECORD IT,
-         * DON'T REFUSE IT.
-         *
-         * The one-account guard above already refused wherever a row stands here, so this can
-         * only be the other half of that rule: an account the vendor holds that this deployment
-         * lost track of. A fresh or upgraded install meets it, and so does every local install in
-         * single-user mode, because they all sign in as the same person against one vendor key.
-         * Refused, the person read a sentence telling them to disconnect an account on a page
-         * that drew the app as not connected and offered no Disconnect. Nothing they could press
-         * would ever end it.
-         *
-         * WHAT IS DONE INSTEAD IS EXACTLY WHAT CONFIRM DOES, THROUGH THE SAME STORE CALL. The
-         * vendor is asked whether this account is connected, and a yes writes the row and files
-         * `mcp.account_connected` for it, once, as a confirm on page load would have. The account
-         * is the one `brokeredAccountFor` resolved at the top of this branch and the actor is the
-         * session's, so a Shared app's account is still only ever adopted by an administrator,
-         * and nothing the request carries can name whose account is recorded.
-         *
-         * `{ connected: true }` IS THE STORE'S ANSWER, PASSED BACK WHOLE, which is the shape
-         * confirm answers with and the one the browser already reads as connected. No link was
-         * minted, so there is no url to hand back and nothing for the person to finish anywhere.
-         *
-         * A NO IS STILL A REFUSAL, AND IT SAYS WHAT HAPPENED. The vendor refused a second link
-         * and then answered that it holds no active account, which is a race with somebody
-         * ending it or a vendor that disagrees with itself. The row confirm deletes on a no was
-         * never here, so the person is not sent to disconnect anything; asking again is the step
-         * that settles it. 409, the status of the one-account guard above, because it is that
-         * guard's conflict seen from the vendor's side.
-         *
-         * A CONFIRM THAT THROWS IS ANSWERED AS CONFIRM ANSWERS IT, with the vendor's or this
-         * deployment's sentence and never with a guess about the account in either direction.
-         *
-         * ARCADE NEVER RAISES THIS CLASS, so this is a no-op there. Only Composio's adapter
-         * translates a held account into it.
-         */
-        if (error instanceof BrokerAccountHeldError) {
-          let confirmed: { connected: boolean };
-          try {
-            confirmed = await store.confirmBrokeredConnection({
-              toolkit,
-              account,
-              by: context.var.actor.id,
-            });
-          } catch (confirmFailure) {
-            const refusal = brokerRefusal(
-              confirmFailure,
-              `Couldn't check whether ${row.title} is already connected. Try again, or ask an admin if it keeps happening.`,
-            );
-            return context.json({ error: refusal.error }, refusal.status);
-          }
-          if (confirmed.connected) return context.json(confirmed);
-          return context.json(
-            {
-              error: `OpenBot was told an account for ${row.title} is already connected, but found none when it checked. Nothing was connected. Press Connect again, or ask an admin if it keeps happening.`,
-            },
-            409,
-          );
-        }
-        logReturnUrlRefusal(error, serverId);
-        const refusal = brokerRefusal(
+        // See `adoptHeld` above.
+        if (error instanceof BrokerAccountHeldError) return adoptHeld();
+        const refusal = personRefusal(
           error,
           `Couldn't start connecting ${row.title}. Try again, or ask an admin if it keeps happening.`,
         );
@@ -878,6 +969,18 @@ export function mountConnectionRoutes({
             error: `${entry.title} hasn't been added yet. Ask an admin to add it.`,
           },
           409,
+        );
+      }
+      if (error instanceof OAuthClientReadError) {
+        await store.recordOAuthClientReadFailure({
+          serverId,
+          actorId: context.var.actor.id,
+        });
+        return context.json(
+          {
+            error: `Couldn't connect ${entry.title}. Try again, or ask an admin if it keeps happening.`,
+          },
+          503,
         );
       }
       throw error;
@@ -1163,7 +1266,7 @@ export function mountConnectionRoutes({
          * no. So the page is told the ask failed, and what it goes on showing is the last answer
          * Composio gave rather than a guess about this one.
          */
-        const refusal = brokerRefusal(
+        const refusal = personRefusal(
           error,
           "Couldn't check whether this account is connected. This shows the last answer. Try again, or ask an admin if it keeps happening.",
         );
@@ -1243,18 +1346,20 @@ export function mountConnectionRoutes({
          * send them to an administrator about this deployment's key. 400 because it is theirs to
          * fix and the message says what to fix.
          */
+        const generic =
+          "Couldn't check whether this connection still works. This shows the last check. Press Re-check again, or ask an admin if it keeps happening.";
         if (error instanceof PluginRefusedError) {
-          return context.json({ error: error.message }, 400);
+          return context.json(
+            { error: forPerson(error.message, generic) },
+            400,
+          );
         }
         /*
          * And a failure this deployment cannot explain says what is on the screen instead of
          * guessing. Nothing was written on the way out of the store here, so the row still carries
          * the last answer anybody earned rather than a verdict invented by a call that failed.
          */
-        const refusal = brokerRefusal(
-          error,
-          "Couldn't check whether this connection still works. This shows the last check. Press Re-check again, or ask an admin if it keeps happening.",
-        );
+        const refusal = personRefusal(error, generic);
         return context.json({ error: refusal.error }, refusal.status);
       }
     },
@@ -1318,7 +1423,7 @@ export function mountConnectionRoutes({
        * one thing a person needs is the button to press, not this deployment's theory of where it
        * stopped.
        */
-      const refusal = brokerRefusal(
+      const refusal = personRefusal(
         error,
         "Couldn't disconnect this account. Press Disconnect again. It's safe to repeat. Ask an admin if it keeps happening.",
       );
@@ -1363,7 +1468,7 @@ export function mountConnectionRoutes({
           }),
         );
       } catch (error) {
-        const refusal = brokerRefusal(
+        const refusal = personRefusal(
           error,
           "Couldn't work out which other apps share this connection. Try again.",
         );
@@ -1373,103 +1478,236 @@ export function mountConnectionRoutes({
   );
 
   /**
-   * Begin authorizing ONE ACTION of a brokered app, for a provider that grants action by action.
-   * Answers `{ authorizationUrl }` and nothing else.
+   * Where a broker's consent sends the person back to, or the refusal to answer with when that is
+   * not an address. Connect, on both brokers, and Authorize build it here and nowhere else, so the
+   * check and the operator's log line cannot drift apart between them.
    *
-   * ORDERING PRINCIPLE: EVERYTHING THAT CAN FAIL WITHOUT THE VENDOR RUNS BEFORE THE CLAIM; THE
-   * CLAIM IS THE LAST THING BEFORE THE MINT. A bad `OPENBOT_APP_URL` must not leave a live attempt
-   * with no mint behind it, and the mint runs after the insert so a mint can never exist without a
-   * row to correlate it.
+   * BUILT FROM THIS DEPLOYMENT'S APP URL AND THE PAGE THE CALLER NAMES, NEVER FROM THE REQUEST.
+   * Whoever chooses it chooses where somebody lands holding a just-completed consent, so the caller
+   * may pick one of two pages ({@link ConnectOrigin}) and nothing more.
    *
-   * THE CAPABILITY GATE IS FIRST, BEFORE `brokeredAccountFor` AND BEFORE ANYTHING IS WRITTEN. A
-   * broker that declares no authorization flow cannot complete one, so claiming a row for it would
-   * block the actor for the full attempt lifetime over a flow that was never possible; a gate after
-   * the claim does not prevent that. It is a presence test on a declared capability and never a
-   * vendor name. 503 and not 404 or 400: the route exists, so 404 would lie, and the request is not
-   * what is wrong; 503 is this file's vocabulary for a capability this deployment does not have.
+   * CHECKED BEFORE ANYTHING IS MINTED. `appUrl` is an environment string, `OPENBOT_APP_URL` or the
+   * first `TRUSTED_ORIGINS` entry, and `openbot.example.com` with the scheme left off builds a
+   * callback that is not a callback. That failure would land after somebody had consented, on the
+   * vendor's page, where this deployment cannot tell them anything; {@link brokerReturnUrl} moves it
+   * to before the link is minted, where nobody has spent a consent on it yet.
    *
-   * `actorId` IS THE SESSION SUBJECT (`users.id`) AND NEVER A CREDENTIAL ACTOR: the verifier finds
-   * the attempt from the returning browser's session.
-   *
-   * THE URL IS A BEARER CAPABILITY — answered to this browser and to nothing else. It is never
-   * logged, audited or put in an error body. No `next_uri` is sent: the vendor refuses every value,
-   * and the landing page comes from the attempt row instead.
-   *
-   * A FAILED MINT'S ATTEMPT is handled at the mint's `catch`. NOT HERE: cancelling one.
+   * WHO IS READING DECIDES WHAT IS SAID. These routes are `requireUser`, so the person who pressed
+   * gets `refused`, which names no vendor and no variable because they can act on neither. The
+   * operator's half is logged by {@link logReturnUrlRefusal}, where an operator looks.
    */
-  routes.post("/servers/:id/authorize", requireUser, async (context) => {
-    const serverId = context.req.param("id");
-
-    if (!composio) {
-      return context.json(
-        {
-          error: new BrokerUnconfiguredError(activeProvider, "person").message,
-        },
-        503,
-      );
-    }
-    const flow = composio.broker.authorizations;
-    if (!flow) {
-      return context.json(
-        {
-          error:
-            "Apps here connect once, with Connect on the app's page. They aren't authorized one action at a time.",
-        },
-        503,
-      );
-    }
-
-    const resolved = await brokeredAccountFor(context, serverId);
+  /**
+   * The accounts the signed-in person holds at one app, each by the name the vendor gave it.
+   *
+   * ASKED OF THE VENDOR ON EVERY READ, and the answer recorded, because this is what a Bot's call
+   * picks its account from: an account connected or ended anywhere since the last read is listed
+   * as it stands now. A person's own accounts only; a Shared app's one team account has nothing to
+   * list here and answers an empty list.
+   *
+   * `canAddAnother` is whether Connect another account is offered: a person's own app, on a
+   * broker that can tell their accounts apart.
+   */
+  routes.get("/servers/:id/accounts", requireUser, async (context) => {
+    const resolved = await brokeredAccountFor(
+      context,
+      context.req.param("id"),
+      {
+        readOnly: true,
+      },
+    );
     if (resolved.refusal) {
       return context.json(
         { error: resolved.refusal.error },
         resolved.refusal.status,
       );
     }
-    const { account, toolkit, title } = resolved;
-
-    const body = await context.req.json().catch(() => null);
-    const action =
-      body && typeof body === "object" && "action" in body
-        ? (body as { action: unknown }).action
-        : undefined;
-    // Exact `===` against the stored names: Arcade's are case-sensitive and never normalized.
-    if (
-      typeof action !== "string" ||
-      !(await store.serverPublishesAction(serverId, action))
-    ) {
-      return context.json(
-        { error: `${title} has no action by that name.` },
-        400,
-      );
+    if (resolved.account.holder !== "person") {
+      return context.json({ accounts: [], canAddAnother: false });
     }
-
-    if (!connect?.appUrl) {
-      return context.json(
-        {
-          error:
-            "Connecting apps isn't set up yet. Ask an admin to set OPENBOT_APP_URL.",
-        },
-        503,
-      );
-    }
-    const returnTo: ConnectOrigin =
-      context.req.query("returnTo") === "admin" ? "admin" : "settings";
-    let returnUrl: string;
     try {
-      returnUrl = brokerReturnUrl(
-        connectedAccountsUrlFor(connect.appUrl, { serverId }, returnTo),
-        activeProvider,
+      const accounts = await withVendorDeadline(() =>
+        store.syncBrokeredAccounts({
+          toolkit: resolved.toolkit,
+          account: resolved.account,
+        }),
       );
+      return context.json({
+        accounts,
+        canAddAnother: Boolean(composio?.broker.accountsOf),
+      });
     } catch (error) {
-      logReturnUrlRefusal(error, serverId);
-      const refusal = brokerRefusal(
+      const refusal = personRefusal(
         error,
-        "Couldn't build the address to bring you back to, so nothing was started.",
+        `Couldn't list your ${resolved.title} accounts. Reload the page.`,
       );
       return context.json({ error: refusal.error }, refusal.status);
     }
+  });
 
+  /** Make one of the person's accounts the one their Bots use when they name none. */
+  routes.post(
+    "/servers/:id/accounts/:accountId/default",
+    requireUser,
+    async (context) => {
+      const resolved = await brokeredAccountFor(
+        context,
+        context.req.param("id"),
+      );
+      if (resolved.refusal) {
+        return context.json(
+          { error: resolved.refusal.error },
+          resolved.refusal.status,
+        );
+      }
+      if (resolved.account.holder !== "person") {
+        return context.json(
+          { error: `${resolved.title} uses one shared account.` },
+          400,
+        );
+      }
+      const changed = await store.setDefaultBrokeredAccount({
+        toolkit: resolved.toolkit,
+        userId: resolved.account.userId,
+        id: context.req.param("accountId"),
+      });
+      if (!changed) {
+        return context.json(
+          { error: "That account isn't connected. Reload the page." },
+          404,
+        );
+      }
+      return context.json({ ok: true });
+    },
+  );
+
+  /**
+   * Disconnect one of the person's accounts at an app and keep the others.
+   *
+   * The id is looked up among the signed-in person's own accounts and nowhere else, so a request
+   * naming somebody else's is a 404 like any account that is not there. The last account goes the
+   * way the app's single account always went, through the whole disconnect.
+   */
+  routes.delete(
+    "/servers/:id/accounts/:accountId",
+    requireUser,
+    async (context) => {
+      const resolved = await brokeredAccountFor(
+        context,
+        context.req.param("id"),
+      );
+      if (resolved.refusal) {
+        return context.json(
+          { error: resolved.refusal.error },
+          resolved.refusal.status,
+        );
+      }
+      if (resolved.account.holder !== "person") {
+        return context.json(
+          { error: `${resolved.title} uses one shared account.` },
+          400,
+        );
+      }
+      try {
+        const ended = await store.disconnectBrokeredAccount({
+          toolkit: resolved.toolkit,
+          account: resolved.account,
+          id: context.req.param("accountId"),
+          by: context.var.actor.id,
+        });
+        if (ended === null) {
+          return context.json(
+            { error: "That account isn't connected. Reload the page." },
+            404,
+          );
+        }
+        if ("only" in ended) {
+          return context.json(
+            await store.disconnectBrokered({
+              toolkit: resolved.toolkit,
+              account: resolved.account,
+              by: context.var.actor.id,
+              reason: "self",
+            }),
+          );
+        }
+        return context.json(ended);
+      } catch (error) {
+        const refusal = personRefusal(
+          error,
+          "Couldn't disconnect this account. Press Disconnect again. It's safe to repeat. Ask an admin if it keeps happening.",
+        );
+        return context.json({ error: refusal.error }, refusal.status);
+      }
+    },
+  );
+
+  /*
+   * `fromDesktop` is the press's own `?from=desktop`: the sign-in was started in OpenBot Desktop's
+   * window and runs in the person's browser, so it comes back to the page that hands them back to the
+   * window ({@link desktopReturnUrlFor}). Anybody can send it, and all it changes is which of this
+   * OpenBot's own pages the browser lands on.
+   */
+  const consentReturnUrl = (
+    appUrl: string,
+    serverId: string,
+    returnTo: ConnectOrigin,
+    refused: string,
+    fromDesktop: boolean,
+  ): { returnUrl: string } | { refusal: ReturnType<typeof personRefusal> } => {
+    try {
+      return {
+        returnUrl: brokerReturnUrl(
+          fromDesktop
+            ? desktopReturnUrlFor(appUrl, serverId)
+            : connectedAccountsUrlFor(appUrl, { serverId }, returnTo),
+          activeProvider,
+        ),
+      };
+    } catch (error) {
+      logReturnUrlRefusal(error, serverId);
+      return { refusal: personRefusal(error, refused) };
+    }
+  };
+
+  /**
+   * Claim an attempt, mint the consent at the broker and bind the two: the sequence Authorize and,
+   * on a broker that runs a correlated flow, Connect both run once they have decided whose account
+   * the consent is for. Answers the response the route sends.
+   *
+   * ORDERING PRINCIPLE: EVERYTHING THAT CAN FAIL WITHOUT THE VENDOR RUNS BEFORE THE CLAIM; THE
+   * CLAIM IS THE LAST THING BEFORE THE MINT. A bad `OPENBOT_APP_URL` must not leave a live attempt
+   * with no mint behind it, and the mint runs after the insert so a mint can never exist without a
+   * row to correlate it. Both callers therefore build `returnUrl` before calling this.
+   *
+   * ONE ACTION OR THE WHOLE APP. `action` is the action Authorize was pressed for, and null on
+   * Connect, which asks the broker for everything the app's actions need. The attempt row carries
+   * that null as it is, so the verifier lands a Connect on the app's page as Composio's does and
+   * the trail's `action` says no single action was asked for.
+   *
+   * THE URL IS A BEARER CAPABILITY — answered to this browser and to nothing else. It is never
+   * logged, audited or put in an error body. No `next_uri` is sent: the vendor refuses every value,
+   * and the landing page comes from the attempt row instead.
+   */
+  const startAuthorization = async (
+    context: Context<{ Variables: AppVariables }>,
+    {
+      broker,
+      serverId,
+      account,
+      toolkit,
+      action,
+      returnUrl,
+      held,
+    }: {
+      broker: ConnectedAppBroker;
+      serverId: string;
+      account: AccountRef;
+      toolkit: string;
+      action: string | null;
+      returnUrl: string;
+      held?: () => Promise<Response>;
+    },
+  ): Promise<Response> => {
     const claim = await store.claimAuthorizationAttempt({
       actorId: context.var.actor.id,
       serverId,
@@ -1479,25 +1717,43 @@ export function mountConnectionRoutes({
     if (!claim.claimed) {
       return context.json(
         {
-          error: claim.live
-            ? `An authorization for ${claim.live.action} is already in progress. Finish it, or wait for it to expire, before starting another.`
-            : "An authorization is already in progress. Finish it, or wait for it to expire, before starting another.",
+          error: !claim.live
+            ? "An authorization is already in progress. Finish it, or wait for it to expire, before starting another."
+            : claim.live.action === null
+              ? "You're already connecting an app. Finish it, or wait for it to expire, before starting another."
+              : `An authorization for ${claim.live.action} is already in progress. Finish it, or wait for it to expire, before starting another.`,
         },
         409,
       );
     }
 
-    let minted: Awaited<ReturnType<typeof composio.broker.authorize>>;
+    let minted: Awaited<ReturnType<ConnectedAppBroker["authorize"]>>;
     try {
       minted = await withVendorDeadline(() =>
-        composio.broker.authorize({
+        broker.authorize({
           account,
           toolkit,
-          action,
+          ...(action ? { action } : {}),
           returnUrl,
         }),
       );
     } catch (error) {
+      /*
+       * THE VENDOR ALREADY HOLDS EVERYTHING THIS CONSENT WOULD ASK FOR, AND THE CALLER SAYS WHAT
+       * THAT MEANS. Connect hands a `held` answer in, which records the account the way Composio's
+       * held account is recorded; Authorize hands none, and the refusal below tells the person.
+       * Nothing was minted either way, so the attempt is freed first, as on any definite refusal.
+       * A failure to free it is not worth the answer: it expires on its own.
+       */
+      if (error instanceof BrokerAccountHeldError && held) {
+        await store
+          .discardAuthorizationAttempt({
+            actorId: context.var.actor.id,
+            createdAt: claim.attempt.createdAt,
+          })
+          .catch(() => false);
+        return held();
+      }
       /*
        * WHAT A FAILED MINT DOES TO ITS ATTEMPT. THREE OUTCOMES, KEYED ON WHAT WAS ANSWERED.
        *
@@ -1573,7 +1829,7 @@ export function mountConnectionRoutes({
           );
           freed = false;
         }
-        const refusal = brokerRefusal(
+        const refusal = personRefusal(
           error,
           "The app refused to start that authorization. Try again in a moment.",
         );
@@ -1766,6 +2022,102 @@ export function mountConnectionRoutes({
       );
     }
     return context.json({ authorizationUrl: minted.redirectUrl });
+  };
+
+  /**
+   * Begin authorizing ONE ACTION of a brokered app, for a provider that grants action by action.
+   * Answers `{ authorizationUrl }` and nothing else. The claim, the mint and the binding are
+   * {@link startAuthorization}'s, which Connect runs too.
+   *
+   * THE CAPABILITY GATE IS FIRST, BEFORE `brokeredAccountFor` AND BEFORE ANYTHING IS WRITTEN. A
+   * broker that declares no authorization flow cannot complete one, so claiming a row for it would
+   * block the actor for the full attempt lifetime over a flow that was never possible; a gate after
+   * the claim does not prevent that. It is a presence test on a declared capability and never a
+   * vendor name. 503 and not 404 or 400: the route exists, so 404 would lie, and the request is not
+   * what is wrong; 503 is this file's vocabulary for a capability this deployment does not have.
+   *
+   * `actorId` IS THE SESSION SUBJECT (`users.id`) AND NEVER A CREDENTIAL ACTOR: the verifier finds
+   * the attempt from the returning browser's session.
+   *
+   * A FAILED MINT'S ATTEMPT is handled at the mint's `catch`. NOT HERE: cancelling one.
+   */
+  routes.post("/servers/:id/authorize", requireUser, async (context) => {
+    const serverId = context.req.param("id");
+
+    if (!composio) {
+      return context.json(
+        {
+          error: new BrokerUnconfiguredError(activeProvider, "person").message,
+        },
+        503,
+      );
+    }
+    const flow = composio.broker.authorizations;
+    if (!flow) {
+      return context.json(
+        {
+          error:
+            "Apps here connect once, with Connect on the app's page. They aren't authorized one action at a time.",
+        },
+        503,
+      );
+    }
+
+    const resolved = await brokeredAccountFor(context, serverId);
+    if (resolved.refusal) {
+      return context.json(
+        { error: resolved.refusal.error },
+        resolved.refusal.status,
+      );
+    }
+    const { account, toolkit, title } = resolved;
+
+    const body = await context.req.json().catch(() => null);
+    const action =
+      body && typeof body === "object" && "action" in body
+        ? (body as { action: unknown }).action
+        : undefined;
+    // Exact `===` against the stored names: Arcade's are case-sensitive and never normalized.
+    if (
+      typeof action !== "string" ||
+      !(await store.serverPublishesAction(serverId, action))
+    ) {
+      return context.json(
+        { error: `${title} has no action by that name.` },
+        400,
+      );
+    }
+
+    if (!connect?.appUrl) {
+      return context.json(
+        {
+          error:
+            "Connecting apps isn't set up yet. Ask an admin to set OPENBOT_APP_URL.",
+        },
+        503,
+      );
+    }
+    const returnTo: ConnectOrigin =
+      context.req.query("returnTo") === "admin" ? "admin" : "settings";
+    const back = consentReturnUrl(
+      connect.appUrl,
+      serverId,
+      returnTo,
+      "Couldn't build the address to bring you back to, so nothing was started.",
+      context.req.query("from") === "desktop",
+    );
+    if ("refusal" in back) {
+      return context.json({ error: back.refusal.error }, back.refusal.status);
+    }
+
+    return startAuthorization(context, {
+      broker: composio.broker,
+      serverId,
+      account,
+      toolkit,
+      action,
+      returnUrl: back.returnUrl,
+    });
   });
 
   /**
@@ -2046,6 +2398,51 @@ export function mountConnectionRoutes({
       const attemptAccount = asAccountRef(attempt);
       if (!attemptAccount) return refusedWith("no-attempt");
       const authId = attempt.authId;
+
+      /*
+       * AN ATTEMPT MINTED UNDER A NAME THIS PERSON NO LONGER HAS IS REFUSED, AND NOTHING AT THE
+       * VENDOR IS TOUCHED.
+       *
+       * A person's name at the broker changes in one way only: a single-user deployment that was
+       * filed under `dev-local-user` is given its own name at a start after an upgrade (see
+       * `ensureSingleUserIdentity`). A consent begun before that restart comes back holding the old
+       * name, and `dev-local-user` at Arcade is shared by every other single-user OpenBot on the
+       * key. Finished, `confirm_user` would complete a grant under that shared name, and the
+       * freshness check below would read the new name as an account that moved and WITHDRAW the
+       * old one's connection, which is other installs' grants. So it is refused before the vendor
+       * is asked anything: the flow at Arcade is left to lapse unconfirmed, and the attempt is
+       * freed so Connect can be pressed again at once under the new name.
+       *
+       * THIS IS WHAT COMPOSIO DOES IN THE SAME CASE, by construction rather than by a check. A
+       * Composio consent finished under the old name is never recorded under the new one, because
+       * the confirm asks Composio about the new name and hears no; nothing is withdrawn, and the
+       * person connects again. Here the refusal says so instead of leaving them to find out.
+       *
+       * Only a PERSON's attempt can be stale this way. A Shared app's identity is minted per app
+       * and a retired one is exactly what the freshness check below exists to withdraw.
+       */
+      if (attemptAccount.holder === "person") {
+        const filed = await store.personAccount(attemptAccount.userId);
+        if (filed.vendorUserId !== attemptAccount.vendorUserId) {
+          console.error(
+            JSON.stringify({
+              type: "arcade-attempt-under-retired-name",
+              server: attempt.serverId,
+              action: attempt.action,
+              authorizationId: authId,
+              attemptStartedAt: attempt.createdAt,
+              note: "A person returned from a consent begun under the name this deployment filed them under before it was given its own. Nothing was confirmed or withdrawn at the vendor, because that name may be shared by other deployments; the flow there lapses unconfirmed. The attempt was cleared so the person can connect again under the current name.",
+            }),
+          );
+          await store
+            .discardAuthorizationAttempt({
+              actorId,
+              createdAt: attempt.createdAt,
+            })
+            .catch(() => false);
+          return refusedWith("name-changed");
+        }
+      }
 
       /*
        * THE BINDING. `handle` IS AN OPAQUE STRING THE SEAM DOES NOT INTERPRET — the vendor's word for
@@ -2468,13 +2865,21 @@ export function mountConnectionRoutes({
        * `connectedAccountsUrlFor` with `{ serverId }` answers a query-less path, so appending
        * `?action=` here cannot produce a second `?`.
        *
+       * A WHOLE-APP CONNECT NAMES NO ACTION AND LANDS AS COMPOSIO'S CONNECT DOES: on the app's page
+       * with no query, where the app reading Connected is the news. Filed under the app's own name
+       * it landed on "You just authorized Gmail." with no grant row to mark.
+       *
        * BUILT BEFORE THE WRITE RATHER THAN AFTER IT, so that the only thing standing between a
        * committed grant and the person's browser is the redirect itself. Both reads are off the
        * attempt row and neither calls anybody.
        */
       const landing = `${connectedAccountsUrlFor(connect?.appUrl, {
         serverId: attempt.serverId,
-      })}?action=${encodeURIComponent(attempt.action)}`;
+      })}${
+        attempt.action === null
+          ? ""
+          : `?action=${encodeURIComponent(attempt.action)}`
+      }`;
 
       /*
        * THE COMPLETION HAS ITS OWN `catch`, AND IT IS THE ONLY PLACE ON THIS LEG THAT MAY ANSWER

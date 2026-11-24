@@ -7,12 +7,11 @@ import {
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import type * as React from "react";
-import { useState } from "react";
 import { AbstractAvatar } from "@/components/agents/abstract-avatar";
-import { BotNeedsYou } from "@/components/approvals/waiting";
 import { PageRows, PageSection } from "@/components/layout/page-shell";
+import { BotNeedsYou } from "@/components/needs-you/board";
+import { DoneTasks, useNeedsYou } from "@/components/needs-you/needs-you";
 import { SharedAppNotice } from "@/components/plugins/shared-app-notice";
-import { SuggestionsInbox } from "@/components/suggestions/proactive-panel";
 import { Button } from "@/components/ui/button";
 import {
   Item,
@@ -32,6 +31,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import type { AgentProfile } from "@/lib/agents/queries";
+import { shownSubtitle } from "@/lib/agents/subtitle";
 import {
   setBotNotifyMutationOptions,
   setBotPausedMutationOptions,
@@ -40,8 +40,12 @@ import {
   type BotNotify,
   botLifecycleQueryOptions,
 } from "@/lib/bot-lifecycle/queries";
+import {
+  requestNotificationPermission,
+  useNotificationPermission,
+} from "@/lib/notifications/permission";
 import { queryClient } from "@/query-client";
-import { BotActivityGlance } from "./activity";
+import { BotActivityGlance, BotActivityRow } from "./activity";
 import { BotPausedBanner } from "./pause-banner";
 
 const NOTIFY_LABEL: Record<BotNotify, string> = {
@@ -50,7 +54,10 @@ const NOTIFY_LABEL: Record<BotNotify, string> = {
   none: "Nothing (badges only)",
 };
 
-/** A Bot's own page: its state for you, what it is doing, its settings, and what can be done to it. */
+/**
+ * A Bot's own page: what it needs from you, its state for you, what it is doing, the tasks you marked
+ * done this week, its settings, and what can be done to it.
+ */
 export function BotProfile({
   agent,
   settings,
@@ -63,24 +70,23 @@ export function BotProfile({
   manage?: React.ReactNode;
 }) {
   const lifecycle = useQuery(botLifecycleQueryOptions(agent.id));
+  const { done } = useNeedsYou(agent.id);
   const pause = useMutation(setBotPausedMutationOptions(queryClient));
   const notify = useMutation(setBotNotifyMutationOptions(queryClient));
-  const [permission, setPermission] = useState<string>(() => {
-    try {
-      return typeof Notification === "undefined"
-        ? "unsupported"
-        : Notification.permission;
-    } catch {
-      return "unsupported";
-    }
-  });
+  // The browser's answer, shared with the prompt a conversation offers, so a yes there shows here.
+  const permission = useNotificationPermission();
 
   return (
     <>
       <div className="mt-6 flex items-center gap-3">
         <AbstractAvatar name={agent.name} seed={agent.avatarSeed} size={40} />
         <div className="min-w-0">
-          {agent.title && <p className="truncate font-medium">{agent.title}</p>}
+          {/* Up to three lines, so a phone shows the whole of a subtitle like the starter's. */}
+          {agent.title && (
+            <p className="line-clamp-3 text-pretty font-medium">
+              {shownSubtitle(agent.title)}
+            </p>
+          )}
           <p className="line-clamp-2 text-muted-foreground text-sm">
             {agent.roleDescription}
           </p>
@@ -90,8 +96,8 @@ export function BotProfile({
         <BotPausedBanner agentId={agent.id} />
       </div>
 
+      {/* Its questions and approvals, its tasks, and what its check-ins found, in one card. */}
       <BotNeedsYou agentId={agent.id} />
-      <SuggestionsInbox agentId={agent.id} />
 
       <PageSection title="For you">
         {/* Whether this Bot's Shared-app calls are being refused right now, with the button that
@@ -117,7 +123,7 @@ export function BotProfile({
                 <ItemDescription>
                   {lifecycle.data.paused
                     ? "Paused. Nothing runs for you until you turn it back on."
-                    : "Runs its routines, responsibilities, hand-offs and follow-ups for you."}
+                    : "Works on its goals, routines, hand-offs and follow-ups for you."}
                 </ItemDescription>
               </ItemContent>
               <ItemActions>
@@ -186,13 +192,7 @@ export function BotProfile({
                   </ItemContent>
                   <ItemActions>
                     <Button
-                      onClick={async () => {
-                        try {
-                          setPermission(await Notification.requestPermission());
-                        } catch {
-                          setPermission("unsupported");
-                        }
-                      }}
+                      onClick={() => void requestNotificationPermission()}
                       size="sm"
                       variant="outline"
                     >
@@ -218,11 +218,13 @@ export function BotProfile({
                 <IconChevronRight className="size-4 text-muted-foreground" />
               </ItemActions>
             </Item>
+            <BotActivityRow agentId={agent.id} />
           </PageRows>
         )}
       </PageSection>
 
       <BotActivityGlance agentId={agent.id} />
+      <DoneTasks done={done} />
       {settings}
       {manage}
     </>

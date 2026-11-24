@@ -30,7 +30,7 @@ import type { BotActivity, BotAttention } from "@/lib/bot-lifecycle/queries";
 import type { ChannelSummary } from "@/lib/channels/queries";
 import { appConfig } from "@/lib/generated/application-config";
 import type { MemoryRecord } from "@/lib/memory";
-import { navigationFor } from "@/lib/navigation";
+import { isNavigationLink, navigationFor } from "@/lib/navigation";
 import type { PluginsPage } from "@/lib/plugins/queries";
 import type { ProactiveSetting, ProactiveSuggestion } from "@/lib/proactive";
 import type { ResponsibilityRecord } from "@/lib/responsibilities";
@@ -196,6 +196,8 @@ const attention: BotAttention[] = [
     unread: 0,
     paused: false,
     notify: "all",
+    items: 0,
+    tasks: { needsInput: 0, ready: 0, failed: 0 },
   },
   {
     agentId: scout.id,
@@ -206,6 +208,8 @@ const attention: BotAttention[] = [
     unread: 1,
     paused: false,
     notify: "all",
+    items: 0,
+    tasks: { needsInput: 0, ready: 0, failed: 0 },
   },
 ];
 
@@ -263,7 +267,9 @@ const suggestions: ProactiveSuggestion[] = [
     title: "Book a table for Friday dinner",
     detail: "Jamie asked about Friday.\nThe thread is in your inbox.",
     sourceApp: "Gmail",
+    sourceRef: "gmail/thread",
     sourceLink: "https://mail.example.com/thread/1",
+    pingId: "ping-1",
     createdAt: now,
   },
   {
@@ -272,7 +278,9 @@ const suggestions: ProactiveSuggestion[] = [
     title: "Compare pricing pages",
     detail: "A competitor changed theirs.",
     sourceApp: null,
+    sourceRef: null,
     sourceLink: null,
+    pingId: null,
     createdAt: now,
   },
 ];
@@ -284,7 +292,13 @@ const routines: RoutineRecord[] = [
     schedule: "Every weekday at 9:00",
     timezone: "Europe/London",
     instruction: "Send me the headlines",
-    channel: { id: "c-muse", name: "Muse", gone: false },
+    title: null,
+    channel: {
+      id: "c-muse",
+      name: "Muse",
+      title: "Morning headlines",
+      gone: false,
+    },
     enabled: true,
     nextRunAt: now,
     lastRun: null,
@@ -388,12 +402,12 @@ function serve(options: { role?: "admin" | "user"; userId?: string } = {}) {
     "/api/agents": { agents: [scout, muse] },
     "/api/channels": { channels, nextCursor: null },
     "/api/approvals": inbox,
-    "/api/bots/attention": { bots: attention },
+    "/api/bots/attention": { bots: attention, lastPingId: null },
     [`/api/bots/${muse.id}/activity`]: { activity },
     [`/api/bots/${scout.id}/activity`]: {
       activity: { inProgress: [], scheduled: [], completed: [] },
     },
-    "/api/proactive/settings": { settings },
+    "/api/proactive/settings": { settings, allowed: true },
     "/api/proactive/suggestions": { suggestions },
     "/api/routines": {
       routines,
@@ -518,6 +532,11 @@ async function openMenu() {
 }
 
 describe("OpenMuse is a registered skin with its own frame", () => {
+  test("is shown to people as OpenFuse, and keeps the id a saved choice uses", () => {
+    expect(SKINS.openmuse.name).toBe("OpenFuse");
+    expect(SKINS.openmuse.id).toBe("openmuse");
+  });
+
   test("the registry hands OpenBot the frame and the three skin screens", () => {
     expect(SKINS.openmuse.Frame).toBe(OpenMuseFrame);
     // Apps is OpenBot's own Connections page, so the skin adds three screens, not four.
@@ -791,7 +810,7 @@ describe("every OpenBot surface stays reachable", () => {
       renderAt("/s/goals");
       const menu = within(await openMenu());
       await menu.findByRole("link", { name: /^Settings$/ });
-      for (const item of navigationFor(role)) {
+      for (const item of navigationFor(role).filter(isNavigationLink)) {
         expect(
           menu
             .getByRole("link", { name: new RegExp(`^${item.label}$`) })
@@ -855,9 +874,12 @@ describe("each tab is OpenBot's own sections for the centre Bot", () => {
   test("Activity shows what the Bot waits on you for, and its work", async () => {
     serve();
     renderAt("/s/activity");
-    // OpenBot's Needs you section, with OpenBot's own approval and its details always shown.
-    expect(await page().findByText("Muse wants to open url")).toBeTruthy();
-    expect(page().getByText(/"url": "https:\/\/example.com"/)).toBeTruthy();
+    // OpenBot's Needs you section, under the Bot's name, with its approval's details always shown.
+    expect(await page().findByText("Open url")).toBeTruthy();
+    expect(page().getAllByText("Muse").length).toBeGreaterThan(0);
+    // Labelled, as the card in OpenBot lists what it would send: the URL is the target and the value.
+    expect(page().getByText("URL")).toBeTruthy();
+    expect(page().getAllByText("https://example.com").length).toBe(2);
     // OpenBot's activity sections for the Bot.
     expect(await page().findByText("Morning briefing")).toBeTruthy();
     expect(page().getByText("Draft the launch post")).toBeTruthy();
@@ -872,11 +894,9 @@ describe("each tab is OpenBot's own sections for the centre Bot", () => {
       await page().findByText("Book a table for Friday dinner"),
     ).toBeTruthy();
     expect(page().queryByText("Compare pricing pages")).toBeNull();
-    // OpenBot's own background-research section for the Bot sits under the suggestions.
-    expect(
-      page().getByRole("heading", { name: "Background research" }),
-    ).toBeTruthy();
-    fireEvent.click(page().getByRole("button", { name: "Start as task" }));
+    // OpenBot's own check-ins section for the Bot sits under the suggestions.
+    expect(page().getByRole("heading", { name: "Check-ins" })).toBeTruthy();
+    fireEvent.click(page().getByRole("button", { name: "Work on it" }));
     await waitFor(() =>
       expect(
         calls.some(
@@ -922,7 +942,8 @@ describe("each tab is OpenBot's own sections for the centre Bot", () => {
     const sheet = within(await page().findByRole("dialog"));
     expect(await sheet.findByText("Muse wants to open url")).toBeTruthy();
     // What it will send is always on screen, as in OpenBot.
-    expect(sheet.getByText(/"url": "https:\/\/example.com"/)).toBeTruthy();
+    expect(sheet.getByText("URL")).toBeTruthy();
+    expect(sheet.getAllByText("https://example.com").length).toBe(2);
     expect(sheet.queryByText(/send email/)).toBeNull();
     fireEvent.click(sheet.getByRole("button", { name: "Allow once" }));
     await waitFor(() =>
@@ -985,6 +1006,8 @@ describe("the rules the frame runs on", () => {
       unread: 0,
       paused: false,
       notify: "all" as const,
+      items: 0,
+      tasks: { needsInput: 0, ready: 0, failed: 0 },
     };
     expect(
       statusLine({ attention: undefined, channels: busy, agentId: "b" }),

@@ -24,6 +24,7 @@ import { createDatabase, type Database } from "../src/db/client";
 import {
   agents,
   auditEvents,
+  brokeredAccounts,
   brokeredConnections,
   credentials as credentialRows,
   credentials,
@@ -40,13 +41,14 @@ import {
 } from "../src/plugins/access";
 import type { BrokerConnection, ComposioBroker } from "../src/plugins/broker";
 import type { CatalogueEntry } from "../src/plugins/catalogue";
-import { catalogueEntry } from "../src/plugins/catalogue";
+import { catalogueEntry, classifyTool } from "../src/plugins/catalogue";
 import {
   type ComposioResult,
   useComposioClient,
 } from "../src/plugins/composio";
 import { actionOf } from "../src/plugins/composio-vendor";
 import { redirectUriFor } from "../src/plugins/oauth";
+import { createPluginRoutes } from "../src/plugins/routes";
 import type { AccountRef } from "../src/plugins/shared-accounts";
 import {
   type AccessToken,
@@ -2878,6 +2880,237 @@ describe("a dynamic client the vendor has evicted", () => {
     expect(registrations).toEqual([]);
   });
 
+  test("Connect does not misclassify vendor registration faults as client read failures", async () => {
+    await clearClient();
+    registrations.length = 0;
+    const previousIssue = issue;
+    const vendorFailure = new Error("vendor registration unavailable");
+    issue = () => {
+      throw vendorFailure;
+    };
+    const readFailures = () =>
+      database
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.eventType, "mcp.oauth_client_read_failed"));
+    const before = await readFailures();
+    const routes = createPluginRoutes(
+      dynamicStore,
+      async (context, next) => {
+        context.set("actor", {
+          id: dynamicUserId,
+          email: "person@openbot.test",
+          role: "user",
+        });
+        await next();
+      },
+      async () => false,
+      {
+        encryptionKey: DYNAMIC_KEY,
+        publicUrl: "https://openbot.test",
+        appUrl: "https://openbot.test",
+        personHasAccess: async () => true,
+      },
+    );
+    const escaped: unknown[] = [];
+    routes.onError((error) => {
+      escaped.push(error);
+      return new Response("escaped", { status: 500 });
+    });
+    try {
+      const response = await routes.request(
+        `http://openbot.test/servers/${dynamicServerId}/connect`,
+        { method: "POST" },
+      );
+      expect(response.status).toBe(500);
+      expect(escaped).toEqual([vendorFailure]);
+      expect(registrations).toHaveLength(1);
+      expect(await readFailures()).toHaveLength(before.length);
+    } finally {
+      issue = previousIssue;
+      await putClient(EVICTED);
+    }
+  });
+
+  test.each(["wrong-key", "reader-fault"] as const)(
+    "Connect audits a client read fault (%s) without replacing or exposing it",
+    async (fault) => {
+      await putClient(EVICTED);
+      registrations.length = 0;
+      const sentinel = "private-client-secret-must-not-escape";
+      const audit = createAuditStore(database);
+      const beforeEvents = await database
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.eventType, "mcp.oauth_client_read_failed"));
+      const [before] = await database
+        .select({ credentialId: mcpServers.credentialId })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, dynamicServerId));
+      const failingStore = createPluginStore({
+        brokerProvider: "composio",
+        database,
+        auditStore: audit,
+        credentials:
+          fault === "reader-fault"
+            ? {
+                ...vault,
+                readSecret: async () => {
+                  throw new Error(sentinel);
+                },
+              }
+            : vault,
+        encryptionKey:
+          fault === "wrong-key"
+            ? Buffer.alloc(32, 1).toString("base64")
+            : DYNAMIC_KEY,
+        policy: () => policy,
+        ...seams,
+        redirectUri: REDIRECT_URI,
+      });
+      const routes = createPluginRoutes(
+        failingStore,
+        async (context, next) => {
+          context.set("actor", {
+            id: dynamicUserId,
+            email: "person@openbot.test",
+            role: "user",
+          });
+          await next();
+        },
+        async () => false,
+        {
+          encryptionKey: DYNAMIC_KEY,
+          publicUrl: "https://openbot.test",
+          appUrl: "https://openbot.test",
+          personHasAccess: async () => true,
+        },
+      );
+      const escaped: unknown[] = [];
+      routes.onError((error) => {
+        escaped.push(error);
+        return new Response("escaped", { status: 500 });
+      });
+      const said: string[] = [];
+      const realError = console.error;
+      console.error = (...args: unknown[]) => {
+        said.push(args.map(String).join(" "));
+      };
+      try {
+        const response = await routes.request(
+          `http://openbot.test/servers/${dynamicServerId}/connect`,
+          { method: "POST" },
+        );
+        console.error = realError;
+        const body = await response.text();
+        // The operator's only clue is the fault's name, and never its message, which can quote the
+        // stored client.
+        expect(
+          said
+            .filter((line) => line.includes("mcp-oauth-client-read-failed"))
+            .map((line) => JSON.parse(line)),
+        ).toEqual([
+          {
+            type: "mcp-oauth-client-read-failed",
+            server: dynamicServerId,
+            error: fault === "wrong-key" ? "OperationError" : "Error",
+          },
+        ]);
+        expect(said.join("\n")).not.toContain(sentinel);
+        const events = await database
+          .select()
+          .from(auditEvents)
+          .where(eq(auditEvents.eventType, "mcp.oauth_client_read_failed"));
+        const written = events.filter(
+          (event) => !beforeEvents.some((before) => before.id === event.id),
+        );
+        const [after] = await database
+          .select({ credentialId: mcpServers.credentialId })
+          .from(mcpServers)
+          .where(eq(mcpServers.id, dynamicServerId));
+        expect(response.status).toBe(503);
+        expect(JSON.parse(body)).toEqual({
+          error:
+            "Couldn't connect Notion. Try again, or ask an admin if it keeps happening.",
+        });
+        expect(escaped).toEqual([]);
+        expect(written).toHaveLength(1);
+        expect(written[0]).toMatchObject({
+          actorUserId: dynamicUserId,
+          targetType: "mcp_server",
+          targetId: dynamicServerId,
+          payload: {
+            server: dynamicServerId,
+            operation: "connect",
+            reason: "credential_read_failed",
+          },
+        });
+        expect(body + JSON.stringify(written)).not.toContain(sentinel);
+        expect(registrations).toEqual([]);
+        expect(after?.credentialId).toBe(before?.credentialId);
+        expect(await dynamicStore.oauthClientFor(dynamicServerId)).toEqual(
+          EVICTED,
+        );
+      } finally {
+        console.error = realError;
+        await putClient(EVICTED);
+      }
+    },
+  );
+
+  test.each(["before-lock", "under-lock"] as const)(
+    "a client decryption fault %s does not replace the deployment's client",
+    async (where) => {
+      await putClient(EVICTED);
+      registrations.length = 0;
+      issue = () => FRESH;
+      const [before] = await database
+        .select({ credentialId: mcpServers.credentialId })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, dynamicServerId));
+      const wrongKeyStore = createPluginStore({
+        brokerProvider: "composio",
+        database,
+        auditStore: createAuditStore(database),
+        // The initial read can find no row while a client is found under the lock. Neither read
+        // may interpret a decryption failure as permission to register over the working client.
+        credentials:
+          where === "under-lock"
+            ? { ...vault, readSecret: async () => null }
+            : vault,
+        encryptionKey: Buffer.alloc(32, 1).toString("base64"),
+        policy: () => policy,
+        ...seams,
+        redirectUri: REDIRECT_URI,
+      });
+      try {
+        const outcome = await wrongKeyStore
+          .ensureOAuthClient(dynamicServerId, "someone@openbot.test")
+          .then(
+            () => "returned",
+            () => "rejected",
+          );
+        const [after] = await database
+          .select({ credentialId: mcpServers.credentialId })
+          .from(mcpServers)
+          .where(eq(mcpServers.id, dynamicServerId));
+        expect({
+          outcome,
+          registrations: registrations.length,
+          pointerUnchanged: before?.credentialId === after?.credentialId,
+          client: await dynamicStore.oauthClientFor(dynamicServerId),
+        }).toEqual({
+          outcome: "rejected",
+          registrations: 0,
+          pointerUnchanged: true,
+          client: EVICTED,
+        });
+      } finally {
+        await putClient(EVICTED);
+      }
+    },
+  );
+
   test("a dynamic entry with no client gets one, kept and recorded", async () => {
     await clearClient();
     registrations.length = 0;
@@ -3087,7 +3320,7 @@ describe("a dynamic client the vendor has evicted", () => {
    * the length of this test — see {@link withMockedNotionListing}, which also puts back what the
    * refresh overwrites. What is under test is what a real listing over the real protocol produces.
    */
-  test("a refresh names the advertised tools no write list covers", async () => {
+  test("a refresh of Notion names no silent read, because a tool its lists do not name is a write", async () => {
     await putClient(EVICTED);
     await connect();
     accepted = new Set([EVICTED.clientId]);
@@ -3139,9 +3372,14 @@ describe("a dynamic client the vendor has evicted", () => {
         )
     ).flatMap((row) => (row.payload as { tools?: string[] }).tools ?? []);
 
-    // The one the list does not name, and never the one it does.
-    expect(named).toContain(unlistedName);
-    expect(named).not.toContain("notion-create-pages");
+    /*
+     * Notion names its reads, so the tool neither list names is a write, offered to nobody as a
+     * read, and there is nothing for the reconciliation row to name.
+     */
+    expect(named).toEqual([]);
+    expect(classifyTool(catalogueEntry("notion"), unlistedName, true)).toBe(
+      "write",
+    );
   });
 
   /**
@@ -4047,9 +4285,16 @@ describe("a custom server may only be pointed at its own kind of credential", ()
  * read-only scope would fail here rather than start filing rows about Drive.
  */
 describe("advertised tools a write list does not name", () => {
-  test("a Notion tool absent from the write list is named, sorted", () => {
+  /** Notion as its entry stood before it named its reads: a write list alone, and no scope. */
+  const writeListOnly = (() => {
+    const notion = catalogueEntry("notion");
+    if (!notion) throw new Error("catalogue slug `notion` is gone");
+    return { ...notion, readTools: undefined };
+  })();
+
+  test("a tool absent from a write list that stands alone is named, sorted", () => {
     expect(
-      unlistedAdvertisedTools(catalogueEntry("notion"), [
+      unlistedAdvertisedTools(writeListOnly, [
         "notion-search",
         "notion-create-pages",
         "notion-fetch",
@@ -4059,8 +4304,19 @@ describe("advertised tools a write list does not name", () => {
 
   test("a write the list already names is not", () => {
     expect(
+      unlistedAdvertisedTools(writeListOnly, ["notion-create-pages"]),
+    ).toEqual([]);
+  });
+
+  /*
+   * Notion names its reads now, so a tool its lists do not name is a write, not a read nobody
+   * reviewed: there is no silent read left to name.
+   */
+  test("a vendor that names its reads is not reconciled here", () => {
+    expect(
       unlistedAdvertisedTools(catalogueEntry("notion"), [
-        "notion-create-pages",
+        "notion-search",
+        "notion-delete-comment",
       ]),
     ).toEqual([]);
   });
@@ -4238,6 +4494,10 @@ async function freshDatabase(): Promise<Database> {
    * the guard's to refuse, because at that point nothing has established it is ours.
    */
   await database.delete(brokeredConnections).where(ownedConnections());
+  // The accounts behind those connections, by the same two people and never by app.
+  await database
+    .delete(brokeredAccounts)
+    .where(inArray(brokeredAccounts.userId, ["user_asker", strangerId]));
   // The person the connection outlives, who is a row in `users` like anybody else. Reached only
   // through the check at the top of this function, because there is no suffix on this id to tell a
   // fixture apart from somebody's account and ten cascades sit behind the difference.
@@ -4419,6 +4679,10 @@ afterAll(async () => {
     .delete(mcpServers)
     .where(inArray(mcpServers.id, ["gmail", "notion"]));
   await database.delete(brokeredConnections).where(ownedConnections());
+  // The accounts behind those connections, by the same two people and never by app.
+  await database
+    .delete(brokeredAccounts)
+    .where(inArray(brokeredAccounts.userId, ["user_asker", strangerId]));
   /*
    * And the witness row, which is at neither `gmail` nor any person.
    *
@@ -4764,7 +5028,7 @@ test("a Composio call whose url names no app is refused rather than falling back
       botId: "bot_helper",
       actorId: "user_asker",
     }),
-  ).rejects.toThrow(/no Composio app in its url/i);
+  ).rejects.toThrow(/no app in its url/i);
 
   expect(reached).toEqual([]);
 });
@@ -5079,12 +5343,124 @@ test("an identity a model puts in the arguments does not change whose account th
       // not read from arguments at all.
       userId: "user_asker",
       // Passed through whole, minus nothing: the reserved version key is the only thing the call
-      // path removes, and the model sent none.
+      // path removes, and the model sent none. The last three are OpenBot's own settings for a
+      // Gmail listing (`plugins/composio-shapes.ts`), added beside the model's, never read from them.
       args: {
         userId: "user_stranger",
         user_id: "user_stranger",
         entityId: "user_stranger",
         query: "is:unread",
+        include_payload: false,
+        verbose: false,
+        max_results: 20,
+      },
+    },
+  ]);
+});
+
+/**
+ * The same claim with several accounts: a name a model puts in the arguments picks among the
+ * asker's own accounts and nobody else's.
+ *
+ * `account` is the one argument the call path reads, and it is a NAME matched against the accounts
+ * of the person in the session. So naming somebody else's mailbox is refused before the vendor is
+ * asked, naming one of the asker's own runs in that account's id, and the identity keys beside it
+ * still reach the vendor as the action's own arguments and nothing more.
+ */
+test("with several accounts, an identity a model puts in the arguments still opens only the asker's own", async () => {
+  const { store, database } = await freshStore();
+  const reached: {
+    userId: string;
+    connectedAccountId?: string;
+    args: Record<string, unknown>;
+  }[] = [];
+  useComposioClient({
+    listActions: async () => [],
+    execute: async ({ userId, connectedAccountId }, args) => {
+      reached.push({
+        userId,
+        ...(connectedAccountId === undefined ? {} : { connectedAccountId }),
+        args,
+      });
+      return vendorAnswered();
+    },
+  });
+  await seedComposioGmail(database, store);
+  await database.insert(brokeredAccounts).values([
+    {
+      provider: "composio",
+      app: "gmail",
+      userId: "user_asker",
+      vendorUserId: "user_asker",
+      accountId: "ca_asker_work",
+      identity: "asker@work.example",
+      isDefault: true,
+      connectedAt: new Date("2026-10-01T09:00:00.000Z"),
+    },
+    {
+      provider: "composio",
+      app: "gmail",
+      userId: "user_asker",
+      vendorUserId: "user_asker",
+      accountId: "ca_asker_home",
+      identity: "asker@home.example",
+      connectedAt: new Date("2026-10-02T09:00:00.000Z"),
+    },
+    {
+      provider: "composio",
+      app: "gmail",
+      userId: strangerId,
+      vendorUserId: strangerId,
+      accountId: "ca_stranger",
+      identity: "stranger@work.example",
+      isDefault: true,
+    },
+  ]);
+
+  // The stranger's mailbox by name, beside the three identity keys: refused, and nothing sent.
+  await expect(
+    store.callTool({
+      ref: "gmail/GMAIL_FETCH_EMAILS",
+      args: {
+        userId: strangerId,
+        user_id: strangerId,
+        entityId: strangerId,
+        account: "stranger@work.example",
+        query: "is:unread",
+      },
+      botId: "bot_helper",
+      actorId: "user_asker",
+    }),
+  ).rejects.toBeInstanceOf(PluginRefusedError);
+  expect(reached).toEqual([]);
+
+  // The asker's own second account by name: their own id, that account's id, and the model's
+  // other arguments passed through whole, minus the account choice itself. A Gmail listing also
+  // carries the lean-listing defaults every GMAIL_FETCH_EMAILS call gets (composio-shapes.ts).
+  await store.callTool({
+    ref: "gmail/GMAIL_FETCH_EMAILS",
+    args: {
+      userId: strangerId,
+      user_id: strangerId,
+      entityId: strangerId,
+      account: "asker@home.example",
+      query: "is:unread",
+    },
+    botId: "bot_helper",
+    actorId: "user_asker",
+  });
+  expect(reached).toEqual([
+    {
+      userId: "user_asker",
+      connectedAccountId: "ca_asker_home",
+      args: {
+        userId: strangerId,
+        user_id: strangerId,
+        entityId: strangerId,
+        query: "is:unread",
+        include_payload: false,
+        verbose: false,
+        max_results: 20,
       },
     },
   ]);
@@ -5999,7 +6375,11 @@ test("a catalogue entry declaring the broker's transport is refused, not dialled
 
   expect(() =>
     accessFor(
-      { provenance: "first-party", url: "https://mcp.example.com/mcp" },
+      {
+        provenance: "first-party",
+        url: "https://mcp.example.com/mcp",
+        authScheme: null,
+      },
       brokered,
     ),
   ).toThrow(CatalogueTransportUnroutableError);
@@ -6008,13 +6388,18 @@ test("a catalogue entry declaring the broker's transport is refused, not dialled
   // per-person vendor does, so what is refused is the value and not the fixture.
   expect(
     accessFor(
-      { provenance: "first-party", url: "https://mcp.example.com/mcp" },
+      {
+        provenance: "first-party",
+        url: "https://mcp.example.com/mcp",
+        authScheme: null,
+      },
       { ...brokered, transport: undefined },
     ),
   ).toEqual({
     transport: "mcp",
     credential: "person-oauth",
     reachedAs: "person",
+    ownCredential: true,
     toolkit: null,
   });
 });
@@ -7948,6 +8333,75 @@ test("offboarding a brokered account nobody held any more withdraws nothing, and
 });
 
 /**
+ * The offboarding sweep must not touch another provider's rows.
+ *
+ * CRITERION. `retireConnectionsFor` on somebody holding a foreign-provider row revokes only the
+ * active broker's rows: the foreign row is not revoked, not deleted, and never audited as
+ * disconnected.
+ *
+ * REASON. The sweep revokes through the ACTIVE broker, so a foreign row would be a revocation
+ * requested at a vendor that would not recognise the connection, while the audit row claimed
+ * `vendorRevocationRequested` about access that was never removed — the one reading of that field
+ * that must never be written. Unreachable while `assertActivatable` refuses to boot a mixed
+ * deployment; this is what keeps the sweep correct when any flow relaxes that refusal (#783).
+ *
+ * THE FOREIGN ROW IS READ BACK, not inferred from the revoke count. An implementation that revoked
+ * it and deleted it also answers a smaller count once the sweep is otherwise correct, so only the
+ * standing row distinguishes "left alone" from "silently taken" — and the audit read beside it
+ * says the trail never claimed a withdrawal this deployment could not have performed.
+ *
+ * THE SAME APP UNDER BOTH PROVIDERS, because that is the row the delete after the sweep can reach.
+ * It deletes by app name among the apps the active broker withdrew, so a foreign row for a
+ * different app is never in that list and would pass whether or not the delete is scoped.
+ */
+test("offboarding does not revoke or audit another provider's rows", async () => {
+  const { broker, order } = brokerSpy({ revoke: async () => true });
+  const { store, auditStore } = await freshStore({ broker });
+
+  // The active provider's own row, so the sweep still retires something.
+  await database.insert(brokeredConnections).values({
+    provider: "composio",
+    app: "gmail",
+    holder: "person",
+    userId: "user_leaver",
+    vendorUserId: "user_leaver",
+  });
+  // The same app, filed under the provider this deployment does not use.
+  await database.insert(brokeredConnections).values({
+    provider: "arcade",
+    app: "gmail",
+    holder: "person",
+    userId: "user_leaver",
+    vendorUserId: "user_leaver",
+  });
+
+  expect(await store.retireConnectionsFor("user_leaver", "admin")).toEqual({
+    // One, because the arcade row is not this broker's to revoke.
+    retired: 1,
+  });
+  expect(order).toEqual(["revoke:user_leaver"]);
+
+  const standing = await database
+    .select({
+      provider: brokeredConnections.provider,
+      app: brokeredConnections.app,
+    })
+    .from(brokeredConnections)
+    .where(eq(brokeredConnections.userId, "user_leaver"));
+  expect(standing).toEqual([{ provider: "arcade", app: "gmail" }]);
+
+  const disconnected = auditStore
+    .recorded()
+    .filter((event) => event.eventType === "mcp.account_disconnected");
+  expect(disconnected.map((event) => event.targetId)).toEqual(["gmail"]);
+  expect(
+    disconnected.every(
+      (event) => event.payload.vendorRevocationRequested === true,
+    ),
+  ).toBe(true);
+});
+
+/**
  * The same false, on the other act that ends a brokered connection.
  *
  * CRITERION. `removeServer` on a brokered row whose broker answers `false` records
@@ -8235,4 +8689,8 @@ describe("a vault read that fails on a query of this deployment's own", () => {
     expect(written).not.toContain("Failed query:");
     expect(written).not.toContain(faultCredentialId ?? "<none>");
   });
+});
+
+afterAll(async () => {
+  await database.$client.close();
 });

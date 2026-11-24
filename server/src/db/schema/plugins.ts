@@ -148,6 +148,13 @@ export const mcpServers = pgTable(
      * this column writes rows without it.
      */
     ownerGrants: text("owner_grants").$type<"any" | "admin">(),
+    /**
+     * The Microsoft Entra scope a server added by URL is reached with as the signed-in person, for
+     * example `api://hr-api/.default`. Set, each call goes out with a token Entra issues for that
+     * person through the on-behalf-of exchange (`auth/entra.ts`); null, the server is reached on the
+     * one credential the deployment holds for it, as every server added by URL always was.
+     */
+    entraScope: text("entra_scope"),
     /** What the deployment last heard back from it. `null` until the first successful listing. */
     toolsRefreshedAt: timestamp("tools_refreshed_at", { withTimezone: true }),
     /** The last failure, kept so the Plugins page can say why a server has no tools. */
@@ -160,6 +167,19 @@ export const mcpServers = pgTable(
      * writes nothing here.
      */
     skippedTools: text("skipped_tools").array(),
+    /**
+     * Which reading of a vendor's listing recorded this app's tools: `LISTING_REVISION` in
+     * `plugins/plugin-store/model.ts` as of the refresh that stored them, 0 for rows stored before
+     * this column existed.
+     *
+     * What OpenBot records from a listing can change between releases while the vendor's answer
+     * does not: #1177 started recording a broker's silence as `unclassified`, where Arcade's had been
+     * recorded as `destructive`. Nothing stored tells those rows apart from an action the vendor did
+     * flag, so they are listed again instead. At each start, every app of the active broker whose
+     * revision is behind is refreshed once (`relistOutdatedBrokeredApps`), so an upgraded install
+     * records what a fresh one would, with nobody pressing Refresh tools.
+     */
+    listingRevision: integer("listing_revision").notNull().default(0),
     addedBy: text("added_by"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -264,6 +284,35 @@ export const mcpTools = pgTable(
      * an approver to click through the colour.
      */
     destructive: boolean("destructive").notNull().default(false),
+    /**
+     * A broker listed this action and said nothing about what it does: Composio gave it no
+     * read-only, destructive, create or update label, or Arcade no behaviour flag it could read.
+     *
+     * Kept apart from {@link mcpTools.destructive}, which stays the vendor's own word. That word
+     * makes a call always ask and draws "destroys things" on a Bot's page, and nobody said it here.
+     * {@link mcpTools.effect} is `write`, so chat treats it as any change. A check-in, a task's
+     * trusted read and a memory source treat it as cautiously as a destructive action (see
+     * `mightDestroy` in `plugins/catalogue.ts`). An MCP server's silence is a null `effect`
+     * instead, which its reviewed lists decide, so this stays `false` for MCP rows.
+     *
+     * `false` for rows listed before this column existed. Arcade recorded such an action as
+     * destructive then, which asks every time. Such an app is listed again at the next start, which
+     * records it here (see {@link mcpServers.listingRevision}).
+     */
+    unclassified: boolean("unclassified").notNull().default(false),
+    /**
+     * Whether the server marked this action read-only (MCP `readOnlyHint`), as it said it.
+     *
+     * Its own fact, and NOT an input to {@link mcpTools.effect}: chat goes on deciding whether to ask
+     * first exactly as it did, because a hint from a server nobody reviewed is not believed there.
+     * A check-in reads it, and only for an app the person connected with their own account, where
+     * the tool's own read-only label is what decides whether a background run may call it. See
+     * `labelledRead` in `plugins/catalogue.ts`.
+     *
+     * `false` for an action nothing said about, and for rows listed before this column existed: an
+     * app is re-read on its next refresh.
+     */
+    declaredRead: boolean("declared_read").notNull().default(false),
     /**
      * The vendor's version for this action, as the listing gave it — `20260903_00` and the like.
      *
@@ -513,6 +562,106 @@ export const brokeredConnections = pgTable(
 );
 
 /**
+ * Each account a person holds at one brokered app, when they hold more than the one.
+ *
+ * `brokered_connections` says a person has an app connected and stays one row per person per app.
+ * This table says WHICH accounts stand behind that row: two Gmail mailboxes, a work and a personal
+ * calendar. It is a record of what the broker last listed for the person, rebuilt from the vendor's
+ * own listing whenever the app's page loads (`syncBrokeredAccounts`), so a row here is never the
+ * only evidence that an account exists.
+ *
+ * `vendor_user_id` IS WHO THE ACCOUNT IS FILED UNDER AT THE BROKER, and `account_id` IS WHICH OF
+ * THEIR ACCOUNTS IT IS. Composio files every account a person holds under one user id and tells them
+ * apart by a connected account id, which a call passes to pick one. Arcade keeps one account per user
+ * id and provider, so a person's second account there is filed under a second user id of theirs
+ * (`<their id>~<suffix>`) and `account_id` is empty. A call reads both off the row it picked.
+ *
+ * `user_id` IS ALWAYS A PERSON. A Shared app's team account is one account and lives only in
+ * `brokered_connections`. No key to `users`, for the reason `brokered_connections.user_id` has none.
+ *
+ * `identity` IS WHAT THE VENDOR SAYS THE ACCOUNT IS — the mailbox address, the login — and is what a
+ * person and a model name the account by. Null where the vendor published none.
+ *
+ * `is_default` MARKS THE ACCOUNT A CALL USES WHEN IT NAMES NONE. The first one listed is the default
+ * until the person picks another; a partial unique index holds it to at most one per person per app.
+ */
+export const brokeredAccounts = pgTable(
+  "brokered_accounts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider").$type<"composio" | "arcade">().notNull(),
+    app: text("app").notNull(),
+    userId: text("user_id").notNull(),
+    vendorUserId: text("vendor_user_id").notNull(),
+    /** The vendor's id for the account, or the empty string where the user id alone names it. */
+    accountId: text("account_id").notNull().default(""),
+    identity: text("identity"),
+    isDefault: boolean("is_default").notNull().default(false),
+    /** When the vendor says the account was made, where it says. */
+    connectedAt: timestamp("connected_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check(
+      "brokered_accounts_provider_check",
+      sql`${table.provider} IN ('composio', 'arcade')`,
+    ),
+    uniqueIndex("brokered_accounts_account_idx").on(
+      table.provider,
+      table.app,
+      table.userId,
+      table.vendorUserId,
+      table.accountId,
+    ),
+    uniqueIndex("brokered_accounts_default_idx")
+      .on(table.provider, table.app, table.userId)
+      .where(sql`${table.isDefault}`),
+    index("brokered_accounts_user_idx").on(table.userId),
+  ],
+);
+
+/**
+ * The name a person's accounts are filed under at a broker, where it is not their own id.
+ *
+ * A person is filed under their own `users.id` everywhere else (see `personAccount`), and that is
+ * only safe because the id is theirs alone. The single-user actor's is not: every single-user
+ * deployment signs its one person in as `dev-local-user`, so every one of them sharing a Composio
+ * or Arcade key was one user there. One deployment's Gmail was listed and used by another, a
+ * disconnect in one ended the account for both, and a call naming no account ran in whichever of
+ * them connected last. So a single-user deployment's own name is minted once per broker,
+ * `dev-local-user:<random>`, and kept here, where every replica and every restart reads the same
+ * one. The local id is unchanged, so threads, memory and everything else stay attached to
+ * `dev-local-user`.
+ *
+ * NO ROW MEANS THE PERSON'S OWN ID, which is every signed-in person. Every single-user deployment
+ * with a broker has one, written at its first start with that broker and never replaced; the
+ * connections it had recorded under `dev-local-user` are retired then, here and not at the broker,
+ * and connected again under the new name. See `ensureSingleUserIdentity` in
+ * `plugins/single-user-identity.ts`, the only writer.
+ *
+ * NO KEY TO `users`, for the reason `brokered_connections.user_id` has none: the name has to
+ * outlive the person for as long as accounts filed under it might need ending.
+ */
+export const brokeredIdentities = pgTable(
+  "brokered_identities",
+  {
+    provider: text("provider").$type<"composio" | "arcade">().notNull(),
+    userId: text("user_id").notNull(),
+    vendorUserId: text("vendor_user_id").notNull(),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.provider, table.userId] }),
+    check(
+      "brokered_identities_provider_check",
+      sql`${table.provider} IN ('composio', 'arcade')`,
+    ),
+  ],
+);
+
+/**
  * One in-flight Arcade authorization: what the returning browser is verified against.
  *
  * `actor_id` IS THE SIGNED-IN PERSON'S `users.id` — the session subject — AND NEVER
@@ -569,7 +718,13 @@ export const pendingAuthorizations = pgTable(
     serverId: text("server_id")
       .notNull()
       .references(() => mcpServers.id, { onDelete: "cascade" }),
-    action: text("action").notNull(),
+    /**
+     * The one action Authorize was pressed for, or `null` for Connect, which asks the broker for
+     * everything the app's actions need. Null rather than the app's own name, because the verifier
+     * lands the person on `?action=` and the trail files it as `action`, and an app's name there
+     * read as an action that was just authorized.
+     */
+    action: text("action"),
     /**
      * Whose account this attempt is for, with the same meaning and the same two values as
      * {@link brokeredConnections.holder} — and held by the same CHECK, because `$type<>` is erased

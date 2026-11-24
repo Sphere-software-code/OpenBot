@@ -7,17 +7,50 @@ the same way any other message from that Bot does.
 
 ## Creating one
 
-There is no form for this. Ask a Bot, in a channel: "every weekday at 9, post the standup notes
-here." Turning a sentence into a five-field cron expression and a channel is conversational work, and
-that is what the conversation is for. The same Bot can list what is standing, change one, or delete
-one, all by being asked.
+Two ways, and they write through the same store call.
 
-**The prerequisite:** a Bot can only do this once an administrator has granted it to. Routines is a
-catalogue entry like any other — `create_routine`, `update_routine` and `delete_routine` are its write
-tools — and enabling the entry does not hand any Bot access to it. Each tool is granted per Bot at
-`/admin/plugins/routines`, exactly as a Google Drive or Notion tool would be. An administrator decides
-which Bots may schedule future work at all, before deciding what that work is; a Bot with none of the
-three tools can still be asked and will say it cannot.
+- **Routines in the sidebar.** The Routines page lists every routine you have, across all your Bots,
+  and **New routine** opens a form: the Bot, what it should do, when (every day, every weekday, one
+  day a week, one day a month, or every hour, at a time on your clock), and the conversation it posts
+  in, or a new one named after it. A Bot's own Routines page and the clock beside a conversation's
+  message box open the same form with that Bot, and that conversation, already chosen. The form
+  sends `POST /api/routines`, which calls `routineStore.create` exactly as `create_routine` does.
+- **Ask a Bot**, in a conversation: "every weekday at 9, post the standup notes here." Anything the
+  form's schedules do not cover ("every other Tuesday") goes this way. The same Bot can list what is
+  standing, change one, or delete one, all by being asked. There is no edit form.
+
+Connections > Routines points to the Routines page, and the New Bot form shows an example beside
+Routines under "Apps it can use".
+
+**Always on.** Every Bot can do this, in every edition. The server adds Routines at startup and gives
+every Bot all of its tools, including the write tools `create_routine`, `update_routine` and
+`delete_routine`. A Bot made later gets them the first time it runs. Routines can't be turned off, and
+its tools can't be taken from a Bot: the server answers `403`. A Bot still asks before each write
+while Extra vigilant is on, and `delete_routine` asks as any delete does, unless the person allowed
+it for the conversation or always (see [Approvals](approvals.md)). See `server/src/plugins/personal-defaults.ts`.
+
+**Goals too.** The same app carries a goal's tools for a conversation: `create_goal`, `list_goals`,
+`update_goal`, `run_goal`, `pause_goal`, `resume_goal` and `complete_goal`, beside the trigger tools
+that wake a goal. Asked for a goal, a Bot makes one that reports into the conversation it was asked
+in, or into another the person names, and it shows on the Bot's Goals page. A goal has no schedule of
+its own: it runs when asked, or when an event wakes it. A goal's own run is not given these copies,
+because it already holds the goal's own tools. See `server/src/responsibilities/chat-tools.ts`.
+
+A goal that repeats is never completed by one of its runs. It repeats when it was made `recurring`,
+when an enabled routine of its Bot runs it, or when an event wakes it. Its run is told so, records
+its result with `report_goal_progress`, and is refused `complete_goal`; only the person ends it.
+Asked to run a completed or paused goal, `run_goal` says so instead of running nothing. See
+`GoalRepeats` in `server/src/responsibilities/types.ts`.
+
+A routine records the goal it runs (`routines.goal_id`): the `goalId` a Bot passes to
+`create_routine` or `update_routine`, else the goal whose id its instruction names, else the goal
+its firing first runs with `run_goal`. Never a goal its instruction only mentions. A routine made
+before 0.3.3 (`goal_by_title`) is read from its instruction, by the goal's id or its whole title in
+quotes. See `routineRunsGoal`.
+
+Its tools are OpenBot's own code, so the server brings the saved list up to date with the running
+release at every start, before it gives them out: a tool a release renames, rewords or adds reaches an
+existing installation without anybody pressing Refresh. A start where nothing changed writes nothing.
 
 The routine belongs to whoever asked for it and runs as them. See
 [Who a routine runs as](#who-a-routine-runs-as).
@@ -88,12 +121,15 @@ Two settings carry this:
   about where the worker process runs rather than a fact about the deployment, so it is read from the
   environment directly rather than from the rest of the deployment's configuration.
 
-On Kubernetes, `routines.enabled` turns on a CronJob running `fire-routines.ts` on `routines.schedule`,
-the same way the computer culler is a CronJob rather than a timer inside the API — a timer fires in
+On Kubernetes, the chart runs a CronJob of `fire-routines.ts` on `routines.schedule`, on by default
+(`routines.enabled`), and generates the shared secret for it and the API server unless one is
+supplied (see [the chart's routines sweep](../charts/openbot/README.md#the-routines-sweep)). It is a
+CronJob the same way the computer culler is a CronJob rather than a timer inside the API: a timer fires in
 every replica, and a CronJob's single run does the whole sweep once. On a laptop, `scripts/start.sh`
 starts a worker process that runs that same sweep in a loop instead of once and exiting, so the two
 shapes are the same code doing the same thing on two different clocks, not two implementations to keep
-in sync.
+in sync. OpenBot Desktop runs the same loop as the `worker` Compose service, from the server image,
+behind the `openbot` profile in `docker-compose.yml`.
 
 ## Who a routine runs as
 

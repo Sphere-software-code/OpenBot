@@ -1,6 +1,9 @@
 import { cutAtCodeUnits } from "../channels/text";
+import { appsPage, itsAppPage } from "../edition";
 import { BrokerAccountGoneError, brokerSentence, flagOf } from "./broker";
+import { type ActionShape, shapeOf } from "./composio-shapes";
 import { type ListedTool, MAX_RESULT_CHARS, type McpCallResult } from "./mcp";
+import { fitJsonResult } from "./result-fit";
 
 /**
  * The Composio transport: an app somebody enabled, reached as the person asking.
@@ -298,16 +301,18 @@ export function toolkitOf(url: string): string | null {
 /**
  * What an action does, from the labels Composio publishes with it.
  *
- * SIX LABELS, AND ONLY TWO DECIDE ANYTHING. `readOnlyHint` is the one thing that can produce a read.
- * `destructiveHint` produces a destructive write. `createHint` and `updateHint` are writes, which is
- * also what an unlabelled action is, so reading them buys nothing over the default. `idempotentHint`
- * and `openWorldHint` say nothing about effect — DELETE is idempotent, so treating idempotence as
- * safety would wave through exactly the calls worth asking about.
+ * SIX LABELS, AND ONLY TWO DECIDE THE EFFECT. `readOnlyHint` is the one thing that can produce a
+ * read. `destructiveHint` produces a destructive write. `createHint` and `updateHint` are plain
+ * writes. `idempotentHint` and `openWorldHint` say nothing about effect: DELETE is idempotent, so
+ * treating idempotence as safety would wave through exactly the calls worth asking about.
  *
- * ANYTHING UNLABELLED IS A WRITE. Measured across Gmail, Linear, Calendar, Notion and Slack, every
- * action carried at least one label, so this is a guard against the future rather than the present: an
- * app that labels nothing, or a label added later that this code has never heard of, must land on
- * write. The opposite default would silently classify new actions as safe.
+ * ANYTHING UNLABELLED IS AN UNCLASSIFIED WRITE. Measured across Gmail, Linear, Calendar, Notion and
+ * Slack, every action carried at least one label, so this is a guard against the future rather than
+ * the present: an app that labels nothing, or a label added later that this code has never heard
+ * of, must land on write. The opposite default would silently classify new actions as safe. It is
+ * `unclassified` and not `destructive`, exactly as Arcade's action with no flags is (`classify` in
+ * `./arcade`): it doesn't always ask, and every background reader treats it as cautiously as a
+ * destructive one.
  *
  * DESTRUCTIVE WINS OVER READ-ONLY. Both at once is somebody else's bug, and the strict reading is the
  * only safe one.
@@ -315,6 +320,8 @@ export function toolkitOf(url: string): string | null {
 export function effectOf(tags: readonly string[] | undefined): {
   effect: "read" | "write";
   destructive: boolean;
+  /** Composio labelled nothing about what the action does. */
+  unclassified?: true;
 } {
   /*
    * AND THE LABEL IS THE WORD, WHICH IS THE SAME READ THE SLUG AND THE VERSION BESIDE IT ALREADY
@@ -333,7 +340,9 @@ export function effectOf(tags: readonly string[] | undefined): {
   if (labels.has("destructiveHint"))
     return { effect: "write", destructive: true };
   if (labels.has("readOnlyHint")) return { effect: "read", destructive: false };
-  return { effect: "write", destructive: false };
+  if (labels.has("createHint") || labels.has("updateHint"))
+    return { effect: "write", destructive: false };
+  return { effect: "write", destructive: false, unclassified: true };
 }
 
 /**
@@ -788,7 +797,7 @@ export async function listTools(connection: {
   const toolkit = toolkitOf(connection.url);
   if (!toolkit) {
     throw new Error(
-      `${connection.url} does not name a Composio app, so nothing was asked what it offers. A row reached through this transport is one whose provenance says composio, and its url has to be composio:// followed by an app slug; correct the url on the Plugins page.`,
+      `${connection.url} does not name a Composio app, so nothing was asked what it offers. A row reached through this transport is one whose provenance says composio, and its url has to be composio:// followed by an app slug; correct the url on the ${appsPage()} page.`,
     );
   }
   if (!installed) {
@@ -1221,7 +1230,7 @@ export async function listTools(connection: {
   }
 
   return offered.map((action) => {
-    const { effect, destructive } = effectOf(action.tags);
+    const { effect, destructive, unclassified } = effectOf(action.tags);
     /*
      * TRIMMED HERE BECAUSE IT IS TRIMMED AT THE OTHER END. {@link callTool} trims the recorded
      * version and refuses an empty one, so a whitespace-only string that counted as a version
@@ -1271,6 +1280,7 @@ export async function listTools(connection: {
       inputSchema: action.inputParameters ?? {},
       effect,
       destructive,
+      ...(unclassified ? { unclassified } : {}),
       ...(version ? { version } : {}),
     };
   });
@@ -1529,9 +1539,10 @@ function listingSentence(toolkit: string, error: unknown): string {
 }
 
 /**
- * The cap every string this module puts in front of a model goes through.
+ * The cap a failure's sentence goes through. A result goes through `fitJsonResult` in
+ * `./result-fit` instead, which keeps a list's records whole and says how to read the rest.
  *
- * Its own function because BOTH ANSWERS NEED IT, and only one of them used to get it. A refusal lands
+ * Its own function because BOTH ANSWERS NEED A CAP, and only one of them used to get it. A refusal lands
  * in a model's context exactly as a result does, and a vendor's sentence is no shorter for being a
  * failure — so {@link failure} capping nothing and reporting `truncated: false` was the silent
  * truncation's mirror image: unbounded text, plus a field stating that nothing had been cut.
@@ -1615,14 +1626,29 @@ const NOTHING = new Set(["", "null", "{}"]);
  *
  * The same cap the MCP transport applies and for the same reason: a tool result goes straight into a
  * model's context, so an unbounded one is somebody else's server deciding how much of our context
- * window to spend. Truncated visibly, never silently. An empty answer is stated in words rather than
+ * window to spend. Truncated visibly, never silently, and with the way to the rest: a list is cut
+ * between its records and the note names the call that fetches the others. An empty answer is
+ * stated in words rather than
  * returned empty — an empty string reads as "the action had nothing to say" rather than "there is
  * nothing there", and a model closes that gap from memory.
  *
  * CAN THROW, and is called from outside the vendor's `try` for that reason. See {@link callTool}.
  */
-function resultOf(data: ComposioResult["data"] | undefined): McpCallResult {
-  const text: string | undefined = JSON.stringify(data ?? null, null, 2);
+function resultOf(
+  data: ComposioResult["data"] | undefined,
+  toolName: string,
+  shape: ActionShape | null,
+): McpCallResult {
+  /*
+   * AN ACTION OPENBOT ASKS FOR IN ITS OWN WAY IS READ IN ITS OWN WAY TOO: a Gmail listing loses the
+   * raw MIME it was asked not to carry, and keeps its messages whole when it is cut. See
+   * `./composio-shapes`.
+   */
+  const shown =
+    shape && data && typeof data === "object" && !Array.isArray(data)
+      ? shape.answer(data)
+      : data;
+  const text: string | undefined = JSON.stringify(shown ?? null, null, 2);
   /*
    * `JSON.stringify` ANSWERS `undefined` RATHER THAN THROWING for a value with no JSON form — a
    * function, a symbol — and this field is the vendor's while the type saying it is a record is
@@ -1643,7 +1669,10 @@ function resultOf(data: ComposioResult["data"] | undefined): McpCallResult {
       truncated: false,
     };
   }
-  return { ...cap(text), isError: false };
+  return {
+    ...fitJsonResult(shown, text, toolName, shape?.list),
+    isError: false,
+  };
 }
 
 /**
@@ -1880,6 +1909,7 @@ export async function askAction(
   }
 
   const { [VERSION_ARG]: rawVersion, ...rest } = args;
+  const shape = shapeOf(toolName);
   const version = typeof rawVersion === "string" ? rawVersion.trim() : "";
   if (!version) {
     /*
@@ -1897,7 +1927,7 @@ export async function askAction(
      * condition under which it helps, which is the part nobody in this deployment controls.
      */
     return unreached(
-      `${toolName} has no recorded version, so it cannot be called: Composio requires a specific one and rejects "latest", so there is nothing to fall back on. Refreshing this app's tools on its Plugins page recovers it only if Composio publishes a version for this action. Where Composio publishes none, no refresh will make it callable.`,
+      `${toolName} has no recorded version, so it cannot be called: Composio requires a specific one and rejects "latest", so there is nothing to fall back on. Refreshing this app's tools on ${itsAppPage()} recovers it only if Composio publishes a version for this action. Where Composio publishes none, no refresh will make it callable.`,
     );
   }
 
@@ -1955,7 +1985,7 @@ export async function askAction(
          */
         ...(account === null ? {} : { connectedAccountId: account }),
       },
-      rest,
+      shape?.request ? shape.request(rest) : rest,
     );
   } catch (error) {
     /*
@@ -2077,7 +2107,10 @@ export async function askAction(
 
   try {
     // The action ran and Composio answered, which is the plainest `answered` there is.
-    return { result: resultOf(answer.data), answered: true };
+    return {
+      result: resultOf(answer.data, toolName, shape),
+      answered: true,
+    };
   } catch (error) {
     /*
      * THE LAST PATH THAT REACHED A MODEL WITHOUT PASSING THE DOOR. This quoted a raw `error.message`

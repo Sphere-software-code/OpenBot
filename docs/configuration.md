@@ -29,11 +29,28 @@ All five above stop server startup if missing. The three `INTELLIGENCE_` values 
 checked as a set, so a partial set is refused as a misconfiguration rather than treated as
 unconfigured.
 
-`COPILOTKIT_LICENSE_TOKEN` is optional: managed Intelligence issues no licence token, and a
+The browser opens the Intelligence gateway's socket itself, at the address the server gives it. Where
+the server reaches the gateway somewhere a browser cannot, two variables cover it.
+`INTELLIGENCE_BROWSER_GATEWAY_WS_URL` names a second address for the same gateway (OpenBot Desktop's
+container uses it). `INTELLIGENCE_GATEWAY_PROXY=on` has the server carry the socket itself, at
+`/api/intelligence/client` on its own address, for an Intelligence nobody outside the cluster can
+reach: the Helm chart sets it for the Intelligence it installs, so one port-forward or one Ingress
+host is enough. The socket needs a signed-in session, and the gateway still checks the join token on
+it. Set one of the two, not both; `off` or unset is neither, and any other value of
+`INTELLIGENCE_GATEWAY_PROXY` refuses to start. With the proxy on and no
+`OPENBOT_PUBLIC_URL`, the page is told the socket as a path and resolves it against itself. The
+OpenBot Recorder is not on the page, so its capture pass names the socket on the address the
+Recorder reached OpenBot at, and only where that is this machine's loopback, as over
+`kubectl port-forward`. A Recorder that reaches OpenBot any other way needs `OPENBOT_PUBLIC_URL`.
+
+`COPILOTKIT_LICENSE_TOKEN` is optional: managed Intelligence issues no license token, and a
 self-hosted Intelligence that has one sets this and has it forwarded to the runtime. That
-Intelligence needs the same licence on its own deployment as well, or it refuses memory and the
-other licensed features while conversations carry on. OpenBot asks Intelligence once at boot and
-logs `intelligence-entitlement-not-ready`, naming the fix, when the answer is not ready.
+Intelligence needs the same license on its own deployment as well, or it refuses memory and the
+other licensed features while conversations carry on. OpenBot asks Intelligence at boot and logs
+`intelligence-entitlement-not-ready`, naming the fix, when the answer is not ready. An
+Intelligence still starting, as one installed beside OpenBot is while its migrations run, is asked
+again for up to ten minutes, with one `intelligence-entitlement-waiting` line; only one still not
+answering then is logged as `intelligence-entitlement-unreadable`. A refused key is logged at once.
 
 `MANAGED_AGENT_AG_UI_URL` names the Bot in the box: the default endpoint for coworkers created in
 the product. It needs `MANAGED_AGENT_TOKEN` beside it, or the server refuses to start. Unset, the
@@ -48,47 +65,60 @@ at `agent-langgraph` on a laptop.
 | Variable             | Default                            | Meaning                                                             |
 | -------------------- | ---------------------------------- | ------------------------------------------------------------------- |
 | `PORT`               | `3001`                             | API server port. `SERVER_PORT` names the same port; set either, or both to the same value, or the server refuses to start. |
-| `NODE_ENV`           | unset                              | `production` refuses the example `KEY_ENCRYPTION_KEY`. It does not decide whether sign-in is required; see `OPENBOT_SINGLE_USER`. |
+| `OPENBOT_EDITION`    | `team`                             | `personal` runs OpenBot for one person with no sign-in, one computer and no Admin. See [personal-edition.md](personal-edition.md). Any value other than `team` or `personal` refuses to start. `personal` also refuses to start with a sign-in provider or `OPENBOT_ORGANIZATION_AUTH_URL` configured, without `OPENBOT_SINGLE_USER=true`, or without one shared computer (`AGENT_COMPUTER_URL`, with no `COMPUTER_SUPERVISOR_URL` or `COMPUTER_SANDBOX_NAMESPACE`). |
+| `NODE_ENV`           | unset                              | `production` refuses the example `KEY_ENCRYPTION_KEY` and `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS=true`. It does not decide whether sign-in is required; see `OPENBOT_SINGLE_USER`. |
 | `TENANT_PACKAGE_DIR` | `../examples/fintech`              | Tenant package directory, resolved from `server/`.                  |
 | `DEPLOYMENT_ID`      | the tenant package's id            | Names this deployment inside a shared Intelligence project, and prefixes the identity a Shared app's account is held under at the vendor. That identity is fixed when the app is made Shared, so changing this later does not move it. |
 | `OPENAI_API_KEY`     | unset                              | Default model key for built-in agents and both shipped Bots.        |
 | `OPENAI_BASE_URL`    | unset                              | OpenAI-compatible endpoint that key is spent against. See below.    |
-| `BOT_PROVIDER`       | `openai`                           | Provider the framework Bot (`agent-langgraph`) and the picked harness run on: `openai`, `anthropic`, or `google`. The Python Bots read it too; `agent-bot` does not, it is OpenAI only. |
+| `COPILOTKIT_OPENAI_API` | unset                          | Which OpenAI API the built-in Bots call behind an `OPENAI_BASE_URL` that is not OpenAI or Azure: `responses` or `chat`. Unset, the model decides. See [OpenAI-compatible endpoints](#openai-compatible-endpoints). |
+| `ROUTER_MODEL`       | `claude-haiku-5-5` / `gpt-6-luna`  | Model that picks which Bot an untagged message from the home page goes to. It runs while the person waits, so it defaults to a light model on the deployment's provider and falls back to the Bots' model when that one is refused. Behind `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` it defaults to the Bots' model, since the endpoint's catalogue is unknown. |
+| `BOT_PROVIDER`       | `openai`                           | Provider the framework Bot (`agent-langgraph`) and the picked harness run on: `openai`, `anthropic`, or `google`. The Python Bots read it too; `agent-bot` does not, it is OpenAI only. The API server reads it for the built-in Bots as well: `anthropic`, `openai` or an empty value (read as `openai`) moves them off the tenant package's `model.yaml` provider, and `google` or an absent variable leaves them on it. |
 | `ANTHROPIC_API_KEY`  | unset                              | Anthropic key when `BOT_PROVIDER=anthropic`.                        |
 | `ANTHROPIC_BASE_URL` | unset                              | Anthropic-compatible endpoint that key is spent against.            |
 | `GOOGLE_API_KEY`     | unset                              | Google key when `BOT_PROVIDER=google`.                              |
 | `GOOGLE_GENERATIVE_AI_BASE_URL` | unset                   | Google-compatible endpoint that key is spent against.               |
-| `BOT_MODEL`          | the Bot's row in the spec file   | Model for whichever Bot is starting. Unset, it comes from that Bot's row in [the provider spec file](#the-provider-spec-file); the provider fallbacks are `gpt-5.5`, `claude-sonnet-4-5`, and `gemini-2.5-flash`. |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `CHATGPT_AUTH_FILE` | unset    | A model plan sign-in in place of a key: the Anthropic token from `claude setup-token`, or the file a signed-in ChatGPT plan writes. Set one, not both. The built-in Bots then run on the plan through the installed harness that holds it (`agent-claude-sdk` for Claude, `agent-langgraph-agui` for ChatGPT), named by `PICKED_HARNESS_IMAGE` and `PICKED_HARNESS_URL`, with `MANAGED_AGENT_TOKEN`. The server refuses to start with both set, or with either set and that harness missing. OpenBot Desktop writes these itself; see below. |
+| `BOT_MODEL`          | the Bot's row in the spec file   | Model for whichever Bot is starting. Unset, it comes from that Bot's row in [the provider spec file](#the-provider-spec-file); the provider fallbacks are `gpt-5.5`, `claude-sonnet-5-5`, and `gemini-2.5-flash`. Set, it is the default for built-in Bots and the picked harness while the credential lists it; a person can still pick another in the composer. Unset, the [model list](#the-model-list) chooses the default. |
+| `CHATGPT_CODEX_CLIENT_VERSION` | `0.167.0` | The Codex client version the LangGraph harness names when it reads a ChatGPT plan's model list. Change it only if the plan's list comes back empty after a Codex release. |
+| `OPENBOT_MODEL_CAPABILITIES_URL` | `https://models.dev/api.json` | Where the model list reads each model's thinking levels, line and price when the provider's own listing does not say. `off` reads none: providers that publish their own (Anthropic, xAI, a ChatGPT plan) still show thinking levels, and the default falls back to the configured model. See [The model list](#the-model-list). |
 | `AGENT_BOT_MODEL`    | `gpt-5.5`                          | Model for the proof-of-concept Bot (`agent-bot`), kept separate because it speaks `/v1/chat/completions` directly and refuses a model it cannot use. |
 | `BOT_RESPONSES_API`  | `false`                            | Makes `agent-langgraph` use the OpenAI Responses API.               |
 | `BOT_REASONING_EFFORT` | unset (provider default)         | OpenAI and the Responses API only: one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `agent-langgraph` refuses to start on any other value, on a non-`openai` provider, or without the Responses API. |
-| `AGENT_STALL_TIMEOUT_MS` | unset (off)                    | How long a Bot's stream may produce nothing before the turn is ended for it. |
+| `AGENT_STALL_TIMEOUT_MS` | unset (off)                    | How long a Bot's stream may produce nothing before the turn is ended for it, in milliseconds. A value that is not a whole number of zero or more refuses to start. |
 | `AGENT_TOOL_TOKEN`   | unset; `start.sh` generates one    | The secret a framework Bot presents when it calls a granted tool back through this server. |
+| `OPENBOT_TOOL_URL`   | `http://127.0.0.1:3001/api/agent-tools/call`; Compose passes `http://host.docker.internal:3001/api/agent-tools/call` | Read by the framework Bots (`agent-langgraph` and the Python LangGraph harness): where they call a granted tool back through this server. Set it when the server is not on that address, as when it runs in a container or on another port. |
 | `APP_DIST_DIR`       | unset                              | Where the built app is, when this process serves it. Set inside the container image; unset in development, where Vite serves the app. |
-| `AUDIT_RETENTION_DAYS` | unset                            | Whole number of days to keep audit rows; older ones are removed. Unset keeps the trail forever. |
-| `WORKER_SHARED_SECRET` | unset; `start.sh` uses a fixed local default | The secret the routines worker presents to fire a due routine. Without it the server refuses every handoff, whether or not a worker exists to send one. |
+| `AUDIT_RETENTION_DAYS` | unset                            | Whole number of days to keep audit rows, at least `1`; older ones are removed. Unset keeps the trail forever. Any other value refuses to start. |
+| `WORKER_SHARED_SECRET` | unset; `start.sh` uses a fixed local default; the Helm chart generates one | The secret the routines worker presents to fire a due routine. Without it the server refuses every handoff, whether or not a worker exists to send one. |
 | `OPENBOT_GENERATIVE_UI` | unset (capability on)               | Set `false` or `0` to stop Bots from answering with generated interfaces. |
 | `OPENBOT_SELF_HOST_BANNER` | unset (banner on)               | Set `false` or `0` to hide the bar offering help self-hosting OpenBot, for everybody. It never shows on a paid Intelligence plan, and each person can also close it for themselves. |
 | `OPENBOT_ACCESSIBILITY_DISABLED` | unset | `true` or `1` stops naming OpenBot on the analytics the runtime already sends. |
-| `COMPOSIO_API_KEY`   | unset                              | One key for the whole deployment, for the broker that holds people's accounts for a few hundred apps. Unset, there is nothing to connect, nothing to grant and no Composio tool for a Bot to call; what remains is one row that goes nowhere, under **More apps** on the admin Plugins page, naming this variable. See [Composio](plugins/composio.md). |
+| `OPENBOT_PRODUCT_TELEMETRY` | unset (off; on for OpenBot Desktop) | `1` or `true` sends OpenBot's product usage events; `0` turns them off. `DO_NOT_TRACK` or `COPILOTKIT_TELEMETRY_DISABLED` set to `1` or `true` turns them off whatever this says. See [TELEMETRY.md](TELEMETRY.md). |
+| `COMPOSIO_API_KEY`   | provisioned during desktop sign-in or local setup when no broker is configured | One project key for the whole deployment. Desktop sign-in saves a provisioned key in native protected storage and supplies it on Start/restart. A key in `.env` or the environment always wins and is never moved. `start.sh` / `bun run setup:composio` uses the existing CLI login; supplied keys and Arcade are preserved. Direct server/container launches still need the prepared key. See [Composio](plugins/composio.md). |
+| `COMPOSIO_<SLUG>_CLIENT_ID`, `COMPOSIO_<SLUG>_CLIENT_SECRET` | unset | This deployment's own OAuth client for one Composio app that connects with a server-to-server grant (`S2S_OAUTH2`), such as `COMPOSIO_SHOPIFY_CLIENT_ID`. Both or neither. Set, the app can be enabled and connected as one shared account; unset, it stays hidden. Read only when the app is enabled; see [rotating the client](#rotating-a-composio-apps-own-client). See [Composio](plugins/composio.md#the-56-that-are-not-offered). |
+| `OPENBOT_INSTALLATION_ID` | a fresh private UUID in `.env.openbot-installation-id` | Stable Composio provisioning identity, persisted before a request. Optional explicit UUID for first setup; later values must match the saved file. Retain it for retries and restarts, and generate a fresh identity for a new installation. It never falls back to `DEPLOYMENT_ID`. |
+| `ARCADE_API_KEY`     | unset                              | The Arcade project key, for a deployment that brokers apps through Arcade instead of Composio. See [Arcade](plugins/arcade.md). |
+| `OPENBOT_BROKER_PROVIDER` | unset (chosen by which key is set) | `composio` or `arcade`: which broker is live when both `COMPOSIO_API_KEY` and `ARCADE_API_KEY` are set. Any other value refuses to start, and so does naming a provider whose key is unset, or setting both keys with this unset. See [Choosing the provider](plugins/arcade.md#choosing-the-provider). |
 
 **`OPENBOT_GENERATIVE_UI`** enables generated interfaces by default: streamed HTML/CSS/JavaScript
 in a sandboxed iframe, and A2UI 1.0 interfaces built from CopilotKit's standard catalog (every
-standard component except Map, Favicon, LinkCard and Citation). Their buttons send their named action
-and the values entered back to the current conversation's Bot.
+standard component except Map, Favicon, LinkCard and Citation), plus OpenBot's own Breakdown:
+editable amounts that add up to a total, each in its own color, with a bar of how the total splits.
+Their buttons send their named action and the values entered back to the current conversation's Bot.
 Set `OPENBOT_GENERATIVE_UI=false` or `0` to disable both. `true`, `1`, an empty value, or an unset
 value leave the capability on. The server configures both runtime renderers and reports the same
 setting through `/api/capabilities` to the browser.
 
 **`OPENBOT_SELF_HOST_BANNER`** shows a slim bar at the top of the signed-in app offering
-CopilotKit's help self-hosting OpenBot, linking to `https://copilotkit.ai/talk-to-an-engineer` with
-`ref=openbot_app`. Closing it is saved to that person's preferences, so it stays closed on every
-device they sign in from. Set `false` or `0` to hide it for everybody, which suits a fork running
+CopilotKit's help self-hosting OpenBot, linking to the OpenBot for Business page,
+`https://open.bot/business`, where a call can be booked. Closing it is saved to that person's
+preferences, so it stays closed on every device they sign in from. Set `false` or `0` to hide it for everybody, which suits a fork running
 OpenBot for its own organization. Any other value, or none, leaves it on.
 
 Left on, it still never shows on a deployment that pays for Intelligence. The server reads the
 deployment's Intelligence entitlement and hides the bar when it is active on a paid plan (`pro`,
-`team`, `team_self_hosted` or `enterprise`) or comes from an AWS Marketplace licence. A free or
+`team`, `team_self_hosted` or `enterprise`) or comes from an AWS Marketplace license. A free or
 developer plan, an inactive entitlement, and one that cannot be read all show it. The answer is
 kept for ten minutes, so a plan bought today hides the bar within ten minutes, and a page waits at
 most a second for the first answer after the server starts. In Helm, set the variable through
@@ -141,13 +171,40 @@ else the caller says, so a well-known value from a public repository gates nothi
 `AGENT_TOOL_TOKEN` is generated fresh and written to `.env` precisely because it is not that: it is
 copied into every Bot container, and a framework Bot holding it may be running on a machine of its
 own, so a fixed default there would be no boundary at all. Production deployments must set a real
-`WORKER_SHARED_SECRET`.
+`WORKER_SHARED_SECRET`; the Helm chart generates one and gives it to both the server and its routines
+CronJob, unless one is supplied (see
+[the chart's routines sweep](../charts/openbot/README.md#the-routines-sweep)).
 
 **`SERVER_INTERNAL_URL`** is read by the worker, not by the API server, so it is not in the table
 above: it says where the worker's own process can reach this deployment's API, which is a fact about
 where the worker runs rather than a fact about the deployment `loadConfig` describes. `start.sh` points
 it at the server's own port on a laptop; the Helm chart's routines CronJob points it at the server's
-in-cluster Service address.
+in-cluster Service address. The worker refuses to start without it, or with a value that is not an
+`http(s)` URL, and also needs `DATABASE_URL`.
+
+### Rotating a Composio app's own client
+
+`COMPOSIO_<SLUG>_CLIENT_ID` and `COMPOSIO_<SLUG>_CLIENT_SECRET` are read when an administrator
+enables the app. Enabling creates an authorization config at Composio named after the app with
+`(OpenBot)` at the end, such as `Shopify (OpenBot)`, and saves the client on it. Composio then uses
+that saved client for every token. While that config stands, enabling never replaces it, so changing
+either variable later and restarting changes nothing at Composio.
+
+To rotate the secret, do one of these:
+
+- **Update the config at Composio.** In the Composio dashboard, under Auth Configs, open the
+  `(OpenBot)` config for the app and replace the client secret. The shared account, its grants and
+  every Bot that uses it stay as they are. Set the new value in the environment as well, so a config
+  created later carries it.
+- **Turn the app off and on again.** Set the new values, restart, then on the app's Plugins page
+  turn **Enable for this deployment** off and back on. Turning it off deletes the config at Composio
+  and ends the shared account and every Bot's grant on the app. Turning it on creates a new config
+  with the new client. Then make the app shared, connect the team account and grant it to Bots again.
+
+An app on its own client connects only as one shared account. Because the credential is this
+deployment's client, a personal account would give anyone who can see the app its full access, so
+**Connect** refuses one and the screens don't offer it. Make the app shared on its Plugins page, and
+an administrator connects it there.
 
 ## The provider spec file
 
@@ -191,7 +248,7 @@ when nobody chose a model. API keys never appear in the file: they arrive in the
 under the `key_variable` the provider row names.
 
 Adding a Bot in any language is adding one `bots` entry — `"agent-java": { "provider":
-"anthropic", "model": "claude-sonnet-4-5" }` — after which that Bot resolves its model the same
+"anthropic", "model": "claude-sonnet-5-5" }` — after which that Bot resolves its model the same
 way everything else does. A row that names a provider no `providers` entry exists for, or leaves a
 field empty, stops every Bot at startup with the path of the key that is wrong, rather than at the
 first model call.
@@ -213,7 +270,7 @@ has never read `BOT_PROVIDER`, and `bots.agent-bot` supplies only its model.
 
 It moves the whole deployment rather than one Bot. The API server reads it for package built-in agents, `agent-bot` reads it for the client it constructs, and `agent-langgraph` reads it for `BOT_PROVIDER=openai`.
 
-`OPENAI_CONTAINER_BASE_URL` overrides that value inside the Bot containers only, for an endpoint the containers reach by a different route than the host does. Unset, the containers use `OPENAI_BASE_URL` like everything else.
+`OPENAI_CONTAINER_BASE_URL` overrides that value inside Compose's containers only (the Bots, and the `server` service when OpenBot itself runs in Compose), for an endpoint the containers reach by a different route than the host does. Unset, the containers use `OPENAI_BASE_URL` like everything else. Compose's `server` service takes `INTELLIGENCE_CONTAINER_API_URL` and `INTELLIGENCE_CONTAINER_GATEWAY_WS_URL` the same way, in place of `INTELLIGENCE_API_URL` and `INTELLIGENCE_GATEWAY_WS_URL`; the browser is still given `INTELLIGENCE_GATEWAY_WS_URL`.
 
 The other two providers work the same way under their own names, because they are different APIs rather than different URLs for this one: `ANTHROPIC_BASE_URL` and `GOOGLE_GENERATIVE_AI_BASE_URL`. All three are the names the API server already reads, so one line moves the built-in agents and the Bots together and a deployment cannot end up with half of itself pointed somewhere else.
 
@@ -240,7 +297,27 @@ Most gateways publish a model list, which is the way to check a name before conf
 
 Two things are worth knowing before pointing a deployment at any gateway. Not every catalogue entry accepts tools, and a Bot without tool calling cannot drive its computer; the model list says which do. And `BOT_RESPONSES_API=true` needs an endpoint that implements the Responses API, not only chat completions.
 
-The built-in Bots call a gateway's Chat Completions API (`/chat/completions`), which every OpenAI-compatible endpoint serves, unless their model takes tools only through the Responses API: `gpt-5.6` and later, the `-pro` models and `gpt-5.3-codex`, under a gateway's `openai/` name too. For those they call `/responses`, which a gateway or a proxy in front of OpenAI also serves. `COPILOTKIT_OPENAI_API=responses` or `chat` picks one API for every model instead.
+The built-in Bots call a gateway's Chat Completions API (`/chat/completions`), which every OpenAI-compatible endpoint serves, unless their model takes tools only through the Responses API: `gpt-5.6` and later, the `-pro` models and `gpt-5.3-codex`, under a gateway's `openai/` name too. For those they call `/responses`, which a gateway or a proxy in front of OpenAI also serves. `COPILOTKIT_OPENAI_API=responses` or `chat` picks one API for every model instead. When OpenBot picks `/responses` itself, the server logs `openai-api` once at start-up, naming the model; a value you set is never changed, `chat` included, and any other value is an error when a built-in Bot runs.
+
+## The model list
+
+The model picker in a Bot's composer offers the models the deployment's credential can use, and how hard each one can think, per conversation and turn by turn: a change applies to the next message. It applies to built-in Bots and to the harness picked in setup when it is OpenBot's own LangGraph or Claude Agent SDK harness; a Bot on any other framework picks its own model.
+
+Who decides what is offered depends on who uses the deployment. With `OPENBOT_SINGLE_USER=true` (OpenBot Desktop among them), the one person is offered every model the credential lists, and no allowlist narrows it. In a team, people pick among the models an admin allows in Admin, Providers; until an admin allows one, people get the default and see no picker. An allowed model the provider stops listing drops out on its own, and a pick saved on it runs on the default. "Only allowed models" in the same place also refuses runs on any other model, a remote Bot's own included.
+
+| Signed in with | Models listed from | Thinking levels from |
+| -------------- | ------------------ | -------------------- |
+| OpenAI key | `GET https://api.openai.com/v1/models`, chat models only, dropping any past its `shutdown_date` | models.dev |
+| Anthropic key | `GET https://api.anthropic.com/v1/models` | Anthropic's own `capabilities.effort` |
+| Google key or sign-in | Google's model list (the OpenAI-compatible `/models` for a key, the native list for a sign-in) | models.dev |
+| xAI key or sign-in | `GET https://api.x.ai/v1/language-models` | xAI's own `capabilities.reasoning_effort` and default |
+| ChatGPT plan | the plan's own Codex listing, read by the LangGraph harness that holds the sign-in | the plan's `supported_reasoning_levels` and default |
+| Claude plan | `GET https://api.anthropic.com/v1/models` with the plan's token | Anthropic's own `capabilities.effort` |
+| Any other `OPENAI_BASE_URL` | the endpoint's `/models`, as it is | models.dev, for names it knows |
+
+The default, when nobody has picked, is the operator's model: `BOT_MODEL`, or the model chosen on the Desktop setup screen, while the credential lists it. When nobody named one, or the named one is not in the credential's list (a ChatGPT plan given `gpt-5.5`, say), the default is the middle of the provider's current line: the newest model of each line still current, ordered by price, and the one in the middle (GPT-6.1 Terra, Claude Sonnet, Gemini Flash). A gateway keeps the model its operator named while it lists it. Nothing in OpenBot names a model on the operator's behalf: `docker-compose.yml` leaves `BOT_MODEL` empty when unset, and the Desktop writes it only for a model the person chose. A model nothing describes yet is still listed, and runs on its own default effort.
+
+Nothing in this is a table OpenBot ships. The listing and the capability data are read at start-up and then every six hours in the background, never on a message. A refresh that fails keeps the last good list. When a provider refuses a model as unknown or unsupported, the list is read again at once, at most once a minute, so a retired model drops out without waiting. Set `OPENBOT_MODEL_CAPABILITIES_URL` to a mirror of models.dev, or `off`.
 
 ## Voice dictation
 
@@ -250,8 +327,8 @@ the chat model provider; neither `OPENAI_BASE_URL` nor `OPENAI_API_KEY` is inher
 
 | Variable | Meaning |
 | --- | --- |
-| `TRANSCRIPTION_PROVIDER` | `openai-compatible`, the first transcription adapter. Unset with all other transcription variables unset disables dictation. |
-| `TRANSCRIPTION_BASE_URL` | Explicit API base URL, including the version path if required. The adapter appends `/audio/transcriptions`. |
+| `TRANSCRIPTION_PROVIDER` | `openai-compatible`, the first transcription adapter. Unset with all other transcription variables unset disables dictation. Setting any of them requires this, `TRANSCRIPTION_BASE_URL` and `TRANSCRIPTION_MODEL`, or the server refuses to start. |
+| `TRANSCRIPTION_BASE_URL` | Required. Explicit HTTP(S) API base URL, including the version path if required, with no credentials, query or fragment. The adapter appends `/audio/transcriptions`. |
 | `TRANSCRIPTION_MODEL` | Required model name, passed verbatim to the configured service. |
 | `TRANSCRIPTION_API_KEY` | Dedicated server-side bearer credential. Optional for services that intentionally require no authentication. |
 
@@ -303,7 +380,7 @@ saves are removed from that outbox. No call audio is recorded by OpenBot.
 
 | Variable | Meaning |
 | --- | --- |
-| `VOICE_PROVIDER` | `openai-realtime` or `xai-realtime`. All voice variables unset disables calls. |
+| `VOICE_PROVIDER` | `openai-realtime` or `xai-realtime`. All voice variables unset disables calls. Setting any of them requires this, `VOICE_MODEL` and `VOICE_API_KEY`, or the server refuses to start. |
 | `VOICE_MODEL` | Required realtime voice model available to your provider account. |
 | `VOICE_API_KEY` | Required server credential. Set explicitly; no chat or dictation credential is inherited. Bun `.env` files can explicitly reference `$OPENAI_API_KEY` or `$XAI_API_KEY`. |
 | `VOICE_NAME` | Provider voice name; defaults to `marin` for OpenAI or `ara` for Grok. |
@@ -341,27 +418,34 @@ policies apply. See [OpenAI WebRTC](https://developers.openai.com/api/docs/guide
 | `MICROSOFT_OAUTH_CLIENT_ID`  | Microsoft Entra ID application id.                                                     |
 | `MICROSOFT_OAUTH_CLIENT_SECRET` | Microsoft Entra ID client secret.                                                   |
 | `MICROSOFT_OAUTH_TENANT_ID`  | Directory to admit. `common` by default, which admits personal accounts too; a GUID admits one directory. |
+| `MICROSOFT_OAUTH_API_SCOPE`  | OpenBot's own API in Entra, as a scope. `api://<client id>/.default` by default. See [Company systems behind Microsoft Entra](#company-systems-behind-microsoft-entra). |
+| `MICROSOFT_OAUTH_ALLOWED_CLIENTS` | The apps that may call OpenBot with a person's Entra token, as client ids separated by commas. Unset, no app may. An entry that is not a client id (a GUID) refuses to start. See [Company systems behind Microsoft Entra](#company-systems-behind-microsoft-entra). |
 | `OKTA_OAUTH_CLIENT_ID`       | Okta client id.                                                                        |
 | `OKTA_OAUTH_CLIENT_SECRET`   | Okta client secret.                                                                    |
 | `OKTA_OAUTH_ISSUER`          | Which Okta, for example `https://example.okta.com/oauth2/default`.                     |
 | `BETTER_AUTH_SECRET`         | At least 32 characters. Required with any provider.                                    |
 | `BETTER_AUTH_URL`            | Public API server base URL, where OAuth callbacks return. Required with any provider.  |
-| `TRUSTED_ORIGINS`            | Comma-separated app origins accepted by the API, plus every host in a registered OIDC provider's discovery document. |
+| `TRUSTED_ORIGINS`            | Comma-separated app origins accepted by the API, plus every host in a registered OIDC provider's discovery document. Unset, sign-in accepts the app on port 3010 at `127.0.0.1`, `[::1]` and `localhost`. |
 | `INITIAL_ADMIN_EMAILS`       | Comma-separated administrators. **Required** with any provider.                        |
 | `OPENBOT_PUBLIC_URL`         | Public address of this API. Defaults to `BETTER_AUTH_URL`.                              |
-| `OPENBOT_APP_URL`            | Where the browser app is served. Defaults to the first `TRUSTED_ORIGINS` entry.          |
+| `OPENBOT_APP_URL`            | Where the browser app is served. Defaults to the first `TRUSTED_ORIGINS` entry, then the public address. |
 | `SIGNIN_ALLOWED_EMAIL_DOMAINS` | Comma-separated email domains admitted at sign-in. Empty means no opinion. Exact, no wildcards. |
 | `OPENBOT_ORGANIZATION_AUTH_URL` | An OpenBot deployment that verifies employee identity and roles. Decides sign-in ahead of `OPENBOT_SINGLE_USER`. |
 | `OPENBOT_RECORDER_EXTRA_EXTENSION_IDS` | Extra extension ids OpenBot trusts besides the Recorder's own, for a fork or a build signed with another key. Comma separated, each 32 letters from a to p, or the server refuses to start. Unset trusts only the Recorder's own id. |
 
-**Some variables belong to the desktop app, not to you.** A desktop installation writes these into
+**Some variables belong to the desktop app, not to you.** A desktop installation runs the
+[personal edition](personal-edition.md#openbot-desktop), so it writes `OPENBOT_EDITION=personal`,
+`TENANT_PACKAGE_DIR=../examples/personal` and `COMPUTER_PERSON_ID=personal`, and writes
+`COMPUTER_SUPERVISOR_URL` and `COMPUTER_SUPERVISOR_CONTAINER_URL` empty. It also writes these into
 its own deployment's `.env` and owns their values: `OPENBOT_MODEL_OAUTH_FILE`, `CHATGPT_AUTH_FILE`,
-`CLAUDE_CODE_OAUTH_TOKEN`, `OPENBOT_BROWSER_URL` and `BROWSER_PORT` (the person's own browser, see
-[OpenBot Desktop runs it for the person](#openbot-desktop-runs-it-for-the-person)), and the
+`CLAUDE_CODE_OAUTH_TOKEN`, `COMPUTER_LOOPBACK_RELAYS` (see the computer table below), and the
 `PICKED_HARNESS_*` names that describe the Bot picked during setup
 (`PICKED_HARNESS_IMAGE`, `PICKED_HARNESS_URL`, `PICKED_HARNESS_PORT` and the rest). The server reads
 `PICKED_HARNESS_IMAGE` and `PICKED_HARNESS_URL` to hand that Bot `MANAGED_AGENT_TOKEN`, and refuses to
-start when they are set without it. When a model provider is connected by OAuth rather than by key, the
+start when they are set without it. It hands the server `OPENBOT_DESKTOP_HOST_TOKEN` too, minted on every
+Start and never written to `.env`: its folder worker answers the server with it, and without it the
+server has no desktop host, so Settings → Computer says folders need OpenBot Desktop (see
+[Folders on this computer](personal-edition.md#folders-on-this-computer)). When a model provider is connected by OAuth rather than by key, the
 desktop also points `OPENAI_BASE_URL` at OpenBot's own loopback route and sets `OPENAI_API_KEY` to a
 local proxy credential rather than a provider key, so those two do not mean what the table above says
 in that mode. A server you configure yourself is unaffected by all of this.
@@ -380,11 +464,55 @@ address and a `.local` name are what this flag is mostly used for, and anybody o
 the administrator. A value that cannot be parsed as a URL counts as public, because nobody checked
 it.
 
+**And only to this machine, unless you name more.** The administrator is admitted only for a request
+addressed to one of this machine's own names (`localhost`, `127.0.0.1`, `[::1]`) or the host of a
+configured URL, so a web page whose name was pointed at your machine is not it. Where the server runs
+on your own machine (OpenBot Desktop, `scripts/start.sh`, `bun run dev`) and no address beyond it is
+configured, it is admitted only for a caller on this machine, and the app's own servers
+(`app/serve.ts`, the Vite dev server) answer only this machine too. To open it from another machine
+on your network, set `OPENBOT_APP_URL` (or `TRUSTED_ORIGINS`) to the address they use. OpenBot's
+container images set `OPENBOT_IN_CONTAINER=true`, because there every caller arrives through the
+container engine; set it yourself only for a container of your own that runs this server. Routes
+that containers and services call back on (Bots' tool calls, the model proxy, the routines worker)
+prove themselves with their own secrets and are not affected.
+
+**A single-user deployment has its own identity at Composio or Arcade.** Both keep accounts apart
+by a user id OpenBot sends, and the one person of every single-user deployment is `dev-local-user`,
+so two of them on the same `COMPOSIO_API_KEY` or `ARCADE_API_KEY` used to share one set of
+connections: one deployment's Gmail, or its consent to Google, was used by the other, and a
+disconnect in one ended it for both. Now each is given its own user id at its broker,
+`dev-local-user:` and a random part, at its first start with that broker's key, and keeps it in its
+database (the `brokered_identities` table, one row per broker), so it is the same after a restart
+and on every replica. Only the name at the broker changes: threads, memory and everything else stay
+with `dev-local-user`.
+
+A deployment that already had connections under `dev-local-user` gets its own id too, at the same
+start, and **connects each of its apps once more**. Neither broker can move a connection to another
+user id: Composio's connected-account update takes no user id, and Arcade's user connections can
+only be listed and deleted. Nor can either say which deployment made a connection under the shared
+id, and before this change one deployment opening an app another had connected recorded that
+account as its own. So at that start the deployment removes its own records of connections under
+`dev-local-user` (its `brokered_connections` rows for the active broker whose `user_id` and
+`vendor_user_id` are both `dev-local-user`), logs the apps it removed as
+`single-user-connections-retired`, and asks the broker nothing. Each app then reads as not connected
+and one Connect files it under the new id. The accounts themselves stay at the broker under
+`dev-local-user`, because another OpenBot on the same key may still be using them. If this was the
+only OpenBot on its key, remove them there: they are Composio's connected accounts for user id
+`dev-local-user`, and Arcade's user connections for `user_id=dev-local-user`
+(`GET /v1/admin/user_connections`).
+
+A consent begun under `dev-local-user` before that start and finished after it is refused, and the
+person is asked to press Connect again; nothing held under `dev-local-user` is confirmed or
+withdrawn. A deployment that signs people in keeps filing each person under their own id. To see
+the id in use, run `select provider, vendor_user_id from brokered_identities`; no row for the
+active broker means the person's own id. That is also the `--user` to give
+`bun run composio:smoke`.
+
 **`SIGNIN_ALLOWED_EMAIL_DOMAINS` decides who may sign in**, as distinct from who is an
 administrator once in. Matching is exact with no wildcards, so `example.com` admits neither
 `sub.example.com` nor `evil-example.com`, and both sides go through the same IDNA normalisation, so
 a rule may be written `@Example.COM.` or in punycode and still mean what it says. Two arrangements
-are refused at start-up rather than documented and hoped for: a list that normalises to nothing,
+are refused at start-up rather than documented and hoped for: a list that normalizes to nothing,
 which `@` and a stray `.` both produce, because it is a non-empty list no address can match; and a
 list combined with a `MICROSOFT_OAUTH_TENANT_ID` that names no directory (`common`, `organizations`
 or `consumers`), because there the address the list is checked against is one the signing-in tenant
@@ -414,7 +542,9 @@ from OpenBot, and a person's recordings stay in Intelligence after they are remo
 **Any one provider turns sign-in on**, and several may be configured at once. Each provider's id and
 secret must be set together, Okta additionally needs its issuer, and any of them requires
 `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `INITIAL_ADMIN_EMAILS`. Every incomplete combination is
-refused at start-up rather than at somebody's first attempt to sign in.
+refused at start-up rather than at somebody's first attempt to sign in, and so are the leftovers of
+one: `BETTER_AUTH_SECRET` or `BETTER_AUTH_URL` with no provider, and `OKTA_OAUTH_ISSUER` without
+Okta's id and secret.
 
 `INITIAL_ADMIN_EMAILS` is required because nothing else grants the administrator role at first: an
 address it names becomes an administrator at every sign-in and cannot be demoted from the People
@@ -445,6 +575,64 @@ where `<provider>` is `google`, `microsoft` or `okta`.
 `OPENBOT_APP_URL` is where the callback sends the person afterwards. It is a separate setting because the app and the API are separate addresses: locally the app is Vite on `3010` and the API is `3001`, so a relative redirect would land on the API, which serves no pages. A deployment serving both from one origin can leave it unset.
 
 A [Composio](plugins/composio.md) app needs `OPENBOT_APP_URL` and nothing else of the two: the consent lives at the broker, so no redirect URI of ours is registered anywhere, but the address Composio returns somebody to has to be absolute and this is where it comes from. Connecting a brokered account refuses where it resolves to nothing, rather than sending somebody to a consent screen with no way back.
+
+### Company systems behind Microsoft Entra
+
+A company MCP server protected by Entra can be reached as the signed-in person, so the system sees
+the real person with only their access, never a shared service account. An admin adds it as a
+server by URL and marks it with the system's Entra scope:
+
+```http
+POST /api/plugins/servers/custom
+{ "id": "hr", "title": "HR", "url": "https://hr.example.com/mcp", "entraScope": "api://hr-api/.default" }
+```
+
+Each call then goes out with a token Entra issues for the person asking, through Microsoft's
+on-behalf-of exchange (`requested_token_use=on_behalf_of`) with that scope. The token it exchanges
+is the person's token to OpenBot's own API: the one their app sent, or, for work nobody is watching
+(routines, check-ins), one OpenBot gets from their stored Microsoft sign-in. Tokens are reused until
+a few minutes before they expire. A person who has not signed in with Microsoft, whose sign-in has
+expired, or whose admin has not granted OpenBot access to the system or to OpenBot's own API is told
+so in those words.
+Marking a server this way needs Microsoft sign-in configured. Adding the same server again without
+`entraScope` keeps the mark; send `"entraScope": null` to reach it on a token again. The server's
+page under Plugins shows the mark and its scope.
+
+**Apps can call OpenBot with an Entra token.** An app that signed somebody in with Entra asks for a
+token to `MICROSOFT_OAUTH_API_SCOPE` and sends it as `Authorization: Bearer <token>` on any API or
+agent request. It is checked against the directory's published keys, its issuer (the directory
+`MICROSOFT_OAUTH_TENANT_ID` names, so this needs the GUID rather than `common`), its audience
+(OpenBot's client id or the scope's `api://` identifier) and its expiry, and the request runs as
+that person exactly as a signed-in browser does. Somebody OpenBot has not seen before is signed in
+the way Microsoft sign-in signs them in, under the same SSO, domain and removal rules.
+
+**Only the apps you list can do this.** Entra issues a token for OpenBot's API to any app that a
+person or an admin consents to, including other companies' multi-tenant apps if your tenant lets
+people consent to apps themselves. So OpenBot also checks the token's `azp` claim, the client id of
+the app the token was issued to, against `MICROSOFT_OAUTH_ALLOWED_CLIENTS`. A token from any other
+app is refused, and the server logs `entra-token-client-not-allowed` with that app's client id.
+With the setting unset, no app can call in. Routines and check-ins still reach marked servers from
+each person's stored Microsoft sign-in.
+
+**Routines need a browser sign-in once.** A token from a person's app lasts 60 to 90 minutes and
+is kept in memory only, so it can't stand in for them later. Work nobody is watching (routines,
+check-ins) uses their stored Microsoft sign-in, which only signing in to OpenBot in the browser
+with Microsoft creates. Someone who has only ever used OpenBot through an app is asked to do that
+once, in the message their routine leaves.
+
+In Entra, on OpenBot's app registration:
+
+1. **Expose an API** (an Application ID URI such as `api://<client id>` and a delegated scope such
+   as `access_as_user`), and set `requestedAccessTokenVersion` to `2` in the manifest so its tokens
+   name the directory's v2.0 issuer. Then add that scope to the registration's own API permissions
+   (under My APIs) and grant admin consent: OpenBot asks Entra for a token to its own API from each
+   person's stored sign-in, and without the consent Entra refuses with `AADSTS65001`.
+2. **Add a delegated API permission for each company system** to OpenBot's app registration, and
+   grant admin consent.
+3. **Let the company's apps request tokens for OpenBot's API**: add them as authorized client
+   applications of the scope from step 1, or have them request it with consent.
+4. **List those apps' client ids in `MICROSOFT_OAUTH_ALLOWED_CLIENTS`.** Step 3 decides which apps
+   Entra issues tokens to. This setting decides which of those tokens OpenBot takes.
 
 ### SCIM provisioning
 
@@ -494,12 +682,13 @@ Slack app of its own.
 | Variable                        | Meaning                                                                                                                                                                           |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `OPENTAG_SHARED_SECRET`         | Enables the pairing. At least 32 characters. OpenTag must send `Authorization: Bearer <secret>` (its `AGENT_AUTH_HEADER`), and OpenBot sends the same header on proactive posts. |
-| `OPENTAG_URL`                   | OpenTag's base URL, for messages sent when no Slack turn is open (replies after an approval, responsibility progress, questions). Without it those sends fail visibly in the outbox, and Slack triggers are refused because channel membership cannot be checked. |
+| `OPENTAG_URL`                   | OpenTag's `http(s)` base URL, for messages sent when no Slack turn is open (replies after an approval, responsibility progress, questions). Without it those sends fail visibly in the outbox, and Slack triggers are refused because channel membership cannot be checked. Setting it, or the icon template, without `OPENTAG_SHARED_SECRET` refuses to start. |
 | `OPENTAG_BOT_ICON_URL_TEMPLATE` | Optional `https` PNG URL with `{seed}` (the Bot's avatar seed) or `{agentId}`, used as the Bot's Slack icon on proactive posts.                                                    |
 
 Point OpenTag's `AGENT_URL` at `<public URL>/api/delivery/webhooks/opentag/agent`. A person links
 their Slack or Teams identity from a Bot's page, under **Reaching you**: OpenBot shows a one-time `link <code>` message,
-valid for ten minutes, which they send to the OpenTag app. After that, only that person's messages
+valid for ten minutes, which they send to the OpenTag app in a direct message. On Slack, a code posted
+in a shared channel is canceled, because whoever sends it first is linked to that Bot. After that, only that person's messages
 reach their chosen Bot, in their own OpenBot conversation, with learning, governance, approvals and
 audit on every turn. Anyone unlinked is told how to link and nothing runs. Approval requests appear
 as OpenTag approval cards (allow once, always allow, cancel) and are decided through the approvals
@@ -508,7 +697,7 @@ service as the linked owner; a reply to a Bot's question answers that question.
 The former direct Slack settings (`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_BOT_TOKEN`,
 `SLACK_TEAM_ID`, `SLACK_SIGNING_SECRET`) are refused at start-up; unset them.
 
-SMS through Twilio honours Advanced Opt-Out: `STOP` (and Twilio's other opt-out keywords) marks the
+SMS through Twilio honors Advanced Opt-Out: `STOP` (and Twilio's other opt-out keywords) marks the
 number opted out, later messages show `opted_out` in the delivery history instead of being sent, and
 `START` resumes. Twilio sends the confirmation reply itself, so OpenBot does not.
 
@@ -619,13 +808,13 @@ them, including a saved off. See [automatic-learning.md](automatic-learning.md).
 
 | Variable                                 | Meaning                                                                                       |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `CPK_INTELLIGENCE_LEARNING_CONTAINER_ID` | Default Learning container for this deployment's Bots. 1 to 64 lowercase letters, digits and single hyphens, or the server refuses to start. |
+| `CPK_INTELLIGENCE_LEARNING_CONTAINER_ID` | Default Learning container for this deployment's Bots. 1 to 64 lowercase letters, digits and single hyphens, or the server refuses to start. Checked at start: a container the configured Intelligence does not have is logged (`configured_absent`) and ignored, and automatic assignment runs as though it was unset. |
 | `CPK_INTELLIGENCE_SKILLS_REVISION`       | An exact published skills revision to pin. Read only beside a container id. Unset follows the latest. |
-| `OPENBOT_LEARNING_AUTO_ASSIGN`           | `false` or `0` stops the server assigning the project's `openbot` container automatically. On otherwise, and off whenever `CPK_INTELLIGENCE_LEARNING_CONTAINER_ID` is set. |
+| `OPENBOT_LEARNING_AUTO_ASSIGN`           | `false` or `0` stops the server assigning the project's `openbot` container automatically. On otherwise. Stands aside for a `CPK_INTELLIGENCE_LEARNING_CONTAINER_ID` the configured Intelligence has. |
 | `INTELLIGENCE_SERVICE_TOKEN`             | An Intelligence service token that creates the `openbot` Learning container (local evaluation installs only; see [Creating the container](automatic-learning.md#creating-the-container)). Requires `INTELLIGENCE_PROJECT_ID`. |
 | `INTELLIGENCE_PROJECT_ID`                | The numeric ID of the runtime key's Intelligence project, where the service token creates the container. Set both or neither, or the server refuses to start. |
 | `OPENBOT_MEMORY_SOURCE_DEFAULTS`         | `false` or `0` stops OpenBot making each app a person connected into a memory source for the Bots they talk to. On otherwise. Existing sources are left as they are. |
-| `OPENBOT_PROACTIVE_DEFAULTS`             | `false` or `0` stops OpenBot switching on background research for the Bots a person talks to. On otherwise. Existing settings are left as they are. |
+| `OPENBOT_PROACTIVE_DEFAULTS`             | `true` or `1` switches on an hourly check-in on everything a Bot can read the first time a person talks to it alone, as OpenBot did before. Off otherwise: a Bot offers a check-in on one thing in the conversation, and it runs only once the person accepts. Existing settings are left as they are. |
 
 ## OpenTelemetry export
 
@@ -649,34 +838,43 @@ is still the record.
 | Variable                             | Meaning                                                                                   |
 | ------------------------------------ | ----------------------------------------------------------------------------------------- |
 | `AGENT_COMPUTER_URL`                 | Shared computer URL. If absent, computer routes are not mounted.                          |
-| `COMPUTER_TOKEN`                     | Secret every computer request must present. The computer refuses to start without it.     |
-| `COMPUTER_MAX_BROWSERS`              | How many Bots may hold a running browser at once. `8` by default; the least recently used is closed past it. A person's browser in a native window (OpenBot Desktop) counts toward it and is closed only when no Bot's browser is left to close; a person's cloud browser is ranked by use like a Bot's. |
+| `COMPUTER_TOKEN`                     | Secret every computer request must present. The computer refuses to start without it. The shared computer holds it as it is. A computer the supervisor or a Sandbox makes for one person or one isolated Bot is given its own token instead, derived from this one and whose computer it is, so a Bot that reads its computer's token cannot open anybody else's. |
+| `COMPUTER_MAX_BROWSERS`              | How many Bots may hold a running browser at once. `8` by default; the least recently used is closed past it. A person's browser in a native window (a host-side computer of people's browsers) counts toward it and is closed only when no Bot's browser is left to close; a person's cloud browser is ranked by use like a Bot's. |
 | `COMPUTER_SEPARATE_WORKSPACES`       | `on` gives each Bot its own folder of files on a computer many Bots share, with its shell starting there. On for Helm's `shared` computer and the docker-compose `agent-computer`; off elsewhere. Files saved before it was on stay at the root of the volume. Commands can still read other folders: use `computers.mode: sandbox` to keep people apart. |
-| `COMPUTER_BROWSER_IDLE_MS`           | How long an untouched browser is kept. 30 minutes by default; `0` keeps them resident. A person's cloud browser takes the same rule: the Browser page touches it every second while it is open, so it closes once nobody is on that page. A person's native window (OpenBot Desktop) is never closed for being idle. |
-| `COMPUTER_MEMORY_HIGH_PERCENT`       | At what share of its memory limit a computer starts closing browsers nobody is using, least recently used first and one at a time, until it is ten points under that share (75% at the default). `85` by default; `0` switches it off. Memory is the container's working set, as the kubelet reads it (usage less the inactive page cache), checked before every launch and every minute, one pass at a time however many launches arrive together. It is a check, not a guarantee: a page that grows between two checks can still run the container out of memory. A container with no limit is measured against the machine's memory; a computer outside a container (OpenBot Desktop's) closes nothing for memory. Never closed for memory: the browser being launched, the most recently used one, any used in the last minute, a person's own browser (cloud or native), and a Bot's whose wheel a person holds or has been asked to take. In the all-in-one image the share counts the database and the API server as well as the browsers, on purpose: the kernel's out-of-memory kill counts them too and can take the database down, and closing a browser first is how the database is protected. Each close logs `computer-browser-closed-for-memory` with the working set and the limit in bytes. |
+| `COMPUTER_BROWSER_IDLE_MS`           | How long an untouched browser is kept. 30 minutes by default; `0` keeps them resident. A person's cloud browser takes the same rule: the Browser page touches it every second while it is open, so it closes once nobody is on that page. A person's native window (a host-side computer of people's browsers) is never closed for being idle. |
+| `COMPUTER_MEMORY_HIGH_PERCENT`       | At what share of its memory limit a computer starts closing browsers nobody is using, least recently used first and one at a time, until it is ten points under that share (75% at the default). `85` by default; `0` switches it off. Memory is the container's working set, as the kubelet reads it (usage less the inactive page cache), checked before every launch and every minute, one pass at a time however many launches arrive together. It is a check, not a guarantee: a page that grows between two checks can still run the container out of memory. A container with no limit is measured against the machine's memory; a computer outside a container (the local Chrome helper) closes nothing for memory. Never closed for memory: the browser being launched, the most recently used one, any used in the last minute, a person's own browser (cloud or native), and a Bot's whose wheel a person holds or has been asked to take. In the all-in-one image the share counts the database and the API server as well as the browsers, on purpose: the kernel's out-of-memory kill counts them too and can take the database down, and closing a browser first is how the database is protected. Each close logs `computer-browser-closed-for-memory` with the working set and the limit in bytes. |
 | `COMPUTER_TAB_IDLE_MS`               | How long a Bot's background tab may sit untouched before it is closed. 10 minutes by default; `0` keeps them. A Bot is always on its newest page, so an older tab (the page a sign-in popup opened from, a link opened in a new tab) is one it cannot go back to. Navigating, being acted on, or being in front counts as use. Never closed: the page the Bot is on, a person's own browser, and any tab of a Bot whose wheel a person holds. |
 | `OPENBOT_RECORDER_DIR`               | The built OpenBot Recorder (`extension/dist` after `bun run build`), absolute. Every person's browser the computer opens has it loaded and connected. Every Bot's browser has it loaded too (except in local Chrome), disconnected and silent until a person holding the Bot's control presses Record. Without it, or pointed at anything that is not a built Recorder, the computer still serves Bots, whose browsers then launch without it and cannot record, and refuses to open a person's browser, saying why. The computer image sets it to the Recorder it carries. |
-| `COMPUTER_PEOPLE_ONLY`               | `on` for a computer that runs people's own browsers and no Bot (OpenBot Desktop sets it on its host-side computer); it refuses every Bot. A person's browser runs only on a computer of its own: this one, or one started for it alone (`COMPUTER_BOT_ID`, as the supervisor and a Sandbox start each computer). The shared computer refuses it, and so does the server, whose Browser page says why, because a Bot's shell there could read the person's logins off the disk. |
-| `COMPUTER_BROWSER_BACKEND`           | `managed` by default (full bundled Chromium); `local-chrome` opts into installed Chrome with dedicated profiles and a loopback API. |
-| `COMPUTER_BROWSER_MODE`              | Managed defaults to `headed` on Linux, which is every hosted computer (a container, a pod, the desktop app's engine): full Chromium on the computer's own Xvfb display. A computer run directly on macOS or Windows defaults to `headless`, where headed would open windows on the desktop. `headless` is full Chromium's new headless mode. Local Chrome requires `headed`. See [Getting past bot checks](#getting-past-bot-checks). |
-| `WEB_BOT_AUTH`                       | `on` or `off`. Unset means off. `on` needs an https public URL. See [Web Bot Auth](#web-bot-auth). |
-| `WEB_BOT_AUTH_KEY`                   | The Web Bot Auth signing key, an Ed25519 private JWK. Unset derives one from `KEY_ENCRYPTION_KEY`. Never logged. |
+| `COMPUTER_PEOPLE_ONLY`               | `on` for a computer that runs people's own browsers and no Bot (a host-side computer, as `scripts/start.sh` starts one for the personal edition); it refuses every Bot. A person's browser runs only on a computer of its own: this one, or one started for it alone (`COMPUTER_BOT_ID`, as the supervisor and a Sandbox start each computer). The shared computer refuses it, and so does the server, whose Browser page says why, because a Bot's shell there could read the person's logins off the disk. The personal edition's one computer is the exception (`COMPUTER_PERSON_ID` with `OPENBOT_EDITION=personal`): every Bot on it is the one person's, so their browser runs there too, shown in the page. |
+| `COMPUTER_PERSON_ID`                 | The one person a computer carries every Bot of, as the supervisor and a Sandbox start one per person and the personal edition starts its one computer (`personal`). Record runs in those Bots' browsers there. With `OPENBOT_EDITION=personal` the person's own browser runs there too; otherwise it does not. Compose hands the shared computer both. |
+| `COMPUTER_LOOPBACK_RELAYS`           | Ports the computer listens on at its own loopback and passes to another address, as `<port>=<host>:<port>`, comma-separated. The Recorder reaches OpenBot only at https or at loopback, so on a laptop a browser is handed `http://127.0.0.1:<port>`, which inside a container is the container. OpenBot Desktop relays its app's and server's ports to `server:3001` and a local Intelligence gateway's to `host.docker.internal`. Unset relays nothing. A setting it cannot read stops the computer at start, naming the entry. |
+| `OPENBOT_BROWSER_URL`                | Read by the server: the computer that runs people's own browsers, when it is not the Bots' computer (a host-side computer with `COMPUTER_PEOPLE_ONLY=on`). Unset, people's browsers run on the computers the Bots run on. `scripts/start.sh` sets it for the personal edition to the one it starts on `BROWSER_PORT` (`4101` by default). |
+| `COMPUTER_BROWSER_BACKEND`           | `managed` by default (full bundled Chromium); `local-chrome` opts into installed Chrome with dedicated profiles and a loopback API. Any other value stops the computer at start. |
+| `COMPUTER_BROWSER_MODE`              | Managed defaults to `headed` on Linux, which is every hosted computer (a container, a pod, the desktop app's engine): full Chromium on the computer's own Xvfb display. A computer run directly on macOS or Windows defaults to `headless`, where headed would open windows on the desktop. `headless` is full Chromium's new headless mode. Local Chrome requires `headed`. Any other value stops the computer at start. See [Getting past bot checks](#getting-past-bot-checks). |
+| `WEB_BOT_AUTH`                       | `on` or `off`. Unset means off; any other value refuses to start. `on` needs an https public URL. See [Web Bot Auth](#web-bot-auth). |
+| `WEB_BOT_AUTH_KEY`                   | The Web Bot Auth signing key, an Ed25519 private JWK. Unset derives one from `KEY_ENCRYPTION_KEY`. A key that is not an Ed25519 private JWK, or whose public half does not match, refuses to start. Never logged. |
 | `OPENBOT_LOCAL_COMPUTER_DIR`         | Local startup helper's absolute data root. Defaults to the platform's OpenBot user-data directory; contains `profiles/` and `workspace/`. |
 | `COMPUTER_SUPERVISOR_URL`            | Supervisor URL for per-Bot computers. If absent, Bots share `AGENT_COMPUTER_URL`.         |
-| `SUPERVISOR_TOKEN`                   | Bearer token required by the supervisor.                                                  |
+| `SUPERVISOR_TOKEN`                   | Bearer token required by the supervisor. The supervisor refuses to start without it.     |
 | `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS` | Local-only private-host browsing when `true`. A deployment running with `NODE_ENV=production` refuses to start while it is set. Cloud metadata addresses are refused either way. |
-| `AGENT_ENDPOINT_ALLOWED_HOSTS`       | Private addresses an agent may be registered at, comma separated; unset (none) by default. Host, optionally with a port. Exact match; no wildcards. Never-allowed addresses cannot be named. |
-| `AGENT_COMPUTER_POLICY`              | JSON action policy: `{"mode":"enforce","deny":[...],"allow":[...]}`.                      |
+| `AGENT_ENDPOINT_ALLOWED_HOSTS`       | Private addresses an agent may be registered at, comma separated; unset (none) by default. Host, optionally with a port. Exact match; no wildcards. Never-allowed addresses cannot be named. An entry that is a URL or holds a `*` refuses to start. |
+| `OPENBOT_THIS_MACHINE_HOST`          | For a server in a container on the person's own machine: the host name that container reaches the machine by. An agent registered at a loopback address (`localhost`, `127.x`, `[::1]`) is dialled through it; the address as typed is what is checked and stored. OpenBot Desktop sets `host.docker.internal`. Unset (the default) dials addresses as written. A value with a scheme, port or path refuses to start. |
+| `AGENT_COMPUTER_POLICY`              | JSON action policy: `{"mode":"enforce","deny":[...],"allow":[...]}`. `mode` is `enforce` or `dry-run`. Invalid JSON or an invalid policy refuses to start. |
 | `APPROVAL_CONTENT_TOOLS`             | Tools whose arguments are content for a person to read (a script, a draft), as comma-separated tool-ref globs such as `social-video/*`; unset (none) by default. The built-in password, security-settings and payment hand-offs then read only the tool's name, server and target, not its arguments. |
 | `ROUTINE_FRESH_CONTEXT_BOTS`         | Bots whose routine firings start from the stored instruction alone, as comma-separated Bot ids; unset (none) by default. A firing is normally handed its channel's whole thread. The thread is still written to and a person still reads all of it, and follow-ups, approvals and whatever a person says keep the whole thread. |
 | `COMPUTER_RUNTIME`                   | Set to `runsc` to run supervised computers under gVisor.                                  |
-| `COMPUTER_SANDBOX`                   | Set to `on` to enable Chromium's own sandbox where the host permits user namespaces. Which way it went is printed at start-up. |
+| `COMPUTER_SANDBOX`                   | Set to `on` to enable Chromium's own sandbox where the host permits user namespaces. Which way it went is printed at start-up. Compose's `agent-computer` service does not pass it from `.env`, and the supervisor does not forward it to the computers it creates: in Compose put it in `egress.env` (see below), which reaches the shared computer, and on Helm in `computers.extraEnv`. |
 
 `COMPUTER_SANDBOX` is not the cluster sandbox provider. A Kubernetes deployment can instead run each
 computer as a sandboxed pod, selected by `COMPUTER_SANDBOX_NAMESPACE` with `COMPUTER_SANDBOX_IDLE_AFTER`
 and `COMPUTER_SANDBOX_TEMPLATE_FILE` beside it; those are set by the Helm chart, not by Compose, and
-are covered in [charts/openbot/README.md](../charts/openbot/README.md). The similarly named
-`COMPUTER_SANDBOX` above only toggles Chromium's own process sandbox on a Docker computer.
+are covered in [charts/openbot/README.md](../charts/openbot/README.md). The chart sets them for
+`computers.mode: sandbox`, from `computers.sandbox.namespace` (the release's namespace by default) and
+`computers.sandbox.idleAfter`. The server's own defaults are `30m` for the idle time, written as
+`30s`, `30m`, `2h` or a plain number of milliseconds, and `/etc/openbot/sandbox-template.json` for the
+template. A namespace takes precedence over `COMPUTER_SUPERVISOR_URL` and `AGENT_COMPUTER_URL`. The
+similarly named `COMPUTER_SANDBOX` above only toggles Chromium's own process sandbox on a Docker
+computer.
 
 Changing `COMPUTER_BROWSER_MODE` affects new supervised computers. A computer that already exists is
 left running until its image changes or its container is recreated. To apply a mode-only change to
@@ -781,49 +979,39 @@ selectors, and restart the API. Unset `COMPUTER_BROWSER_BACKEND` (or set `manage
 computer process; choose `headless` or `headed` as before. Local Chrome profiles remain in the local
 data root, separate from managed computer volumes.
 
-#### OpenBot Desktop runs it for the person
+#### OpenBot Desktop
 
-OpenBot Desktop starts this computer itself, as a fourth process beside the server, the app and the
-worker, to run the person's own browser: their installed Google Chrome, or Microsoft Edge where
-Chrome is missing, as a window on their desktop with the OpenBot Recorder already in it. Nothing
-above needs doing. Desktop gives it a loopback port of its own (`BROWSER_PORT`, 4101 when free), the
-computer token the stack already shares, the default data root above, and `OPENBOT_RECORDER_DIR`
-pointing at the Recorder that installation copies into the deployment (`extension/dist`) out of the
-release's own computer image, prebuilt, and `COMPUTER_PEOPLE_ONLY=on`. It points
-the server at it with `OPENBOT_BROWSER_URL=http://127.0.0.1:<port>`. Bots' own computers stay with
-the supervisor; only the person's browser runs here. It starts and stops with the rest of OpenBot,
-is restarted the way the other processes are, and its browser is asked to close before Stop or Quit
-takes the rest down (SIGTERM to the computer on macOS and Linux, `taskkill` without `/F` to the
-browser's windows on Windows), and ended only if it has not closed within ten seconds.
-
-It runs only when Chrome or Edge is installed where it looks (`/Applications` on macOS;
-`Program Files` or the user's `AppData\Local` on Windows; on Linux `/opt/google/chrome` or
-`/opt/microsoft/msedge`, where Google's and Microsoft's own packages put them on every distribution,
-then `google-chrome-stable`, `google-chrome`, `microsoft-edge-stable` or `microsoft-edge` on the
-`PATH`, as NixOS has them) and the deployment's release includes the OpenBot Browser. The Flatpak
-builds of Chrome and Edge run sandboxed away from the profile and the Recorder and cannot be used,
-and neither browser is published as a Snap. Otherwise `OPENBOT_BROWSER_URL` is not set, Desktop
-sets `OPENBOT_BROWSER_ABSENT` to the reason, and the app says it to the person in one sentence.
-Desktop checks again at every Start, so a browser installed later is found.
-
-Uninstalling OpenBot Desktop removes the browser's data root (the profile the person signed in to)
-and the Recorder's native messaging host manifests: the Windows uninstaller does, and so do the
-.deb and .rpm packages' removal scripts, for each person and as that person. An app removed by
-dragging it to the Trash on macOS, or an AppImage deleted, runs nothing on the way out, so there
-those files stay until removed by hand. The helper above and
-Desktop use the same data root, so stop one before starting the other: Chrome lets one browser at a
-time use a profile.
+OpenBot Desktop does not run this helper. Its person's browser runs on the personal edition's one
+computer and shows inside the OpenBot window, as on hosted OpenBot (see
+[Personal edition](personal-edition.md#openbot-desktop)), so it writes no `OPENBOT_BROWSER_URL`, and
+a Start takes out the `OPENBOT_BROWSER_URL`, `OPENBOT_BROWSER_CONTAINER_URL`, `BROWSER_PORT` and
+`OPENBOT_BROWSER_ABSENT` an earlier version wrote. Earlier versions ran this helper as a host-side
+browser, a separate Chrome or Edge window, with its profile in the data root above; uninstalling
+OpenBot Desktop still removes that data root and the Recorder's native messaging host manifests on
+Windows and from the .deb and .rpm packages. On macOS, and for an AppImage, it stays until removed
+by hand.
 
 `agent-computer` also reads:
 
-- `ACTION_TIMEOUT_MS`
-- `NAVIGATION_TIMEOUT_MS`
-- `WORKSPACE_DIR`
-- `PROFILES_DIR`
-- `COMPUTER_BOT_ID`
+- `PORT` (`4100`)
+- `COMPUTER_BIND`: the address a managed computer listens on. Unset, every interface;
+  `127.0.0.1` keeps a computer run directly on a person's machine off the network. Local Chrome
+  always listens on loopback.
+- `ACTION_TIMEOUT_MS` (`10000`)
+- `NAVIGATION_TIMEOUT_MS` (`30000`)
+- `BROWSER_TURN_LIMIT_MS`: how long one action may hold a Bot's browser before the next goes ahead
+  anyway, logged as `browser-turn-overrun` (one navigation timeout plus two action timeouts)
+- `WORKSPACE_DIR` (`/workspace`)
+- `PROFILES_DIR` (`/profiles`)
+- `COMPUTER_BOT_ID` (`shared`; letters, digits, hyphen and underscore, or the computer stops at
+  start)
 - `EGRESS_PROXY_DEFAULT` (in `egress.env`, see below)
 - `EGRESS_PROXY_<BOT_ID>` (in `egress.env`, see below)
 - `COMPUTER_SHELL_ENV`
+
+The numeric ones take whole numbers; anything else, or a blank value, falls back to the default.
+Compose's `agent-computer` service passes only the names it lists, plus whatever is in `egress.env`,
+so on Compose a setting it does not list goes in `egress.env`.
 
 A command on the computer inherits PATH, locale and terminal names, and the proxy variables, not
 the rest of the process environment. Userinfo is stripped from a proxy URL, so a password in
@@ -849,25 +1037,34 @@ default. Both the shared computer and the supervisor are given it: the computer 
 proxy from these names, and the supervisor forwards them into each computer it creates.
 
 Every computer runs its own filtering proxy on `127.0.0.1`, which applies the network policy an
-administrator sets under **Admin > Enterprise controls**, and it sets `HTTP_PROXY`, `HTTPS_PROXY` and
+administrator sets under **Admin > Computers > Network**, and it sets `HTTP_PROXY`, `HTTPS_PROXY` and
 `NO_PROXY` for itself and its shell to point at that filter. Do not set those three to reach an
 upstream proxy; use `EGRESS_PROXY_<BOT_ID>` or `EGRESS_PROXY_DEFAULT`, which the filter chains to.
 
-The server pushes each Bot's policy to its computer when the computer wakes and every 30 seconds
-after. Until a policy has arrived, the filter refuses every connection. Metadata and link-local
+The server pushes each Bot's policy to its computer when the computer wakes, ahead of the Bot's next
+action after any change to the enterprise controls, and to every running computer every 30 seconds.
+A push that does not land, such as one to a computer that is still starting, is tried again after
+1, 2, 4, 8 and 16 seconds. The server logs one `egress-policy-push-waiting` line when that starts,
+`egress-policy-delivered` when it lands, and an `egress-policy-push-failed` error only if computers
+have still not taken their policies after five minutes. Until a policy has arrived, the filter
+refuses every connection. Metadata and link-local
 addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254` and the like) are refused in every mode,
 including `allow_all`. `EGRESS_POLICY_REQUIRED=0` (or `false`) lets the filter allow everything
 until a policy arrives instead, which only a computer run with no API server should need. It is read
 by the computer: in Compose put it in `egress.env`, which reaches the shared computer, and on
-Kubernetes put it in `computers.extraEnv`. The supervisor forwards only the `EGRESS_PROXY` names, so
-a computer it creates does not receive it.
+Kubernetes put it in `computers.extraEnv`. Of `egress.env`, the supervisor forwards only the
+`EGRESS_PROXY` names, so a computer it creates does not receive it.
 
 The supervisor also reads:
 
-- `COMPUTER_IMAGE`
+- `PORT` (`4300`)
+- `COMPUTER_IMAGE` (`openbot-agent-computer:latest`)
 - `COMPUTER_NAMESPACE`
 - `COMPUTER_NETWORK`
-- `COMPUTER_MEMORY_BYTES`
+- `COMPUTER_MEMORY_BYTES`: a memory limit for each computer it creates, as a whole number of bytes.
+  Anything else stops the supervisor at start. Unset, no limit.
+- `COMPUTER_BROWSER_MODE`, which it passes to each computer it creates. Anything but `headed` or
+  `headless` stops the supervisor at start.
 - `DOCKER_SOCKET`
 
 `ENGINE_SOCKET` is separate from those, because it is read by Compose rather than by the supervisor:
@@ -1023,7 +1220,7 @@ stack without a toolchain and without waiting for Chromium to build.
 | `supervisor`      | `SUPERVISOR_IMAGE`  | `ghcr.io/copilotkit/openbot-supervisor`     |
 | `agent-bot`       | `BOT_IMAGE`         | `ghcr.io/copilotkit/openbot-agent-bot`      |
 | `agent-langgraph` | `LANGGRAPH_IMAGE`   | `ghcr.io/copilotkit/openbot-agent-langgraph`|
-| `migrate`         | `SERVER_IMAGE`      | `ghcr.io/copilotkit/openbot-server`         |
+| `server`, `worker`, `migrate` | `SERVER_IMAGE` | `ghcr.io/copilotkit/openbot-server` |
 
 Unset, each names a local tag and Compose builds it, which is what a checkout of this repository
 does. Set to a published reference, pinned by digest, together with `IMAGE_PULL_POLICY=missing`,
@@ -1037,6 +1234,26 @@ useful answer is that the image could not be fetched. Somewhere that must never 
 `build` sections away instead.
 
 `docs/releasing.md` shows reading the digests straight out of a release's `container-images.json`.
+
+## Setup checklist
+
+**Settings → Setup** shows admins one row each for
+CopilotKit Intelligence, the AI model, the Bot computer, more apps (Composio or Arcade) and Slack and
+Teams. They are read from `GET /api/setup`, and `POST /api/setup/check` asks again.
+
+- **Ready means it works.** Intelligence is read from its own entitlement answer and the model from
+  the provider's answer for the key in use now. A computer is Ready when every running one took its
+  network policy; with none running it reads "not checked". More apps and Slack and Teams read Ready
+  when they are configured.
+- **Who reads it decides what it says.** An admin, and somebody running OpenBot alone
+  (`OPENBOT_SINGLE_USER`), is shown the page or the variable that closes each gap. Everybody else sees
+  whether it works and "Your admin sets this up.", and their response carries no variable name.
+  Only those who can act on it get the Settings page.
+- **What it costs.** Both routes need a signed-in person. Answers from Intelligence, the provider and
+  the computers are kept for five minutes. A read asks again sooner only when one of them could not
+  be had (Intelligence did not answer, or the provider was never asked about the key in use); a
+  refusal waits for Check again or for the five minutes. Asking again, by a read or by Check again,
+  happens at most once every ten seconds for the whole server, and never wakes a stopped computer.
 
 ## Ports
 
@@ -1090,6 +1307,20 @@ tenant:
   id: openbot
   product_name: OpenBot
 ```
+
+`tenant.id` owns the Bots and channels the package seeds, and names the deployment when
+`DEPLOYMENT_ID` is unset. A package that changes its id lists the ids it had before:
+
+```yaml
+tenant:
+  id: openbot
+  former_ids: [personal]
+  product_name: OpenBot
+```
+
+A deployment set up under a former id keeps that name, and its Bots and channels move to the new id
+on the next start. Without it, the server refuses the package's own Bots as another package's and
+does not start.
 
 Optional theme:
 
@@ -1232,7 +1463,7 @@ model:
 
 `provider` must be `openai` or `anthropic`. `credential_secret_ref` is a reference to a stored credential, not a credential value. `default_model` is passed through as written, so an OpenAI-compatible endpoint reached through `OPENAI_BASE_URL` takes the name that endpoint publishes.
 
-At start-up the server asks OpenAI or Anthropic, once, whether the configured key can call `default_model`. A key that cannot (a project key whose model allowlist leaves it out, say) would otherwise fail at the first message; instead the log says `model-unavailable`, naming the model and the fix. A rejected key logs `model-credential-rejected`. Nothing is asked with no key configured yet, or of an endpoint set by `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, and start-up never waits for the answer.
+At start-up the server asks OpenAI or Anthropic, once, whether the configured key can call `default_model`. A key that cannot (a project key whose model allowlist leaves it out, say) would otherwise fail at the first message; instead the log says `model-unavailable`, naming the model and the fix. A rejected key logs `model-credential-rejected`. Nothing is asked with no key configured yet, or of an endpoint set by `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` to another host. A base URL that is the provider's own API written out (`https://api.openai.com/v1`, say) is still asked. Start-up never waits for the answer, which the [setup checklist](#setup-checklist) also shows.
 
 ### `knowledge.yaml`
 

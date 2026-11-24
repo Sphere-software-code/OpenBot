@@ -1,3 +1,5 @@
+import { readFiring } from "@openbot/shared/routine-firing";
+import { isStarterTourAgent } from "@openbot/shared/starter-tour";
 import {
   and,
   asc,
@@ -23,19 +25,28 @@ import type { AppVariables } from "../auth/guards";
 import type { Database } from "../db/client";
 import {
   agentProfiles,
+  agents,
+  botTasks,
   channelAgents,
   channelMemberships,
   channels,
   intelligenceChannelMappings,
+  users,
 } from "../db/schema";
 import { parsePageLimit } from "../paging";
+import type { UserPreferencesStore } from "../user-preferences";
 import {
   CHANNEL_ACTIVITY_TOPIC,
   type ChannelActivityEvent,
   type ChannelEventHub,
 } from "./events";
 import { upgradeWebSocket } from "./socket";
-import { oneLine } from "./text";
+import {
+  firstPlainLine,
+  MAX_TITLE_GRAPHEMES,
+  oneLine,
+  plainLine,
+} from "./text";
 import type { ThreadIdentity } from "./thread-identity";
 import { type ChannelWork, channelWorkDto, workIn } from "./working";
 
@@ -58,8 +69,13 @@ export type AgentChannel = {
 
 /** A channel plus the last thing said in it, which is what a roster renders. */
 export type ChannelSummary = AgentChannel & {
-  /** A few words about the conversation, or null. Readers fall back to the channel's name. */
+  /**
+   * What the conversation is called, or null: the name its owner gave it, else the few words the
+   * naming sweep wrote. Readers fall back to `opening`, then the channel's name.
+   */
   summary: string | null;
+  /** The person's first words here, plain, or null: the conversation's name until `summary`. */
+  opening: string | null;
   lastMessage: string | null;
   lastMessageAgentId: string | null;
   createdAt: Date;
@@ -67,6 +83,13 @@ export type ChannelSummary = AgentChannel & {
   pinned: boolean;
   /** When the caller last had this channel open, or null for never. The caller's, only. */
   lastReadAt: Date | null;
+  /** Whether the caller started this conversation, which is who may rename it. See `rename`. */
+  canRename: boolean;
+  /**
+   * Whether this is a task's own conversation (tasks/*), which holds one piece of work. Choosers of
+   * "a conversation with this Bot", such as where its check-ins reach the person, leave these out.
+   */
+  task: boolean;
 };
 
 /** What a client that ran an agent reports back about the message it just saw. */
@@ -156,11 +179,13 @@ export function decodeChannelCursor(
  *
  * The browser repeats the recency half when the socket patches a row, and lifts pinned rows at
  * render; both must agree with this, or the list reorders itself on the next event. See `byRecency`
- * in use-channel-events.ts and `pinnedFirst` in app-sidebar.tsx.
+ * in use-channel-events.ts and `pinnedFirst` in app-sidebar.tsx. A routine's question about which
+ * conversation to post in lists them in this order too (routines/store.ts), so the person reads its
+ * options in the order the sidebar shows them. Any query using it must join `channelMemberships`.
  */
 const PINNED_RANK = sql`case when ${channelMemberships.pinnedAt} is not null then 1 else 0 end`;
 const RECENCY = sql`coalesce(${channels.lastMessageAt}, ${channels.createdAt})`;
-const ROSTER_ORDER = [
+export const ROSTER_ORDER = [
   sql`${PINNED_RANK} desc`,
   sql`${RECENCY} desc`,
   desc(channels.id),
@@ -170,7 +195,16 @@ const ROSTER_ORDER = [
 type ChannelTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export type ChannelStore = {
-  create(actor: AgentActor, agentIds: string[]): Promise<AgentChannel>;
+  /**
+   * A new conversation. On `transaction` when one is given, so a record that names the conversation
+   * (a task's, tasks/runner.ts) commits with it or not at all: the conversation is never visible
+   * without the record that says what it is for.
+   */
+  create(
+    actor: AgentActor,
+    agentIds: string[],
+    transaction?: ChannelTransaction,
+  ): Promise<AgentChannel>;
   /**
    * The one conversation this person has with this Bot alone, made if they have not had one yet.
    *
@@ -180,7 +214,8 @@ export type ChannelStore = {
    * five Knowledge channels, four of them empty, and no way to tell which one holds the answer.
    *
    * The one it finds is the one the person already talks to that Bot in, which is also where they
-   * would look for the answer.
+   * would look for the answer. Never a task's own conversation: that one holds one piece of work,
+   * and is often the newest, so ordering alone would pick it.
    */
   direct(actor: AgentActor, agentId: string): Promise<AgentChannel>;
   get(actor: AgentActor, channelId: string): Promise<AgentChannel | null>;
@@ -194,6 +229,19 @@ export type ChannelStore = {
   /** Stamp the caller's own membership as read now. Throws ChannelNotFoundError for a non-member. */
   markRead(actor: AgentActor, channelId: string): Promise<void>;
   /**
+   * Name the conversation, or clear the name with null, for every member.
+   *
+   * Only the person who started it may: the earliest member, the same person a group calls its
+   * creator. Throws ChannelNotFoundError for a non-member and ChannelNotOwnerError for any other
+   * member. Resolves to what the conversation is called now, which is the summary again once a
+   * name is cleared.
+   */
+  rename(
+    actor: AgentActor,
+    channelId: string,
+    title: string | null,
+  ): Promise<string | null>;
+  /**
    * Hide the channel for every member. Soft: the row and the thread survive, every read filters.
    * Throws ChannelNotFoundError for a non-member and ChannelPackageOwnedError for a channel the
    * tenant package defines, which configuration owns rather than any member.
@@ -202,7 +250,11 @@ export type ChannelStore = {
    * True when this call deleted the channel; false when it was already deleted. A repeat is a
    * no-op, so it announces nothing and its route records nothing.
    */
-  softDelete(actor: AgentActor, channelId: string): Promise<boolean>;
+  softDelete(
+    actor: AgentActor,
+    channelId: string,
+    discardFailedStart?: boolean,
+  ): Promise<boolean>;
   recordActivity(
     actor: AgentActor,
     channelId: string,
@@ -257,9 +309,20 @@ const PRIVATE_AGENT_CHANNEL_DESCRIPTION = "Private agent channel.";
 const MAX_CHANNEL_NAME_CODE_POINTS = 120;
 const MAX_ACTIVITY_GRAPHEMES = 200;
 
-/** Reduce a message to the one line a roster draws. See `oneLine` for why it is shared. */
+/**
+ * Reduce a message to the one line a roster draws, as plain text. See `plainLine`: until a
+ * conversation has a name this line stands in for one, so a Bot's Markdown must not reach it.
+ */
 function previewOf(text: string) {
-  return oneLine(text, MAX_ACTIVITY_GRAPHEMES);
+  return plainLine(text, MAX_ACTIVITY_GRAPHEMES);
+}
+
+/**
+ * What a person's message says, as the conversation's name until it has one. A routine's framed
+ * instruction is its instruction, the same as the summary sweep reads it.
+ */
+function openingOf(text: string) {
+  return plainLine(readFiring(text) ?? text, MAX_TITLE_GRAPHEMES);
 }
 
 function channelName(names: string[]) {
@@ -268,6 +331,48 @@ function channelName(names: string[]) {
   if (codePoints.length <= MAX_CHANNEL_NAME_CODE_POINTS) return joined;
   return `${codePoints.slice(0, MAX_CHANNEL_NAME_CODE_POINTS - 1).join("")}…`;
 }
+
+/**
+ * What a conversation is called: what its Bots are called now.
+ *
+ * A conversation's stored name is its Bots' names when it was made, and nothing wrote it again, so
+ * a Bot renamed on its Setup page went on under its old name in the conversation header, the sidebar
+ * and every list of conversations. Read here from the Bots instead, cut the way {@link channelName}
+ * cuts. A group's Bots keep the order its stored name gives them, and one renamed since goes last.
+ * A package's conversations are named by the package and keep that name.
+ */
+export const conversationName = sql<string>`case when ${channels.packageId} is null then coalesce((
+  select case when char_length(named.joined) <= ${MAX_CHANNEL_NAME_CODE_POINTS}::int then named.joined
+    else left(named.joined, ${MAX_CHANNEL_NAME_CODE_POINTS - 1}::int) || '…' end
+  from (
+    select string_agg(${agents.name}, ', ' order by
+      nullif(strpos(', ' || ${channels.name} || ', ', ', ' || ${agents.name} || ', '), 0) nulls last,
+      ${channelAgents.agentId}) as joined
+    from ${channelAgents}
+    inner join ${agents} on ${agents.id} = ${channelAgents.agentId}
+    where ${channelAgents.channelId} = ${channels.id}
+  ) named
+  where named.joined is not null
+), ${channels.name}) else ${channels.name} end`;
+
+/**
+ * Who started a conversation: its earliest member, ties broken by id. The order `summary.ts` reads
+ * a thread in and a group names its creator by, so all three agree on one person.
+ */
+function starterOf(channelId: typeof channels.id) {
+  return sql<
+    string | null
+  >`(select ${channelMemberships.userId} from ${channelMemberships} where ${channelMemberships.channelId} = ${channelId} order by ${channelMemberships.createdAt} asc, ${channelMemberships.userId} asc limit 1)`;
+}
+
+/**
+ * What a conversation is called: the name the person who started it gave it, else the summary the
+ * naming sweep wrote, else null. Every reader of a conversation's name reads it through this, so a
+ * chosen name shows wherever the summary did.
+ */
+export const conversationCalled = sql<
+  string | null
+>`coalesce(${channels.title}, ${channels.summary})`;
 
 export function createChannelStore(
   database: Database,
@@ -406,7 +511,8 @@ export function createChannelStore(
   };
 
   const store: ChannelStore = {
-    create(actor, agentIds) {
+    create(actor, agentIds, transaction) {
+      if (transaction) return makeChannel(transaction, actor, agentIds);
       return database.transaction(
         async (transaction) => makeChannel(transaction, actor, agentIds),
         { isolationLevel: "read committed" },
@@ -459,6 +565,9 @@ export function createChannelStore(
               and(
                 isNull(channels.deletedAt),
                 sql`(select count(*) from ${channelAgents} where ${channelAgents.channelId} = ${channels.id}) = 1`,
+                // A task's conversation is made with its task row in one transaction, so a
+                // conversation without one is never a task's caught halfway.
+                sql`not exists (select 1 from ${botTasks} where ${botTasks.channelId} = ${channels.id})`,
               ),
             )
             .orderBy(...ROSTER_ORDER)
@@ -482,7 +591,7 @@ export function createChannelStore(
       const rows = await database
         .select({
           id: channels.id,
-          name: channels.name,
+          name: conversationName,
           agentId: channelAgents.agentId,
           threadId: intelligenceChannelMappings.threadId,
           lastMessageAt: channels.lastMessageAt,
@@ -588,17 +697,20 @@ export function createChannelStore(
       const rows = await database
         .select({
           id: channels.id,
-          name: channels.name,
+          name: conversationName,
           agentId: channelAgents.agentId,
           threadId: intelligenceChannelMappings.threadId,
           deletedAt: agentProfiles.deletedAt,
-          channelSummary: channels.summary,
+          channelSummary: conversationCalled,
+          opening: channels.opening,
           lastMessage: channels.lastMessage,
           lastMessageAt: channels.lastMessageAt,
           lastMessageAgentId: channels.lastMessageAgentId,
           createdAt: channels.createdAt,
           pinnedAt: channelMemberships.pinnedAt,
           lastReadAt: channelMemberships.lastReadAt,
+          canRename: sql<boolean>`${starterOf(channels.id)} = ${actor.id}`,
+          task: sql<boolean>`exists (select 1 from ${botTasks} where ${botTasks.channelId} = ${channels.id})`,
         })
         .from(channels)
         .innerJoin(
@@ -652,12 +764,15 @@ export function createChannelStore(
           threadId: row.threadId,
           active: row.deletedAt === null,
           summary: row.channelSummary,
+          opening: row.opening,
           lastMessage: row.lastMessage,
           lastMessageAt: row.lastMessageAt,
           lastMessageAgentId: row.lastMessageAgentId,
           createdAt: row.createdAt,
           pinned: row.pinnedAt !== null,
           lastReadAt: row.lastReadAt,
+          canRename: row.canRename,
+          task: row.task,
         });
       }
       return { channels: [...summaries.values()], nextCursor };
@@ -750,7 +865,58 @@ export function createChannelStore(
       if (updated.length === 0) throw new ChannelNotFoundError(channelId);
     },
 
-    async softDelete(actor, channelId) {
+    async rename(actor, channelId, title) {
+      return await database.transaction(
+        async (transaction) => {
+          const [row] = await transaction
+            .select({ starter: starterOf(channels.id) })
+            .from(channels)
+            .innerJoin(
+              channelMemberships,
+              and(
+                eq(channelMemberships.channelId, channels.id),
+                eq(channelMemberships.userId, actor.id),
+              ),
+            )
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+          // Not a member, no such channel, or a deleted one: the same answer every way.
+          if (!row) throw new ChannelNotFoundError(channelId);
+          if (row.starter !== actor.id)
+            throw new ChannelNotOwnerError(channelId);
+
+          const [renamed] = await transaction
+            .update(channels)
+            .set({ title, updatedAt: new Date() })
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            .returning({
+              name: conversationCalled,
+            });
+          if (!renamed) throw new ChannelNotFoundError(channelId);
+
+          const members = await transaction
+            .select({ userId: channelMemberships.userId })
+            .from(channelMemberships)
+            .where(eq(channelMemberships.channelId, channelId));
+
+          // Every member, on commit, like a summary: the name is the conversation's, not one person's.
+          const event: ChannelActivityEvent = {
+            channelId,
+            memberIds: members.map((member) => member.userId),
+            lastMessage: null,
+            lastMessageAt: null,
+            lastMessageAgentId: null,
+            summary: renamed.name,
+          };
+          await transaction.execute(
+            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
+          );
+          return renamed.name;
+        },
+        { isolationLevel: "read committed" },
+      );
+    },
+
+    async softDelete(actor, channelId, discardFailedStart = false) {
       return await database.transaction(
         async (transaction) => {
           const [row] = await transaction
@@ -775,13 +941,33 @@ export function createChannelStore(
             .update(channels)
             .set({ deletedAt: new Date(), updatedAt: new Date() })
             .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
-            .returning({ id: channels.id });
+            .returning({
+              id: channels.id,
+              lastMessageAt: channels.lastMessageAt,
+            });
           /*
            * And the rest of the no-op: a repeat changed nothing, so nothing is announced. Without
            * this, every repeat told every member again, and the route wrote another
            * `channel.deleted` row to an append-only trail for a deletion that had not happened.
            */
           if (stamped.length === 0) return false;
+
+          // A failed start can delete its newly created, still-empty conversation.
+          // Release only that account's matching claim, never a used tour.
+          if (discardFailedStart && stamped[0]?.lastMessageAt === null) {
+            await transaction
+              .update(users)
+              .set({
+                preferences: sql`${users.preferences} - 'starterTourChannelId'`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(users.id, actor.id),
+                  sql`${users.preferences}->>'starterTourChannelId' = ${channelId}`,
+                ),
+              );
+          }
 
           // Read on this transaction, so the members told are the ones the channel had when it was
           // hidden. Soft leaves the membership rows in place, so this reads the same list a repeat
@@ -890,27 +1076,76 @@ export function createChannelStore(
               ),
             )
             .returning({ id: channels.id });
+
+          /*
+           * A person's first words are what the conversation is called until it is named.
+           *
+           * Written whether or not the line above moved: a person's message reported after the Bot's
+           * reply is stale as the last message and is still the first thing they said. Only while
+           * there is none, so the first to arrive keeps it.
+           */
+          const opening =
+            activity.agentId === null ? openingOf(activity.text) : "";
+          const opened =
+            opening.length > 0 &&
+            (
+              await transaction
+                .update(channels)
+                .set({ opening })
+                .where(
+                  and(eq(channels.id, channelId), isNull(channels.opening)),
+                )
+                .returning({ id: channels.id })
+            ).length > 0;
+
           // Nothing changed, so there is nothing to announce: a stale report is not news.
-          if (applied.length === 0) return;
+          if (applied.length === 0 && !opened) return;
 
           const members = await transaction
             .select({ userId: channelMemberships.userId })
             .from(channelMemberships)
             .where(eq(channelMemberships.channelId, channelId));
+          const memberIds = members.map((member) => member.userId);
 
           // Announced inside the transaction, so it is delivered on commit and a write that rolls
           // back is never announced. The payload carries the members because the writer has already
-          // resolved them; NOTIFY caps at 8000 bytes, which a 200-character preview leaves room in.
-          const event: ChannelActivityEvent = {
-            channelId,
-            memberIds: members.map((member) => member.userId),
-            lastMessage,
-            lastMessageAt: activity.at.toISOString(),
-            lastMessageAgentId: activity.agentId,
-          };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          // resolved them; NOTIFY caps at 8000 bytes, which a 200-character preview and a first line
+          // no longer than it leave room in.
+          if (applied.length > 0) {
+            const event: ChannelActivityEvent = {
+              channelId,
+              memberIds,
+              lastMessage,
+              lastMessageAt: activity.at.toISOString(),
+              lastMessageAgentId: activity.agentId,
+              ...(activity.agentId !== null
+                ? {
+                    firstLine: firstPlainLine(
+                      activity.text,
+                      MAX_ACTIVITY_GRAPHEMES,
+                    ),
+                  }
+                : {}),
+            };
+            await transaction.execute(
+              sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
+            );
+          }
+          // On its own event, like a summary: it patches one field, and a stale message must not
+          // carry its preview onto the row.
+          if (opened) {
+            const event: ChannelActivityEvent = {
+              channelId,
+              memberIds,
+              lastMessage: null,
+              lastMessageAt: null,
+              lastMessageAgentId: null,
+              opening,
+            };
+            await transaction.execute(
+              sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
+            );
+          }
         },
         { isolationLevel: "read committed" },
       );
@@ -1009,6 +1244,14 @@ export class ChannelNotFoundError extends Error {
   }
 }
 
+/** A member asked to rename a conversation somebody else started. */
+export class ChannelNotOwnerError extends Error {
+  constructor(id: string) {
+    super(`Channel ${id} was started by somebody else.`);
+    this.name = "ChannelNotOwnerError";
+  }
+}
+
 export class ChannelPackageOwnedError extends Error {
   constructor(id: string) {
     super(`Channel ${id} is defined by the deployment package.`);
@@ -1021,6 +1264,39 @@ type ChannelInputParseResult =
   | { ok: false; error: string };
 
 type ChannelInputObject = { agentIds?: unknown };
+
+/** How long a name a person gives a conversation may be: the same cap the naming sweep keeps to. */
+export const MAX_CHOSEN_TITLE_GRAPHEMES = MAX_TITLE_GRAPHEMES;
+
+/**
+ * A rename's body: `{ title }`, one line. Blank or null clears the name, so the conversation goes
+ * back to the summary it was given.
+ */
+export function parseTitleInput(
+  input: unknown,
+): { ok: true; title: string | null } | { ok: false; error: string } {
+  if (!isChannelInputObject(input) || !("title" in input)) {
+    return { ok: false, error: "Send the new name as title." };
+  }
+  const { title } = input as { title: unknown };
+  if (title === null) return { ok: true, title: null };
+  if (typeof title !== "string") {
+    return { ok: false, error: "The name must be text." };
+  }
+  // The roster draws one line, so a pasted newline or tab becomes a space here rather than there.
+  const line = oneLine(title, Number.MAX_SAFE_INTEGER);
+  if (!line) return { ok: true, title: null };
+  if (
+    Array.from(new Intl.Segmenter().segment(line)).length >
+    MAX_CHOSEN_TITLE_GRAPHEMES
+  ) {
+    return {
+      ok: false,
+      error: `Keep the name to ${MAX_CHOSEN_TITLE_GRAPHEMES} characters or fewer.`,
+    };
+  }
+  return { ok: true, title: line };
+}
 
 export function parseChannelInput(input: unknown): ChannelInputParseResult {
   if (!isChannelInputObject(input)) {
@@ -1117,6 +1393,7 @@ export function createChannelRoutes(
   events?: ChannelEventHub,
   /** Where a channel's removal is written. Absent in tests that do not care about the trail. */
   auditStore?: AuditStore,
+  preferences?: Pick<UserPreferencesStore, "claimStarterTour">,
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
 
@@ -1200,6 +1477,24 @@ export function createChannelRoutes(
         context.var.actor,
         parsed.value.agentIds,
       );
+      if (
+        preferences &&
+        channel.agentIds.length === 1 &&
+        isStarterTourAgent(channel.agentIds[0] ?? "")
+      ) {
+        try {
+          await preferences.claimStarterTour(context.var.actor.id, channel.id);
+        } catch (error) {
+          // Creation already succeeded. A preference failure must not invite a duplicate retry.
+          console.error(
+            JSON.stringify({
+              type: "starter-tour-claim-failed",
+              channelId: channel.id,
+              error: String(error),
+            }),
+          );
+        }
+      }
       return context.json({ channel: channelDto(channel) }, 201);
     } catch (error) {
       return mapStoreError(context, error);
@@ -1308,6 +1603,22 @@ export function createChannelRoutes(
     }
   });
 
+  routes.put("/:channelId/title", requireUser, async (context) => {
+    const parsed = parseTitleInput(await context.req.json().catch(() => null));
+    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+    try {
+      const summary = await store.rename(
+        context.var.actor,
+        context.req.param("channelId"),
+        parsed.title,
+      );
+      return context.json({ summary });
+    } catch (error) {
+      return mapStoreError(context, error);
+    }
+  });
+
   routes.put("/:channelId/read", requireUser, async (context) => {
     try {
       await store.markRead(context.var.actor, context.req.param("channelId"));
@@ -1320,7 +1631,11 @@ export function createChannelRoutes(
   routes.delete("/:channelId", requireUser, async (context) => {
     const channelId = context.req.param("channelId");
     try {
-      const deleted = await store.softDelete(context.var.actor, channelId);
+      const deleted = await store.softDelete(
+        context.var.actor,
+        channelId,
+        context.req.query("discardFailedStart") === "true",
+      );
       // A repeat is still 204, but it deleted nothing, and the trail records acts, not attempts.
       if (deleted !== false) await recordDeleted(context, channelId);
       return context.body(null, 204);
@@ -1377,12 +1692,15 @@ function channelSummaryDto(
   return {
     ...channelDto(channel),
     summary: channel.summary,
+    opening: channel.opening,
     lastMessage: channel.lastMessage,
     lastMessageAgentId: channel.lastMessageAgentId,
     createdAt: channel.createdAt.toISOString(),
     pinned: channel.pinned,
     // Serialised as ISO-8601 like lastMessageAt, so the browser can compare the two as strings.
     lastReadAt: channel.lastReadAt?.toISOString() ?? null,
+    canRename: channel.canRename,
+    task: channel.task,
     work: work.map(channelWorkDto),
     /*
      * Only ever true from here. A person's own run is not on any row this can read, so a roster
@@ -1398,6 +1716,14 @@ function mapStoreError(context: Context, error: unknown): Response {
   }
   if (error instanceof ChannelNotFoundError) {
     return context.json({ error: "Couldn't find that conversation." }, 404);
+  }
+  if (error instanceof ChannelNotOwnerError) {
+    return context.json(
+      {
+        error: "Only the person who started this conversation can rename it.",
+      },
+      403,
+    );
   }
   if (error instanceof ChannelPackageOwnedError) {
     return context.json(

@@ -13,6 +13,9 @@ import { vendorSentence } from "../composio";
 import type { AccountRef } from "../shared-accounts";
 import type { SharedUseStore } from "../shared-use-store";
 import type { PluginStore } from "../store";
+import { withVendorDeadline } from "../vendor-deadline";
+
+export { withVendorDeadline };
 
 /**
  * What the plugin route groups share. See `../routes.ts`, which builds one of these and mounts
@@ -77,6 +80,43 @@ export function brokerRefusal(
 }
 
 /**
+ * The broker's name, as a sentence written for an operator spells it.
+ *
+ * A person connects their work apps through OpenBot and is never told which company sits behind
+ * it. Most of the broker layer's sentences were written for an operator who can open that company's
+ * dashboard, so they name it; a route a person calls passes each one through {@link forPerson}.
+ */
+const NAMES_THE_BROKER = /\bComposio\b/;
+
+/**
+ * A sentence a person reads, kept free of the broker's name.
+ *
+ * A sentence that names the broker was written for the operator, and its remedy is somewhere a
+ * person cannot go. The person gets the route's own sentence instead, which says what failed and
+ * who to ask, and the operator's sentence goes to the log, where the admin who can act on it reads.
+ * The status is unchanged: only the words differ.
+ */
+export function forPerson(sentence: string, generic: string): string {
+  if (!NAMES_THE_BROKER.test(sentence)) return sentence;
+  console.error(
+    JSON.stringify({
+      type: "broker-sentence-kept-from-person",
+      note: sentence,
+    }),
+  );
+  return generic;
+}
+
+/** {@link brokerRefusal} for a route a person calls: see {@link forPerson}. */
+export function personRefusal(
+  error: unknown,
+  generic: string,
+): { error: string; status: 502 | 503 } {
+  const refusal = brokerRefusal(error, generic);
+  return { ...refusal, error: forPerson(refusal.error, generic) };
+}
+
+/**
  * A return address this deployment could not use, said once where an operator will read it.
  *
  * THE REMEDY AND THE READER HAD COME APART, WHICH IS WHAT THIS CLOSES. Both routes that check a
@@ -111,13 +151,13 @@ export function logReturnUrlRefusal(error: unknown, serverId: string): void {
  * names the setting rather than quoting it: a key that was pasted with a space in it, or one for
  * another project, is the likeliest reason the vendor will not talk to this deployment at all.
  *
- * THE VENDOR AND ITS SETTING COME OFF THE ACTIVE PROVIDER'S PROFILE, because the client shows the
- * server's sentence in preference to its own fallback: a sentence that spelled one broker was read
- * by an operator of the other.
+ * THE SETTING COMES OFF THE ACTIVE PROVIDER'S PROFILE, because the client shows the server's
+ * sentence in preference to its own fallback: a sentence that spelled one broker's variable was read
+ * by an operator of the other. The broker itself is not named: the directory is OpenBot's.
  */
 export function directoryUnavailable(provider: BrokerProvider): string {
-  const { vendor, envVar } = BROKERED_PROFILE[provider];
-  return `${vendor} would not answer with its app directory, and said nothing about why. Check that ${envVar} is this project's key, and check ${vendor}'s status if it persists.`;
+  const { envVar } = BROKERED_PROFILE[provider];
+  return `Couldn't load the apps you can connect, and no reason was given. Check that ${envVar} is this project's key, and try again in a moment.`;
 }
 
 /**
@@ -175,6 +215,9 @@ export const AUTHORIZATION_REFUSALS = [
   "authorization-failed",
   // The app's account context moved on while the consent was open (D28).
   "context-changed",
+  // The consent was begun under the name this person was filed under before the deployment gave
+  // them their own, so it was refused before the vendor was asked and nothing there was touched.
+  "name-changed",
   // The person can no longer act on the app's account — a Shared app's administrator was demoted,
   // or the app itself stopped resolving to an account — so the consent was closed and nothing moved.
   "not-permitted",
@@ -200,42 +243,6 @@ export function sameAccount(left: AccountRef, right: AccountRef): boolean {
 }
 
 /**
- * A BROKER CALL THAT DID NOT ANSWER INSIDE ITS BOUND, AND CARRYING NOTHING OF THE VENDOR'S (D31).
- *
- * The message names this deployment's own bound and the thrown object has no `cause`, deliberately:
- * a call that times out on the return leg is a call whose answer would have carried a LIVE provider
- * access token and a full profile, and the one thing certain about a half-read answer is that
- * nobody has narrowed it yet. So there is nothing here to attach, log or quote — which is the same
- * promise {@link brokerRefusal} makes about the vendor's own errors, kept by having no vendor
- * material to begin with.
- *
- * It is an ordinary `Error` to every reader of it: `brokerSentence` does not author it and
- * `vendorSentence` finds no nested body, so every call site below answers it with its OWN generic
- * sentence and a 502 — "we asked and got nothing back", which is exactly what happened.
- *
- * NOT EXPORTED, because nothing outside this file should be branching on it: every exit it can
- * reach is already one of this file's own refusals, and a caller matching on the class would be
- * re-deciding what the catch blocks here have decided.
- */
-class VendorTimeoutError extends Error {
-  constructor(afterMs: number) {
-    super(`The broker did not answer within ${afterMs}ms.`);
-    this.name = "VendorTimeoutError";
-  }
-}
-
-/**
- * How long ONE outbound call to the broker may take before this deployment stops waiting on it.
- *
- * EVERY CALL OUT OF THIS FILE GOES THROUGH {@link withVendorDeadline}, and that is the invariant
- * rather than the number. A bound on how MANY times something is attempted is not a bound at all
- * while each attempt is unbounded: a vendor that accepts the connection and then never writes a
- * byte holds the socket, the handler and the browser open for as long as it cares to, and no retry
- * limit, poll count or loop condition is ever reached because the first wait never ends.
- */
-const VENDOR_CALL_TIMEOUT_MS = 10_000;
-
-/**
  * The same bound on ONE return-leg status poll, and tighter because a browser is held open on it.
  *
  * Five polls at two seconds with four one-second pauses is a worst case of FOURTEEN seconds for the
@@ -249,56 +256,6 @@ export const STATUS_CALL_TIMEOUT_MS = 2_000;
  */
 const STATUS_POLLS = 5;
 const STATUS_PAUSE_MS = 1000;
-
-/**
- * One outbound vendor call under a deadline, with an `AbortSignal` for the seams that take one.
- *
- * THE SIGNAL IS THE HALF THAT MATTERS UPSTREAM AND THE RACE IS THE HALF THAT MATTERS HERE. The race
- * is what lets the handler answer and the browser go; aborting is what stops this deployment from
- * holding a socket open against a vendor it has already given up on, and the seams that can carry
- * a signal take it (see {@link AuthorizationFlow}). A seam that cannot is still bounded by the
- * race — a timeout is a timeout to the person waiting either way — and its call is simply
- * abandoned rather than cancelled.
- *
- * THE TIMER IS CLEARED ON BOTH OUTCOMES. A pending timer on a call that answered in time would keep
- * an event loop alive for the rest of the bound, which in a test run is a suite that will not exit
- * and in a deployment is a handler that has returned still holding a reason not to.
- *
- * NOTHING IS RETRIED HERE. A deadline that retried would be the very shape this fix exists to
- * remove, one layer up.
- */
-export function withVendorDeadline<T>(
-  call: (signal: AbortSignal) => Promise<T>,
-  afterMs: number = VENDOR_CALL_TIMEOUT_MS,
-): Promise<T> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(new VendorTimeoutError(afterMs));
-    }, afterMs);
-  });
-  /*
-   * A CALL THAT THROWS BEFORE IT RETURNS A PROMISE IS A REJECTION, NOT AN ESCAPE. The deadline is
-   * already armed by this line, so invoking `call` bare inside the race would let a synchronous
-   * throw — `brokerReturnUrl` refusing a scheme-less `OPENBOT_APP_URL` while the callback builds its
-   * argument is the one that happens — leave this function before the race and its `.finally`
-   * exist: the timer stays armed, aborts nothing anybody is waiting on and rejects `deadline` with
-   * no one subscribed, and a caller's `.catch(...)` on the returned promise is skipped entirely.
-   * Calling it inside an executor turns that throw into this promise's rejection, still
-   * synchronously and still exactly once.
-   */
-  const answer = new Promise<T>((resolve) => resolve(call(controller.signal)));
-  /*
-   * `Promise.race` subscribes to both, so a call that answers AFTER the deadline has its rejection
-   * observed here and never surfaces as an unhandled one. Its answer is dropped unread, which is
-   * also the D31-safe thing to do with it.
-   */
-  return Promise.race([answer, deadline]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-}
 
 /**
  * Where one authorization has got to, waited for with a BOUND ON THE WHOLE WAIT AND ON EACH CALL.

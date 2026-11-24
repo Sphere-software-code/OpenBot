@@ -1,4 +1,5 @@
 import {
+  IconBrain,
   IconBuildingBank,
   IconChecks,
   IconChevronRight,
@@ -8,9 +9,12 @@ import {
   IconKey,
   IconLayoutGrid,
   IconListDetails,
+  IconLockAccess,
   IconPuzzle,
+  IconRadar,
   IconShieldCheck,
   IconUsers,
+  IconZoomQuestion,
 } from "@tabler/icons-react";
 import {
   createFileRoute,
@@ -76,7 +80,8 @@ const SECTIONS: {
       },
       {
         title: "Computers",
-        description: "Manage the computers that run Bot tools.",
+        description:
+          "Manage the computers that run Bot tools, when idle ones stop, and where they can connect.",
         icon: IconDeviceDesktop,
         linkOptions: { to: "/admin/computers" },
       },
@@ -85,13 +90,21 @@ const SECTIONS: {
   {
     title: "What Bots can do",
     description:
-      "Configure the apps, skills, and UI components available to Bots.",
+      "Configure the models, apps, skills, and UI components available to Bots.",
     items: [
       {
         title: "Plugins",
-        description: "Connect services and choose which Bots can use them.",
+        description:
+          "Connect services, choose which Bots can use them, and approve MCP servers.",
         icon: IconPuzzle,
         linkOptions: { to: "/admin/plugins" },
+      },
+      {
+        title: "Providers",
+        description:
+          "See which provider serves your Bots' models, and choose which models they may use.",
+        icon: IconBrain,
+        linkOptions: { to: "/admin/providers" },
       },
       {
         title: "Skills",
@@ -102,9 +115,16 @@ const SECTIONS: {
       {
         title: "Automatic learning",
         description:
-          "Learn from finished conversations and review the skills it proposes.",
+          "Learn from finished conversations, review the skills it proposes, and choose whether people may share theirs.",
         icon: IconFileText,
         linkOptions: { to: "/admin/learning" },
+      },
+      {
+        title: "Check-ins",
+        description:
+          "Turn check-ins on or off, limit them, and see how often people start what Bots raise.",
+        icon: IconRadar,
+        linkOptions: { to: "/admin/proactive" },
       },
       {
         title: "UI components",
@@ -132,16 +152,16 @@ const SECTIONS: {
         linkOptions: { to: "/admin/people" },
       },
       {
-        title: "Enterprise controls",
+        title: "Permissions",
         description:
-          "Configure roles, groups, SSO, SCIM, Skill sharing, network policies, allowlists, and Action Recording.",
-        icon: IconShieldCheck,
-        linkOptions: { to: "/admin/enterprise" },
+          "Choose what people may do with Bots, for everybody and per role or group.",
+        icon: IconLockAccess,
+        linkOptions: { to: "/admin/permissions" },
       },
       {
         title: "Identity providers",
         description:
-          "Configure your company’s sign-in provider for each email domain.",
+          "Configure your company’s sign-in provider for each email domain, and require SSO.",
         icon: IconBuildingBank,
         linkOptions: { to: "/admin/identity-providers" },
       },
@@ -153,9 +173,17 @@ const SECTIONS: {
     items: [
       {
         title: "Audit",
-        description: "Review actions taken in OpenBot and who took them.",
+        description:
+          "Review actions taken in OpenBot and who took them, and record Bots' commands.",
         icon: IconListDetails,
         linkOptions: { to: "/admin/audit" },
+      },
+      {
+        title: "What would happen",
+        description:
+          "Ask what OpenBot would do if a Bot took an action, and see which control decides.",
+        icon: IconZoomQuestion,
+        linkOptions: { to: "/admin/what-if" },
       },
     ],
   },

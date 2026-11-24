@@ -29,6 +29,7 @@ import { authKeys } from "@/lib/auth/queries";
 import { botLifecycleKeys } from "@/lib/bot-lifecycle/queries";
 import { browserKeys } from "@/lib/browser/queries";
 import { type ChannelSummary, channelKeys } from "@/lib/channels/queries";
+import { deploymentKeys } from "@/lib/deployment/queries";
 import { userPreferencesQueryOptions } from "@/lib/settings/message-list";
 
 // Keep the sidebar's live-update socket offline; these tests exercise HTTP pagination.
@@ -170,6 +171,7 @@ function renderSidebar() {
     selfHostBannerDismissed: false,
     narration: null,
     skin: "openbot",
+    proactive: "on",
   });
   queryClient.setQueryData(authKeys.currentUser(), {
     id: "user",
@@ -178,12 +180,22 @@ function renderSidebar() {
     onboarding: null,
   });
   queryClient.setQueryData(agentKeys.list(false), []);
+  // Read once per page load in the app; the navigation entries depend on the edition.
+  queryClient.setQueryData(deploymentKeys.capabilities(), {
+    generativeUi: true,
+    selfHostBanner: false,
+    localEvaluation: false,
+    edition: "team",
+  });
   // The sidebar's attention list polls on its own schedule; this test counts channel requests only.
   queryClient.setQueryDefaults(botLifecycleKeys.attention, {
     staleTime: Number.POSITIVE_INFINITY,
     refetchInterval: false,
   });
-  queryClient.setQueryData(botLifecycleKeys.attention, []);
+  queryClient.setQueryData(botLifecycleKeys.attention, {
+    bots: [],
+    lastPingId: null,
+  });
   // The Browser button reads whether there is a browser once; answered here so only channel requests are counted.
   queryClient.setQueryData(browserKeys.state, {
     available: false,
@@ -225,16 +237,17 @@ test("message emphasis updates mounted rows from the account preferences cache",
   const view = renderSidebar();
   const agent = await view.findByText("Recent conversation");
   const thread = view.getByText("New conversation");
-  expect(thread.className).toContain("text-[0.9rem]");
+  expect(thread.className).toContain("text-sm");
   act(() =>
     clients[0]?.setQueryData(userPreferencesQueryOptions("user").queryKey, {
       messageListEmphasis: "agent",
       selfHostBannerDismissed: false,
       narration: null,
       skin: "openbot",
+      proactive: "on",
     }),
   );
-  await waitFor(() => expect(agent.className).toContain("text-[0.9rem]"));
+  await waitFor(() => expect(agent.className).toContain("text-sm"));
   expect(thread.className).toContain("text-muted-foreground");
 });
 

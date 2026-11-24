@@ -84,6 +84,60 @@ describe("asking a person", () => {
    * A route that reaches nobody is the row worth finding later: the Bot stopped, the person was
    * never asked, and without it nothing anywhere says so.
    */
+  /*
+   * Several decisions asked at once travel as separate parts, each with its own options, so the
+   * person answers them one at a time rather than parsing "(1) … (2) … (3) …" out of a sentence.
+   */
+  test("several decisions reach the route as parts, with their options", async () => {
+    const asked: unknown[] = [];
+    const tool = escalationTool({
+      from: FROM,
+      route: async (input) => {
+        asked.push(input);
+        return { reached: "the person in this conversation" };
+      },
+    });
+    const parts = [
+      {
+        header: "Tier name",
+        question: "Which paid-tier name?",
+        options: ["Pro", "Plus"],
+      },
+      { header: "Soar", question: "Is Soar in the launch?" },
+    ];
+
+    await tool.execute({ question: "Two launch decisions", parts });
+
+    expect(asked[0]).toMatchObject({ question: "Two launch decisions", parts });
+  });
+
+  /*
+   * One option is a suggestion, not a malformed question. It was refused, which left the person
+   * unasked over a hint; the card offers it as a choice above the field for their own words.
+   */
+  test("a part offering a single option is sent, with the option as a suggestion", async () => {
+    const asked: unknown[] = [];
+    const tool = escalationTool({
+      from: FROM,
+      route: async (input) => {
+        asked.push(input);
+        return { reached: "the person in this conversation" };
+      },
+    });
+    const parts = [
+      { header: "Tier name", question: "Which name?", options: ["Pro"] },
+      { header: "Soar", question: "Is Soar in?" },
+    ];
+
+    const said = await tool.execute({
+      question: "Two launch decisions",
+      parts,
+    });
+
+    expect(String(said)).toStartWith(PUT_TO);
+    expect(asked[0]).toMatchObject({ question: "Two launch decisions", parts });
+  });
+
   test("a question that reached nobody is recorded as one", async () => {
     const { written, store } = recorder();
     const tool = escalationTool({

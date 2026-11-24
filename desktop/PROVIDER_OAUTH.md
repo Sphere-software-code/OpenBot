@@ -1,7 +1,11 @@
 # Model provider OAuth
 
-OpenBot's Google and xAI model connections are separate from signing in to
-OpenBot or CopilotKit. API keys remain available for both providers.
+OpenBot's Google, xAI and Unbiased AI model connections are separate from signing
+in to OpenBot or CopilotKit. API keys remain available for all three providers.
+Google and xAI sign-ins leave a refreshable session in a private credential
+file; Unbiased AI's mints an API key, which is kept like a typed one. The
+ChatGPT and Claude plan sign-ins for OpenAI and Anthropic are a separate path
+and are not covered here.
 
 ## Google Gemini
 
@@ -23,9 +27,10 @@ process environment variables can override those defaults:
 For GitHub-built artifacts, configure repository Actions **variables** named
 `OPENBOT_GOOGLE_MODEL_OAUTH_CLIENT_ID` and
 `OPENBOT_GOOGLE_MODEL_OAUTH_QUOTA_PROJECT`, plus an Actions **secret** named
-`OPENBOT_GOOGLE_MODEL_OAUTH_CLIENT_SECRET` when the client has one. Both the
-Desktop artifact workflow and the Windows signing workflow pass these settings
-to the native build. They become defaults inside the distributed desktop app;
+`OPENBOT_GOOGLE_MODEL_OAUTH_CLIENT_SECRET` when the client has one. Every
+workflow that builds the desktop app passes these settings to the native build:
+Desktop build (which Desktop, Internal build and Publish release call) and
+both signing workflows. They become defaults inside the distributed desktop app;
 the desktop client credential is not a user access or refresh token.
 
 When calling the Desktop workflow as a reusable workflow, pass its optional
@@ -55,6 +60,28 @@ apply.
 
 References: [xAI's OpenCode integration](https://x.ai/news/grok-opencode) and
 [xAI OAuth discovery](https://auth.x.ai/.well-known/openid-configuration).
+
+## Unbiased AI
+
+Unbiased AI sign-in uses the platform's device authorization (RFC 8628): OpenBot asks
+`https://platform.unbiased.ai` for a code, opens the approval page, and polls until
+the person approves. The person signs in or creates an Unbiased AI account there, so
+nobody needs an account before choosing the row. The platform then mints an API key
+for `https://api.unbiased.ai/v1` exactly once and keeps no copy, so the token request
+is never retried: a transport failure ends the sign-in and the person starts again.
+
+The key is long-lived until revoked from the Unbiased AI dashboard and has no refresh
+token, so it is not kept in the OAuth credential file above. It is carried into the
+deployment exactly as a typed endpoint key is, as `OPENAI_API_KEY` against that base
+URL, and saved in the protected store under the same endpoint-scoped entry. Bots run
+the `pareto` model; the composer lists what the gateway's `/v1/models` publishes.
+
+A distributor can set `OPENBOT_UNBIASED_OAUTH_CLIENT_ID` to an alternative client
+registered with Unbiased AI. `OPENBOT_UNBIASED_PLATFORM_URL` points the flow at another
+platform for testing against a mock; the approval URL must belong to that platform.
+
+References: Unbiased AI's partner integration guide, which Unbiased AI shares with each
+partner, and [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628).
 
 ## Other build-time settings
 

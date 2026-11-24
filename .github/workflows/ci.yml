@@ -12,9 +12,18 @@ on:
 permissions:
   contents: read
 
-# The newest push on a branch wins; main runs are retained for badge and release history.
+# The newest push on a pull request wins. Every commit on main keeps its own run, for the badge and
+# for the release: publishing a release relies on main's CI having passed on the commit the release
+# PR merged onto (scripts/release-ci-gate.ts). In one group, a push landing while another commit's
+# run was in progress replaced the pending run of the commit before it, and that commit never got a
+# result.
+#
+# `github.workflow` keeps the release's own call of these checks out of main's group. A called
+# workflow sees its caller's context, so without it Publish release's checks shared
+# `ci-refs/heads/main` with main's push runs: they queued behind whichever was in progress (the
+# five-minute wait before the checks of v0.3.1) and cancelled the one that was pending.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -140,13 +149,35 @@ jobs:
       - run: >-
           bun test tests/sign-in.test.ts tests/session-cookies.test.ts tests/follows-popup.test.ts
           tests/webrtc-proxy.test.ts tests/web-bot-auth-browser.test.ts
-          tests/handoff-page-restore.test.ts tests/enter-text.test.ts tests/person-browser.test.ts tests/person-browser-computer.test.ts
-          tests/bot-browser.test.ts tests/bot-browser-computer.test.ts
-          tests/screencast-keys-browser.test.ts tests/browser-memory.test.ts
+          tests/handoff-page-restore.test.ts tests/handback-fresh-look.test.ts tests/enter-text.test.ts tests/parallel-actions-computer.test.ts tests/person-browser.test.ts tests/person-browser-computer.test.ts
+          tests/bot-browser.test.ts tests/bot-browser-computer.test.ts tests/recorder-capture-pass.test.ts
+          tests/screencast-keys-browser.test.ts tests/screencast-pacing-browser.test.ts tests/browser-memory.test.ts
         working-directory: agent-computer
         env:
           OPENBOT_COMPUTER_BROWSER: '1'
           COMPUTER_BROWSER_MODE: headless
+      # The app's real-browser tests, here because this job has the browser: a running step's words
+      # under reduced motion, where onboarding's Back lands beside the Mac window's buttons, the name
+      # step's orb drawn whole under the step dashes, a conversation's rail of turns clear of the
+      # Bot's text, one frame around an interface drawn in a Card, the page under the update banner
+      # holding still as an update gets ready, and Home's message box holding still while the
+      # microphone's notice shows, which only a browser's layout and cascade resolve. The root
+      # playwright-core is the same version as agent-computer's
+      # playwright, so it finds the Chromium installed above. The onboarding frame reads the
+      # generated app config, which `bun test` alone doesn't write (the test script's pretest does).
+      - run: |
+          bun run generate:app-config
+          bun test app/tests/tool-line-reduced-motion.test.tsx app/tests/onboarding-window-buttons.test.tsx app/tests/onboarding-orb-room.test.tsx app/tests/transcript-rail-clearance.test.tsx app/tests/a2ui-frame.test.tsx app/tests/update-banner-layout.test.tsx app/tests/composer-dictation-notice-layout.test.tsx app/tests/conversation-intro-halo.test.tsx
+        env:
+          OPENBOT_APP_BROWSER: '1'
+      # The desktop setup window's, for the same reason: the AI step's form holding still while the
+      # install behind it comes and goes. It bundles the window from the desktop's own dependencies.
+      - run: bun install --frozen-lockfile
+        working-directory: desktop
+      - run: bun test src/setupLayout.browser.test.ts
+        working-directory: desktop
+        env:
+          OPENBOT_APP_BROWSER: '1'
       # Headed is the default for hosted computers, so it is tested as one: the computer starting its
       # own Xvfb, and the signing again with cross-site frames in processes of their own.
       - run: bun test tests/headed-browser.test.ts
@@ -166,7 +197,7 @@ jobs:
       # One red target must not hide whether another is red too.
       fail-fast: false
       matrix:
-        target: [self-hosted, eks, eks-sandbox, gke, aks]
+        target: [vanilla, self-hosted, eks, eks-sandbox, gke, aks]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -203,6 +234,16 @@ jobs:
       # question: every secret key a container demands has to be one the chart actually writes.
       # Getting that wrong is invisible until a pod starts, and every shipped target had it wrong.
       - run: bun scripts/check-rendered-chart.ts rendered.yaml
+      # The README's vanilla secrets file is the licence and the model key and nothing else: with the
+      # bundled database the chart generates the rest. Rendered without a key encryption key, and held
+      # to the same coherence check, so that stays true.
+      - name: Renders from the licence and the model key alone
+        if: matrix.target == 'vanilla'
+        run: |
+          helm template ci charts/openbot \
+            --values charts/openbot/ci/vanilla-values.yaml \
+            > rendered-generated.yaml
+          bun scripts/check-rendered-chart.ts rendered-generated.yaml
       # No target names a Learning credential, so the setup Job renders nowhere above. Render it with
       # one of each, and hold it to the same coherence check.
       - name: Learning setup Job renders
@@ -292,6 +333,24 @@ jobs:
             --set-string config.push.projectId=not-a-uuid
           refuses "a delivery public URL that is not http(s)" \
             --set-string config.deliveryPublicUrl=hooks.example.com
+          # The bundled Intelligence beside one somebody named, and without the licence a self-hosted
+          # Intelligence needs. Armed only on targets that bundle it.
+          if ! grep -qE '^ *enabled: false' <(sed -n '/^intelligence:/,/^[a-z]/p' charts/openbot/ci/${{ matrix.target }}-values.yaml); then
+            refuses "the bundled Intelligence beside an Intelligence address of your own" \
+              --set-string config.intelligence.apiUrl=https://api.intelligence.copilotkit.ai
+            refuses "the bundled Intelligence with no licence for it" \
+              --set-string secrets.licenseToken= \
+              --set-string intelligence.appApi.licenseSecret.existingSecret=openbot-intel-license
+            refuses "the bundled Intelligence with no project key for OpenBot" \
+              --set intelligence.bootstrap.projects=null
+          else
+            echo "skipped: the bundled-Intelligence refusals are armed only where the target bundles it"
+            refuses "no Intelligence at all" \
+              --set-string config.intelligence.apiUrl= --set-string config.intelligence.gatewayWsUrl=
+          fi
+          # A release from before the bundled Intelligence, upgraded with --reuse-values: refused by
+          # name rather than installing a second Intelligence on that chart's bare defaults.
+          refuses "a release with no intelligence.enabled" --set intelligence=null
           # A warm pool nothing claims from. Only meaningful where the target asks for per-Bot
           # computers; on the others the mode is not sandbox and the refusal is not armed.
           if grep -qE '^ *mode: sandbox' charts/openbot/ci/${{ matrix.target }}-values.yaml; then
@@ -310,9 +369,28 @@ jobs:
       - name: A new values key can be absent
         run: bun scripts/check-new-values-keys.ts charts/openbot/ci/${{ matrix.target }}-values.yaml
 
+  # The suite in shards, one runner each, so the run takes as long as its slowest shard rather than
+  # as long as every file one after another. `bun test --shard` does the split, cut by the per-file
+  # durations in scripts/test-timings.json so the shards take about as long as each other (dealt
+  # round-robin, the few files that take a minute each pile up on one runner). Every shard has its
+  # own database, installs and migration, so the shards share no state, and inside a shard the files
+  # still run one at a time because they share that one database. The `tests` job below is the
+  # result people read.
+  #
+  # The id stays `test` for the upstream upgrade, which runs this job's `run` steps as CI's own
+  # checks (scripts/integrate-upstream.ts); the shard reaches those steps through
+  # .github/actions/test-shard, which says why.
   test:
-    name: tests
+    name: tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+    # Five shards take about three and a half minutes each on the free standard runner, so a
+    # larger runner would add cost without shortening the run.
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard runs to the end, so one red run names every failing test, not just the first
+      # shard's.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     # The suite includes a real database integration test. Without a database it fails on every run,
     # including on main, which trains everyone to read a red CI as normal. pgvector rather than plain
     # postgres because the knowledge schema uses the extension.
@@ -340,6 +418,9 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.3
+      - uses: $/.github/actions/test-shard
+        with:
+          shard: ${{ matrix.shard }}/${{ strategy.job-total }}
       - run: bun install --frozen-lockfile
       # The Bots are not root workspaces and each keeps its own lockfile. The startup tests spawn
       # the real entrypoint, so its dependencies have to be installed as well.
@@ -355,7 +436,7 @@ jobs:
         working-directory: agent-computer
       # Same for the Mastra Bot: root test discovery imports its receiver tests, which load Mastra
       # from that Bot's own dependency tree.
-      - run: bun install
+      - run: bun install --frozen-lockfile
         working-directory: agent-mastra
       # Same for the desktop app: root test discovery imports its React tests, whose JSX runtime is
       # pinned by the desktop lockfile rather than the root one.
@@ -368,9 +449,60 @@ jobs:
       # ../.env; that file does not exist in CI, and DATABASE_URL comes from the job env instead.
       - run: bun scripts/migrate.ts
         working-directory: server
-      # A passing job must include the expected test floor. Import-time failures can otherwise skip
-      # files before their tests are registered.
+      # The Kubernetes promotion tests package the real chart, which carries the bundled PostgreSQL
+      # subchart. It is fetched here with the same pinned Helm the chart job uses, so the tests read it
+      # from charts/ rather than pulling it themselves with whatever Helm the runner image has.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+      - run: helm dependency build charts/openbot
+      # This shard's tests, failing on a failed test or on a count it cannot read. The floor under the
+      # count is the suite's, so the `tests` job checks it on the sum of the shards.
       - run: bun run test:ci
+      # The shard's count, and how long each of its files took.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-shard-${{ matrix.shard }}
+          path: ${{ env.TEST_COUNT_DIR }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # One result for the suite, under the name the unsharded job had. A passing job must include the
+  # expected test floor: import-time failures can otherwise skip files before their tests are
+  # registered, and a shard cannot see that, because it does not know how big it is meant to be. So
+  # this fails when any shard did not succeed, when any shard's count is missing, and when the counts
+  # add up to less than the floor (scripts/test-floor.ts).
+  test-total:
+    name: tests
+    runs-on: ubuntu-latest
+    # Also when a shard failed, so this reports the failure rather than being skipped, which a
+    # required check would read as a pass.
+    if: always()
+    needs: [test]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-shard-*
+          path: ${{ runner.temp }}/test-counts
+          merge-multiple: true
+      - name: The shards passed and add up to the floor
+        env:
+          SHARDS_RESULT: ${{ needs.test.result }}
+        run: bun scripts/test-ci-aggregate.ts "$RUNNER_TEMP/test-counts" "$RUNNER_TEMP/test-timings.json"
+      # This run's per-file durations, to download over scripts/test-timings.json when the shards
+      # drift out of balance.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-timings
+          path: ${{ runner.temp }}/test-timings.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   startup:
     name: startup (${{ matrix.os }})
@@ -391,7 +523,10 @@ jobs:
 
   python-harness:
     name: python harness regressions
-    runs-on: ubuntu-latest
+    # CPU-bound: runs on a 16-core larger runner (org runner group openbot-larger, billed per
+    # minute) for main, releases and pull requests from this repository. Pull requests from forks
+    # stay on the free standard runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'openbot-ubuntu-16core' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -491,6 +626,25 @@ jobs:
       - run: docker compose --env-file /dev/null --profile harness config --format json >/dev/null
         env:
           PICKED_HARNESS_IMAGE: openbot-agent-langgraph-agui:test
+      # Docker Desktop shipped Compose v2.24.5 in early 2024, and that version refuses the whole
+      # project when any service's image is blank, profile or not. The desktop app runs
+      # `compose config` before it starts, so this is the oldest Compose it has to get past.
+      - name: Compose v2.24.5 reads the file with no harness picked
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; sum=94355be1d1d395040bbda1490f98d5c7627c30798a7955e1f2a78fda33a4b3e1 ;;
+            aarch64) arch=aarch64; sum=535e90ff9a7f24384f8a38f9f9ad49125485af7ae5ffda7226d091e5b8126948 ;;
+            *) echo "no pinned Compose v2.24.5 for $(uname -m)" >&2; exit 1 ;;
+          esac
+          compose="$RUNNER_TEMP/docker-compose-2.24.5"
+          curl -fsSL --retry 3 -o "$compose" "https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-$arch"
+          echo "$sum  $compose" | sha256sum -c -
+          chmod +x "$compose"
+          "$compose" version
+          unset PICKED_HARNESS_IMAGE
+          "$compose" -f docker-compose.yml -f desktop/src-tauri/telemetry.compose.yml --env-file /dev/null config --format json >/dev/null
+          PICKED_HARNESS_IMAGE=openbot-agent-langgraph-agui:test "$compose" --env-file /dev/null --profile harness config --format json >/dev/null
 
   build:
     name: build
@@ -543,13 +697,14 @@ jobs:
   # them typecheck, lint and test perfectly.
   image:
     name: image
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'openbot-ubuntu-16core' }}
     # The only slow job: it builds the container and boots it, ~14 minutes. The four checks above are
     # seconds and stay on every push, because they catch most things cheaply. This one is the cost, so
     # on a pull request it runs only when an admin adds the `full-ci` label — the point at which the PR
     # is actually a merge candidate. On main and through the release workflow_call it always runs, so
     # nothing reaches a release without it. `verify` treats a skipped job as passing, so an unlabelled
-    # PR is green on the cheap checks alone.
+    # PR is green on the cheap checks alone. It runs on the 16-core larger runner everywhere except
+    # pull requests from forks, which stay on the free standard runner.
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'full-ci')
@@ -566,7 +721,7 @@ jobs:
           load: true
           tags: openbot:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
       # Building it says the layers resolve. Running it says the supervision tree comes up and stays
       # up, which is a different claim and the one that has broken before.
       - name: The image boots and serves
@@ -624,23 +779,162 @@ jobs:
             docker logs openbot-ci
             exit 1
           }
-      - name: A Bot's shell cannot reach the deployment secrets
+      # Reading a secret is one way to reach it, and the checks below the first two are the others.
+      # Root reads /run/s6/container_environment, so anything that runs a command as root through
+      # sudo is a read of every secret in it; and owning /app is rewriting the code the API runs and
+      # the page it serves. Each of those passed here when this only tried the direct reads.
+      - name: A Bot's shell cannot reach the deployment secrets or the API's code
         run: |
           set -uo pipefail
-          if docker exec -u pwuser openbot-ci env -i PATH=/usr/bin:/bin sh -c '
-                for e in /proc/[0-9]*/environ; do tr "\0" "\n" < "$e" 2>/dev/null; done
-              ' | grep -q "^KEY_ENCRYPTION_KEY="; then
+          failed=0
+          # As a Bot's shell runs: `pwuser`, with an environment of its own rather than the image's.
+          bot() {
+            docker exec -u pwuser openbot-ci env -i PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              HOME=/workspace sh -c "$1"
+          }
+
+          # shellcheck disable=SC2016 # `$e` is the Bot's shell's to expand, not this one's.
+          if bot 'for e in /proc/[0-9]*/environ; do tr "\0" "\n" 2>/dev/null < "$e"; done' \
+              | grep -q "^KEY_ENCRYPTION_KEY="; then
             echo "::error::A pwuser shell reads KEY_ENCRYPTION_KEY from a sibling process /proc/<pid>/environ."
-            exit 1
+            failed=1
           fi
-          if docker exec -u pwuser openbot-ci env -i PATH=/usr/bin:/bin sh -c \
-                'cat /run/s6/container_environment/KEY_ENCRYPTION_KEY 2>/dev/null' | grep -q .; then
+          if bot 'cat /run/s6/container_environment/KEY_ENCRYPTION_KEY 2>/dev/null' | grep -q .; then
             echo "::error::A pwuser shell reads KEY_ENCRYPTION_KEY from /run/s6/container_environment."
+            failed=1
+          fi
+
+          # sudo runs the package helper and nothing else, with the environment reset.
+          granted="$(bot 'sudo -n -l' 2>&1)"
+          commands="$(printf '%s\n' "$granted" | sed -n '/may run the following/,$p' | sed '1d; s/^ *//')"
+          if [ "$commands" != "(root) NOPASSWD: /usr/local/sbin/openbot-apt" ]; then
+            echo "::error::sudo grants pwuser more than openbot-apt: $commands"
+            failed=1
+          fi
+          if ! printf '%s\n' "$granted" | grep -q 'env_reset'; then
+            echo "::error::sudo does not reset the environment for pwuser."
+            failed=1
+          fi
+
+          # Each attempt below is a documented way to make apt-get or dpkg run a command as root
+          # (https://gtfobins.org/gtfobins/apt-get/), and each command it would run is the same
+          # one: create /tmp/openbot-ran-as-root. So the check is both that sudo or the helper said
+          # no, and that the file is not there afterwards. `x.deb` is a real package whose
+          # postinst does the same thing, and `apt.conf` sets both hooks.
+          bot 'set -e; rm -rf /tmp/openbot-probe; mkdir -p /tmp/openbot-probe/pkg/DEBIAN
+            cd /tmp/openbot-probe
+            printf "%s\n" "Package: openbot-probe" "Version: 1.0" "Architecture: all" \
+              "Maintainer: OpenBot CI <ci@example.invalid>" "Description: runs a command as root" \
+              > pkg/DEBIAN/control
+            printf "#!/bin/sh\ntouch /tmp/openbot-ran-as-root\n" > pkg/DEBIAN/postinst
+            chmod 0755 pkg/DEBIAN/postinst
+            dpkg-deb --root-owner-group --build pkg x.deb >/dev/null
+            printf "%s\n" "APT::Update::Pre-Invoke { \"touch /tmp/openbot-ran-as-root\"; };" \
+              "DPkg::Pre-Invoke { \"touch /tmp/openbot-ran-as-root\"; };" > apt.conf' \
+            || { echo "::error::Could not build the probe package as pwuser."; failed=1; }
+          ran_as_root() {
+            docker exec openbot-ci test -e /tmp/openbot-ran-as-root
+          }
+          refused() {
+            docker exec openbot-ci rm -f /tmp/openbot-ran-as-root
+            if bot "cd /tmp/openbot-probe && $1" >/dev/null 2>&1; then
+              echo "::error::Allowed as pwuser: $1"
+              failed=1
+            fi
+            if ran_as_root; then
+              echo "::error::Ran a command as root: $1"
+              failed=1
+            fi
+          }
+          refused 'sudo -n apt-get update -o APT::Update::Pre-Invoke::="touch /tmp/openbot-ran-as-root"'
+          refused 'sudo -n apt-get install -y -c apt.conf jq'
+          refused 'sudo -n dpkg -i x.deb'
+          refused 'sudo -n /usr/local/sbin/openbot-apt update -o APT::Update::Pre-Invoke::="touch /tmp/openbot-ran-as-root"'
+          refused 'sudo -n openbot-apt update extra'
+          refused 'sudo -n openbot-apt install -o DPkg::Pre-Invoke::="touch /tmp/openbot-ran-as-root" jq'
+          refused 'sudo -n openbot-apt install -y -o DPkg::Pre-Invoke::="touch /tmp/openbot-ran-as-root" jq'
+          refused 'sudo -n openbot-apt install -yo DPkg::Pre-Invoke::="touch /tmp/openbot-ran-as-root" jq'
+          refused 'sudo -n openbot-apt install -c apt.conf jq'
+          refused 'sudo -n openbot-apt install --allow-unauthenticated jq'
+          refused 'sudo -n openbot-apt install ./x.deb'
+          refused 'sudo -n openbot-apt install /tmp/openbot-probe/x.deb'
+          refused 'sudo -n openbot-apt install x.deb'
+          refused 'sudo -n openbot-apt install jq=1.0'
+          refused 'sudo -n openbot-apt install sudo-'
+          refused 'sudo -n openbot-apt changelog apt'
+          refused 'sudo -n APT_CONFIG=/tmp/openbot-probe/apt.conf openbot-apt update'
+          # Exported rather than set through sudo, which sudo allows and then resets. The update may
+          # succeed; what must not happen is the hook.
+          docker exec openbot-ci rm -f /tmp/openbot-ran-as-root
+          bot 'APT_CONFIG=/tmp/openbot-probe/apt.conf sudo -n openbot-apt update' >/dev/null 2>&1
+          if ran_as_root; then
+            echo "::error::APT_CONFIG from a Bot's shell reached apt-get as root."
+            failed=1
+          fi
+
+          # And the feature itself, which is the reason sudo is here at all.
+          if ! output="$(bot 'sudo -n openbot-apt update && sudo -n openbot-apt install jq && jq --version' 2>&1)"; then
+            echo "::error::sudo openbot-apt install jq did not install jq."
+            printf '%s\n' "$output" | tail -20
+            failed=1
+          fi
+          # The way a model writes it out of habit, with `-y`, which the helper always answers anyway.
+          if ! output="$(bot 'sudo -n openbot-apt install -y tree && tree --version' 2>&1)"; then
+            echo "::error::sudo openbot-apt install -y tree did not install tree."
+            printf '%s\n' "$output" | tail -20
+            failed=1
+          fi
+
+          # /app is root's: the API's code and the page it serves cannot be changed from here.
+          if bot ': >> /app/app/dist/index.html' 2>/dev/null; then
+            echo "::error::A pwuser shell can write /app/app/dist/index.html, which the API serves."
+            failed=1
+          fi
+          if bot 'touch /app/server/src/openbot-probe.ts' 2>/dev/null; then
+            echo "::error::A pwuser shell can write under /app/server, which the API runs."
+            failed=1
+          fi
+          writable="$(bot 'find /app /usr/local/sbin /etc/sudoers.d \( -writable -o -user pwuser \) -print 2>/dev/null | head -5')"
+          if [ -n "$writable" ]; then
+            echo "::error::pwuser owns or can write: $writable"
+            failed=1
+          fi
+
+          [ "$failed" -eq 0 ] || exit 1
+          echo "pwuser cannot reach KEY_ENCRYPTION_KEY, run anything as root but a package install, or change /app"
+      # A Bot's computer, run the way the chart runs it: as 1001, with the command overridden to the
+      # browser process alone (charts/openbot/templates/computer/statefulset.yaml), which starts its
+      # own X display. What that prints at start is in every install's logs, so it must be the
+      # computer's own lines: the X server once said `_XSERVTransmkdir: ERROR` there on every start,
+      # and xkbcomp a warning for each of seventeen keysyms, though the display worked.
+      - name: A Bot's computer starts as the chart runs it, with nothing from the X server
+        run: |
+          set -euo pipefail
+          docker run -d --name openbot-ci-computer --user 1001 \
+            -e PORT=4100 -e WORKSPACE_DIR=/workspace -e PROFILES_DIR=/profiles \
+            -e HOME=/home/pwuser -e BUN_INSTALL=/home/pwuser/.bun \
+            -e COMPUTER_TOKEN=ci-not-a-real-token -e COMPUTER_SEPARATE_WORKSPACES=on \
+            --entrypoint /usr/local/bin/bun openbot:ci /app/agent-computer/src/index.ts
+          for attempt in $(seq 1 60); do
+            if docker logs openbot-ci-computer 2>&1 | grep -q "agent-computer listening"; then
+              break
+            fi
+            if [ -z "$(docker ps -q -f name=openbot-ci-computer)" ] || [ "$attempt" -eq 60 ]; then
+              echo "::error::The computer did not start."
+              docker logs openbot-ci-computer
+              exit 1
+            fi
+            sleep 1
+          done
+          logs="$(docker logs openbot-ci-computer 2>&1)"
+          if printf '%s\n' "$logs" | grep -Eq '_XSERVTrans|xkbcomp|Could not resolve keysym|ERROR'; then
+            echo "::error::The X server printed at the computer's start."
+            printf '%s\n' "$logs"
             exit 1
           fi
-          echo "pwuser cannot reach KEY_ENCRYPTION_KEY"
+          echo "the computer started headed as 1001 with nothing from the X server"
       - if: always()
-        run: docker rm -f openbot-ci >/dev/null 2>&1 || true
+        run: docker rm -f openbot-ci openbot-ci-computer >/dev/null 2>&1 || true
 
   # The five images the release publishes alongside the one above. Nothing else here builds them:
   # they are built by `docker compose up --build`, which only the smoke journey runs and which
@@ -719,7 +1013,7 @@ jobs:
     name: verify
     runs-on: ubuntu-latest
     if: always()
-    needs: [static, deployables, mobile, computer-browser, chart, test, startup, python-harness, build, migrations, image, component-dockerfiles]
+    needs: [static, deployables, mobile, computer-browser, chart, test, test-total, startup, python-harness, build, migrations, image, component-dockerfiles]
     steps:
       - name: Require every check
         env:

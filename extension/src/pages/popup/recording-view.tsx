@@ -53,6 +53,15 @@ type RecordingActions = {
   voice?: VoiceActions;
 };
 
+/**
+ * Where "See it on Teach a Bot" goes: the page's list of recordings, which opens no browser on arrival (`?recordings`).
+ * Resolved relative to OpenBot's address, so a path prefix on it is kept.
+ */
+function teachABotUrl(openbotUrl: string): string {
+  const base = openbotUrl.endsWith("/") ? openbotUrl : `${openbotUrl}/`;
+  return new URL("browser?recordings=1", base).toString();
+}
+
 /** What the popup shows while a recording runs: time, actions, the voice, the capture rows, and Stop or Start over. */
 export function RecordingView({
   state,
@@ -188,7 +197,7 @@ function keptSentence(kept: NonNullable<RecorderState["kept"]>): string {
 /** Where the stopped recording went in Intelligence: the person's own Learning space, or why Learning will not see it. */
 function destinationLines(state: RecorderState): string[] {
   const { lastStopped, learning } = state;
-  if (!lastStopped) return [];
+  if (!lastStopped || lastStopped.discarded) return [];
   // Into the person's space whenever the capture pass joined it, checked or not.
   const space = !learning
     ? null
@@ -201,10 +210,12 @@ function destinationLines(state: RecorderState): string[] {
 /** Which of the after-Stop rows show: sent (Intelligence has all of the last stopped recording) or still sending. */
 function afterStopRows(state: RecorderState, connected: boolean) {
   const keptRecordings = state.kept?.recordings ?? 0;
+  // One the person discarded from the recording mark was not sent: the popup says nothing of it.
+  const saved = state.lastStopped !== undefined && !state.lastStopped.discarded;
   return {
     keptRecordings,
     streaming: connected && state.draining > keptRecordings,
-    sent: connected && state.lastStopped !== undefined && state.draining === 0,
+    sent: connected && saved && state.draining === 0,
   };
 }
 
@@ -215,7 +226,12 @@ export function afterStopLearningSentence(
   connected: boolean,
 ): string | null {
   const { sent, streaming } = afterStopRows(state, connected);
-  if (!(sent || streaming) || !state.lastStopped || !state.learning)
+  if (
+    !(sent || streaming) ||
+    !state.lastStopped ||
+    state.lastStopped.discarded ||
+    !state.learning
+  )
     return null;
   return learningSentence(state.learning);
 }
@@ -227,10 +243,12 @@ export function afterStopLearningSentence(
 export function AfterStop({
   state,
   connected,
+  openbotUrl,
   onDiscard,
 }: {
   state: RecorderState;
   connected: boolean;
+  openbotUrl?: string;
   onDiscard: () => void;
 }) {
   const [asking, setAsking] = useState(false);
@@ -252,7 +270,9 @@ export function AfterStop({
             </ItemMedia>
             <ItemContent>
               <ItemTitle>
-                {sent ? "Sent to Intelligence" : "Sending to Intelligence"}
+                {sent
+                  ? "Sent to OpenBot's backend"
+                  : "Sending to OpenBot's backend"}
               </ItemTitle>
               {sent ? null : (
                 <ItemDescription className="line-clamp-none">
@@ -265,6 +285,16 @@ export function AfterStop({
                   {line}
                 </ItemDescription>
               ))}
+              {sent && openbotUrl ? (
+                <a
+                  href={teachABotUrl(openbotUrl)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sm underline"
+                >
+                  See it on Teach a Bot
+                </a>
+              ) : null}
             </ItemContent>
           </Item>
         ) : null}
@@ -305,7 +335,7 @@ export function AfterStop({
             <DialogTitle>Discard kept events?</DialogTitle>
           </DialogHeader>
           <DialogBody className="mt-4 text-sm">
-            Intelligence will never receive them.
+            OpenBot's backend will never receive them.
           </DialogBody>
           <DialogFooter className="mt-4">
             <Button size="sm" variant="ghost" onClick={() => setAsking(false)}>

@@ -15,8 +15,6 @@ FROM oven/bun:1.4.3@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7
 FROM bun-toolchain AS recorder-build
 WORKDIR /src
 COPY package.json bun.lock ./
-# The dependency patches package.json names in patchedDependencies: the install stops without them.
-COPY patches patches
 COPY tsconfig.base.json bunfig.toml ./
 COPY app/package.json app/package.json
 COPY server/package.json server/package.json
@@ -38,6 +36,13 @@ ENV BUN_INSTALL=/usr/local
 ENV PATH="/usr/local/bin:${PATH}"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# Ubuntu's primary mirror can serve a package index that disagrees with its own release file for
+# hours ("File has unexpected size ... Mirror sync in progress?"), and then every build here fails.
+# The Azure mirror is public and kept in step, so apt reads from it unless UBUNTU_MIRROR says
+# otherwise (arm64 reads ports.ubuntu.com, which this leaves alone). Retries cover a dropped download.
+ARG UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+RUN sed -i "s#http://archive.ubuntu.com/ubuntu/\?#${UBUNTU_MIRROR}/#; s#http://security.ubuntu.com/ubuntu/\?#${UBUNTU_MIRROR}/#" /etc/apt/sources.list.d/ubuntu.sources \
+  && printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-retries
 COPY --from=node-toolchain /usr/local /usr/local
 COPY --from=bun-toolchain /usr/local/bin/bun /usr/local/bin/bun
 # `--no-shell`: every launch names a Chromium channel (`browser-runtime.ts`), and Playwright runs
@@ -73,6 +78,12 @@ RUN ln -s /app/node_modules /shared/node_modules
 # still serves Bots and refuses to open a person's browser, saying why.
 COPY --from=recorder-build /src/extension/dist /recorder
 ENV OPENBOT_RECORDER_DIR=/recorder
+
+# The X server's socket directory and the keysym names its keyboard data needs, as the root Dockerfile
+# has them: Xvfb as any user but root refuses to make the first, and xkbcomp warns at every start
+# without the second. See docker/x11/XKeysymDB.
+RUN install -d -m 1777 /tmp/.X11-unix
+COPY docker/x11/XKeysymDB /usr/share/X11/XKeysymDB
 
 # Durable working directory. Bot-produced files that must survive replacement live here.
 RUN mkdir -p /workspace

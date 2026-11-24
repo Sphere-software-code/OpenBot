@@ -1,35 +1,71 @@
 import { CopilotKitContext } from "@copilotkit/react-core/v2/context";
+import { outcomeForPerson } from "@openbot/shared/approval-outcomes";
 import {
   readConnectPrompt,
   SHOW_APP_ACCESS_TOOL,
 } from "@openbot/shared/connect-prompt";
 import { researchRoleOfTool } from "@openbot/shared/research";
 import {
+  readSubagentResult,
+  SUBAGENT_TOOL,
+  type SubagentResult,
+} from "@openbot/shared/subagent";
+import {
+  answersTheModel,
+  connectorName,
+  ownToolAttempt,
+  readToolName,
+} from "@openbot/shared/tool-name";
+import {
   IconFileText,
+  IconFolder,
   IconPlug,
   IconSearch,
+  IconSubtask,
   IconTool,
   IconWorld,
 } from "@tabler/icons-react";
-import { useCallback, useContext, useMemo, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { Streamdown } from "streamdown";
 import { PendingApprovals } from "@/components/approvals/inline-approval";
-import { markdownComponents } from "@/lib/markdown";
+import { codingLook, foreignCodingCall } from "@/lib/copilot/coding-calls";
 import {
-  connectorName,
-  humanise,
-  ownToolLabel,
-  readToolName,
-} from "@/lib/plugins/tool-name";
+  type FolderNames,
+  FolderNamesContext,
+  folderStepBody,
+  folderStepSubject,
+} from "@/lib/folders/folder-steps";
+import { markdownComponents, markdownPlugins } from "@/lib/markdown";
+import {
+  RESEARCH_RESULTS_LABELS,
+  type ResearchSource,
+  readResearchSources,
+} from "@/lib/plugins/research-results";
 import {
   asText,
   forDisplay,
   REFUSAL_MARKER,
+  refusalOf,
   toolResultFailed,
+  UNOFFERED_TOOL_SENTENCE,
+  unofferedTool,
 } from "@/lib/plugins/tool-result";
 import { readTeamBotConsent } from "@/lib/team-bots";
-import { browserStepDetails, isBrowserStep } from "./browser-activity";
+import {
+  awaitingFreshLook,
+  browserStepDetails,
+  isBrowserStep,
+} from "./browser-activity";
 import type { VisibleChatItem } from "./chat-messages";
+import { codingOutcome, lookStep } from "./coding-tool-cards";
+import { ResearchResults } from "./research-results";
+import { SubtaskStep } from "./subtask-step";
 import { ToolLine } from "./tool-line";
 
 type ToolItem = Extract<VisibleChatItem, { kind: "tool" }>;
@@ -50,7 +86,12 @@ export type TranscriptItem = VisibleChatItem | ToolGroup;
  * tool the app has no component for, such as an external agent's `run_command`. A tool the app draws
  * itself, a chart or a request for help, stays where it is, and so does a refusal that asks the
  * person to connect their own account, because a question for the person must never sit behind a
- * disclosure. A single call on its own keeps its own line; one browser step is still a group, as it
+ * disclosure.
+ *
+ * A coding harness's reads and searches fold too, though the app draws them, because Claude Code
+ * folds them: a run of Read, Grep, Glob and plain `ls`, `cat` or `grep` commands is one line saying
+ * "Read 3 files and searched for 2 patterns" (its changelog, 2.1.0 to 2.1.89). Its edits, writes,
+ * other commands and plan keep their own rows, as they do there. A single call on its own keeps its own line; one browser step is still a group, as it
  * always was, so the row does not change shape when the second step arrives.
  *
  * `isDrawn` says which tools the app draws itself; the transcript reads it from `useDrawnTool`.
@@ -76,6 +117,8 @@ export function groupToolSteps(
     run = [];
   };
   for (const item of items) {
+    // Nothing happened, and the Bot looks and goes again: not a step to show (`awaitingFreshLook`).
+    if (item.kind === "tool" && awaitingFreshLook(item)) continue;
     if (item.kind === "tool" && foldable(item, isDrawn)) {
       run.push(item);
       continue;
@@ -121,7 +164,21 @@ export function groupToolSteps(
 function foldable(item: ToolItem, isDrawn: (name: string) => boolean): boolean {
   if (isBrowserStep(item)) return true;
   const name = item.toolCall.function.name;
-  if (!name.startsWith("mcp__") && isDrawn(name)) return false;
+  const args = item.toolCall.function.arguments;
+  if (codingLook(name, args) !== null) return true;
+  /*
+   * A subtask is work, like a search, so it folds into the same line. It used to be drawn as a card
+   * of its own, task and answer and steps, and a Bot that started three of them beside a search put
+   * five boxes between a question and its answer. Its row opens to all of that instead.
+   */
+  if (name === SUBAGENT_TOOL) return true;
+  // Another harness's tool under one of Claude Code's names is not drawn as Claude Code's.
+  if (
+    !name.startsWith("mcp__") &&
+    isDrawn(name) &&
+    !foreignCodingCall(name, args)
+  )
+    return false;
   /*
    * The app-access card is drawn from a server tool's answer, so no renderer registers it and the
    * registry cannot say so. Never folded — not even while its answer is still on the way, or the
@@ -213,7 +270,18 @@ export function dropRepeatedAppCards(
   });
 }
 
-type StepKind = "search" | "fetch" | "browser" | "connector" | "tool";
+type StepKind =
+  | "search"
+  | "fetch"
+  | "browser"
+  | "connector"
+  | "tool"
+  // A coding harness's reads and searches, counted as Claude Code counts them.
+  | "file"
+  | "pattern"
+  | "directory"
+  // Part of the work given to a subagent: a fresh run of the same Bot. See `SubtaskStep`.
+  | "subtask";
 
 export type StepDetails = {
   id: string;
@@ -232,6 +300,21 @@ export type StepDetails = {
   connector?: string;
   inputs: [string, string][];
   output?: string;
+  /** The output is a file, a command's output or a search's matches: drawn as it came, not as markdown. */
+  verbatim?: boolean;
+  /**
+   * The pages a web search found or a page read returned, read out of the provider's answer. When
+   * set, the step opens to these and nothing else: its inputs were the model's (an objective, a
+   * session id) and its output was the provider's JSON.
+   */
+  sources?: ResearchSource[];
+  /** A subtask's own facts, which its row reads to find and draw the steps it took. */
+  subtask?: {
+    toolCallId: string;
+    task?: string;
+    /** Null while it works, after a turn that stopped before it answered, or when it was refused. */
+    result: SubagentResult | null;
+  };
 };
 
 function objectOf(value: string | undefined): Record<string, unknown> {
@@ -279,11 +362,36 @@ function inputValue(value: unknown): string {
   return text.length > 200 ? `${text.slice(0, 199)}…` : text;
 }
 
+/**
+ * The arguments a step lists when it is opened, as a person reads them.
+ *
+ * A folder step's `grantId` is the id OpenBot gave the folder grant ("host-grant-74138-…"), written
+ * for the model; the line already names the file, and Settings > Computer the folder. Listed, an
+ * opened "Save a file" read "grantId  host-grant-74138-1794115092137885000" above the file's path.
+ */
+function readableInputs(
+  name: string,
+  args: Record<string, unknown>,
+): [string, string][] {
+  return Object.entries(args)
+    .filter(([key]) => !(name.startsWith("host_") && key === "grantId"))
+    .map(([key, value]) => [key, inputValue(value)] as [string, string]);
+}
+
 export function stepDetails(step: ToolItem): StepDetails {
+  return detailsOf(step, new Map());
+}
+
+/** `stepDetails`, naming a folder step's folder from the conversation's folder names. */
+export function stepDetailsIn(
+  folders: FolderNames,
+): (step: ToolItem) => StepDetails {
+  return (step) => detailsOf(step, folders);
+}
+
+function detailsOf(step: ToolItem, folders: FolderNames): StepDetails {
   const args = objectOf(step.toolCall.function.arguments);
-  const inputs = Object.entries(args).map(
-    ([key, value]) => [key, inputValue(value)] as [string, string],
-  );
+  const inputs = readableInputs(step.toolCall.function.name, args);
   if (isBrowserStep(step)) {
     const browser = browserStepDetails(step);
     return {
@@ -302,26 +410,65 @@ export function stepDetails(step: ToolItem): StepDetails {
   }
 
   const name = step.toolCall.function.name;
+  if (name === SUBAGENT_TOOL) return subtaskDetails(step, args);
+  const look = codingLook(name, step.toolCall.function.arguments);
+  if (look !== null) {
+    // Running whenever it has no result: whether the turn still is, the step's status says.
+    const outcome = codingOutcome(step.result, true);
+    const { label, detail } = lookStep(name, args, look, outcome);
+    const output = outcome.text.replace(/\s+$/, "");
+    return {
+      id: step.id,
+      kind: look,
+      label,
+      ...(detail ? { detail } : {}),
+      pending: step.result === undefined,
+      failed: outcome.state === "failed",
+      refused: false,
+      pages: 0,
+      inputs: [],
+      ...(output ? { output, verbatim: true } : {}),
+    };
+  }
   const answer = step.result === undefined ? undefined : asText(step.result);
-  const refused = answer?.startsWith(REFUSAL_MARKER) ?? false;
-  const body = refused ? answer?.slice(REFUSAL_MARKER.length).trim() : answer;
-  // This deployment's own tools answer the model, not the person; see `ServerToolLine`.
-  const own = ownToolLabel(name) !== null;
+  // Behind the marker, or a step the person declined on the conversation's card. See `refusalOf`.
+  const reason = refusalOf(answer);
+  const refused = reason !== undefined;
+  // A refusal is said in the person's words, never in the sentence written for the Bot.
+  const body = refused ? outcomeForPerson(reason) : answer;
+  // A tool whose answer is for the model, not the person; see `ServerToolLine`.
+  const own = answersTheModel(name);
+  // A tool the Bot was never offered: the runtime's answer lists every tool it has, for the model.
+  const unoffered = unofferedTool(step.result);
   const outcome = {
     id: step.id,
     pending: step.result === undefined,
-    failed: !refused && toolResultFailed(step.result),
+    failed: !refused && (unoffered || toolResultFailed(step.result)),
     refused,
-    inputs,
-    ...(body && !own ? { output: body } : {}),
+    // Neither what it was given nor what it said: both were for the model (a tool search's query
+    // and limit), so the line says what it did and does not open.
+    inputs: own ? [] : inputs,
+    ...(body && !own && folderStepBody(name, body)
+      ? {
+          output: unoffered
+            ? UNOFFERED_TOOL_SENTENCE
+            : (folderStepBody(name, body) ?? ""),
+        }
+      : {}),
   };
+  // A folder step names its file and folder ("todo.txt in share"), never a grant id.
+  const folderSubject = folderStepSubject(name, args, folders);
   // Not a connector: one of this deployment's own tools, or one an external agent runs itself.
   // Named in words, never as an identifier.
   if (!name.startsWith("mcp__"))
     return {
       ...outcome,
       kind: "tool",
-      label: ownToolLabel(name, outcome.pending) ?? humanise(name),
+      // Beside "Blocked", what was tried: "Save a file", not "Saved a file", which did not happen.
+      label:
+        (refused ? ownToolAttempt(name) : null) ??
+        readToolName(name, outcome.pending).label,
+      ...(folderSubject ? { detail: folderSubject } : {}),
       pages: 0,
     };
 
@@ -329,7 +476,11 @@ export function stepDetails(step: ToolItem): StepDetails {
   const role = researchRoleOfTool(server, rest.join("__"));
   const { label, detail } = readToolName(name);
   const urls = role === "fetch" ? urlsOf(args) : [];
-  const base = { ...outcome, label };
+  const sources =
+    role && !outcome.failed && !refused && body
+      ? readResearchSources(body)
+      : null;
+  const base = { ...outcome, label, ...(sources ? { sources } : {}) };
   if (role === "search") {
     const query = firstString(
       args.query,
@@ -370,6 +521,55 @@ export function stepDetails(step: ToolItem): StepDetails {
   };
 }
 
+/**
+ * A subtask as a step: what it was asked to do, and how it ended.
+ *
+ * Stopping before an action that needs approval is not a failure. Nothing was done, and the Bot that
+ * started it does that action itself, in the conversation, where the person is asked. So the row
+ * says it was handed back and nothing more urgent: the approval card, when there is one, is the
+ * Bot's own, further down.
+ */
+function subtaskDetails(
+  step: ToolItem,
+  args: Record<string, unknown>,
+): StepDetails {
+  const task =
+    typeof args.task === "string" && args.task.trim()
+      ? args.task.trim()
+      : undefined;
+  const answer = step.result === undefined ? undefined : asText(step.result);
+  const refused = answer?.startsWith(REFUSAL_MARKER) ?? false;
+  const result =
+    answer === undefined || refused ? null : readSubagentResult(answer);
+  const output = refused
+    ? answer?.slice(REFUSAL_MARKER.length).trim()
+    : result && "answer" in result
+      ? result.answer
+      : result && "error" in result
+        ? result.error
+        : undefined;
+  return {
+    id: step.id,
+    kind: "subtask",
+    label: "Subtask",
+    ...(task ? { detail: task } : {}),
+    pending: answer === undefined,
+    failed:
+      !refused &&
+      answer !== undefined &&
+      (result === null || "error" in result),
+    refused,
+    pages: 0,
+    inputs: [],
+    ...(output ? { output } : {}),
+    subtask: {
+      toolCallId: step.toolCall.id,
+      ...(task ? { task } : {}),
+      result,
+    },
+  };
+}
+
 function joinPhrases(phrases: string[]): string {
   if (phrases.length <= 1) return phrases[0] ?? "";
   return `${phrases.slice(0, -1).join(", ")} and ${phrases.at(-1)}`;
@@ -377,6 +577,18 @@ function joinPhrases(phrases: string[]): string {
 
 function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
+}
+
+/** The site a page is on, as people say it: the host without `www.`. Empty when the address is not one. */
+function siteOf(href: string | undefined): string {
+  if (!href) return "";
+  try {
+    const { hostname, protocol } = new URL(href);
+    if (protocol !== "http:" && protocol !== "https:") return "";
+    return hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -389,12 +601,34 @@ function plural(count: number, one: string, many: string): string {
 export function summarise(steps: readonly StepDetails[]): string {
   const of = (kind: StepKind) => steps.filter((step) => step.kind === kind);
   const phrases: string[] = [];
+  // Claude Code's own words for a run of reads and searches.
+  const files = of("file").length;
+  if (files) phrases.push(`read ${plural(files, "file", "files")}`);
+  const patterns = of("pattern").length;
+  if (patterns)
+    phrases.push(`searched for ${plural(patterns, "pattern", "patterns")}`);
+  const directories = of("directory").length;
+  if (directories)
+    phrases.push(`listed ${plural(directories, "directory", "directories")}`);
   if (of("search").length) phrases.push("searched the web");
   const read = of("fetch").reduce((sum, step) => sum + step.pages, 0);
   if (read) phrases.push(`read ${plural(read, "page", "pages")}`);
   const browser = of("browser");
   const browsed = browser.reduce((sum, step) => sum + step.pages, 0);
-  if (browsed) phrases.push(`browsed ${plural(browsed, "page", "pages")}`);
+  // One site is named, as a person would say where they went: "Browsed example.com", "Browsed 3 pages on gov.uk".
+  const sites = [
+    ...new Set(
+      browser.filter((step) => step.pages > 0).map((step) => siteOf(step.href)),
+    ),
+  ];
+  const site = sites.length === 1 ? sites[0] : undefined;
+  if (browsed && site)
+    phrases.push(
+      browsed === 1
+        ? `browsed ${site}`
+        : `browsed ${plural(browsed, "page", "pages")} on ${site}`,
+    );
+  else if (browsed) phrases.push(`browsed ${plural(browsed, "page", "pages")}`);
   else if (browser.length) phrases.push("used the browser");
   const connectors = [
     ...new Set(of("connector").map((step) => step.connector ?? "")),
@@ -404,6 +638,9 @@ export function summarise(steps: readonly StepDetails[]): string {
     phrases.push(
       `used ${plural(connectors.length, "connector", "connectors")}`,
     );
+  const subtasks = of("subtask").length;
+  if (subtasks)
+    phrases.push(subtasks === 1 ? "ran a subtask" : `ran ${subtasks} subtasks`);
   const tools = of("tool").length;
   if (tools) phrases.push(`used ${plural(tools, "tool", "tools")}`);
   const sentence = joinPhrases(phrases);
@@ -416,9 +653,13 @@ const KIND_ICONS = {
   browser: IconWorld,
   connector: IconPlug,
   tool: IconTool,
+  file: IconFileText,
+  pattern: IconSearch,
+  directory: IconFolder,
+  subtask: IconSubtask,
 } as const;
 
-function StepIcon({
+export function StepIcon({
   kind,
   size = "size-4",
 }: {
@@ -453,7 +694,13 @@ function IconStack({ kinds }: { kinds: StepKind[] }) {
   );
 }
 
-function StepStatus({ step, active }: { step: StepDetails; active: boolean }) {
+export function StepStatus({
+  step,
+  active,
+}: {
+  step: StepDetails;
+  active: boolean;
+}) {
   if (step.pending)
     return (
       <span className="shrink-0 text-muted-foreground">
@@ -471,11 +718,28 @@ function StepStatus({ step, active }: { step: StepDetails; active: boolean }) {
   return null;
 }
 
-function StepRow({ step, active }: { step: StepDetails; active: boolean }) {
+/** One step, as a folded line opens to it. Also how a subtask's card lists the steps it took. */
+export function StepRow({
+  step,
+  active,
+}: {
+  step: StepDetails;
+  active: boolean;
+}) {
+  if (step.kind === "subtask")
+    return <SubtaskStep active={active} step={step} />;
+  /*
+   * The step still working shimmers, as the group's own line does while it runs. "In progress" in
+   * muted text beside a label drawn exactly like the finished steps above it read as one more static
+   * row: a person watching four "Fetch emails" lines and a fifth with no result took the Bot for dead.
+   */
+  const running = active && step.pending;
   const line = (
     <span className="flex min-w-0 items-center gap-2">
       <StepIcon kind={step.kind} />
-      <span className="shrink-0">{step.label}</span>
+      <span className={running ? "shrink-0 tool-line-running" : "shrink-0"}>
+        {step.label}
+      </span>
       {step.href ? (
         <a
           href={step.href}
@@ -519,26 +783,88 @@ function StepRow({ step, active }: { step: StepDetails; active: boolean }) {
           {line}
         </summary>
         <div className="mt-1.5 space-y-2 pl-5">
-          {step.inputs.length ? (
-            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
+          {step.sources ? (
+            <ResearchResults
+              label={
+                RESEARCH_RESULTS_LABELS[
+                  step.kind === "search" ? "search" : "fetch"
+                ]
+              }
+              sources={step.sources}
+            />
+          ) : null}
+          {step.inputs.length && !step.sources ? (
+            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-muted-foreground">
               {step.inputs.map(([key, value]) => (
                 <div className="contents" key={key}>
-                  <dt className="text-muted-foreground">{key}</dt>
-                  <dd className="min-w-0 break-words">{value}</dd>
+                  <dt>{key}</dt>
+                  <dd className="min-w-0 break-words text-foreground/80">
+                    {value}
+                  </dd>
                 </div>
               ))}
             </dl>
           ) : null}
-          {step.output ? (
-            <div className="max-h-60 overflow-auto border-l pl-3 [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_h4]:text-xs [&_h1]:font-medium [&_h2]:font-medium [&_h3]:font-medium">
-              <Streamdown components={markdownComponents}>
-                {forDisplay(step.output)}
-              </Streamdown>
-            </div>
+          {step.output && !step.sources ? (
+            <StepOutput output={step.output} verbatim={step.verbatim} />
           ) : null}
         </div>
       </details>
     </li>
+  );
+}
+
+/**
+ * What a step got back, in a soft box cut to a few lines and faded at the foot, with Show all to
+ * read the rest. Not a scrolling box: inside the group's own list, a second scrollbar beside the
+ * first was the hardest thing on the screen to read past.
+ */
+export function StepOutput({
+  output,
+  verbatim,
+}: {
+  output: string;
+  verbatim?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [long, setLong] = useState(false);
+  const measure = useCallback((element: HTMLDivElement | null) => {
+    if (element) setLong(element.scrollHeight > element.clientHeight + 1);
+  }, []);
+  return (
+    <div className="rounded-md bg-muted/50 px-3 py-2">
+      <div
+        className={`relative ${open ? "" : "max-h-40 overflow-hidden"}`}
+        ref={measure}
+      >
+        {verbatim ? (
+          <pre className="font-mono whitespace-pre-wrap break-words">
+            {output}
+          </pre>
+        ) : (
+          <div className="[&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_h4]:text-xs [&_h1]:font-medium [&_h2]:font-medium [&_h3]:font-medium">
+            <Streamdown
+              components={markdownComponents}
+              plugins={markdownPlugins}
+            >
+              {forDisplay(output)}
+            </Streamdown>
+          </div>
+        )}
+        {long && !open ? (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-muted to-transparent" />
+        ) : null}
+      </div>
+      {long ? (
+        <button
+          className="mt-1 text-muted-foreground hover:text-foreground"
+          onClick={() => setOpen(!open)}
+          type="button"
+        >
+          {open ? "Show less" : "Show all"}
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -550,17 +876,30 @@ export function ToolActivity({
   /** This is the newest row of a turn still in flight, so a step without a result is running. */
   active: boolean;
 }) {
-  const steps = group.steps.map(stepDetails);
+  const folders = useContext(FolderNamesContext);
+  const steps = group.steps.map(stepDetailsIn(folders));
   const running = active && steps.some((step) => step.pending);
   const current = steps.find((step) => step.pending);
+  const working = steps.filter(
+    (step) => step.pending && step.kind === "subtask",
+  ).length;
   const issues = steps.filter((step) => step.failed || step.refused).length;
   const kinds = [...new Set(steps.map((step) => step.kind))];
   // The folded line draws its own steps, so a waiting approval gets its card beside it, not inside.
   return (
     <>
       <ToolLine
+        bare
         icon={<IconStack kinds={kinds} />}
-        label={running && current ? `${current.label}…` : summarise(steps)}
+        label={
+          running && working
+            ? working === 1
+              ? "Working on a subtask…"
+              : `Working on ${working} subtasks…`
+            : running && current
+              ? `${current.label}…`
+              : summarise(steps)
+        }
         detail={issues ? plural(issues, "issue", "issues") : undefined}
         running={running}
       >

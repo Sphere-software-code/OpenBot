@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { readToolName } from "../src/lib/plugins/tool-name";
+import {
+  answersTheModel,
+  approvalWords,
+  readToolName,
+} from "@openbot/shared/tool-name";
 
 /**
  * What the person watching is told a Bot just did.
@@ -8,6 +12,14 @@ import { readToolName } from "../src/lib/plugins/tool-name";
  * that exists to keep two vendors' `search` apart. A reader should never see either.
  */
 describe("naming a tool call", () => {
+  test("a Claude Agent SDK Bot looking for a tool says so, as any Bot's tool search does", () => {
+    for (const name of ["search_tools", "ToolSearch"]) {
+      expect(readToolName(name)).toEqual({ label: "Looked for a tool" });
+      expect(readToolName(name, true)).toEqual({ label: "Looking for a tool" });
+      expect(answersTheModel(name)).toBe(true);
+    }
+  });
+
   test("a research call says what it did and not which provider did it", () => {
     for (const name of [
       "mcp__exa__web_search_exa",
@@ -24,15 +36,27 @@ describe("naming a tool call", () => {
       label: "Read web pages",
     });
     // Only the research pair is relabelled; a provider's other tools keep their own names.
-    expect(readToolName("mcp__firecrawl__firecrawl_map").label).toBe(
-      "Firecrawl map",
-    );
+    expect(readToolName("mcp__firecrawl__firecrawl_map")).toEqual({
+      label: "Map",
+      detail: "Firecrawl",
+    });
   });
 
   test("an MCP tool reads as an action against a named server", () => {
     expect(readToolName("mcp__slack__post_message")).toEqual({
       label: "Post message",
       detail: "slack",
+    });
+  });
+
+  test("a vendor that leads its tools with its own name is named once, as the app", () => {
+    expect(readToolName("mcp__notion__notion-fetch")).toEqual({
+      label: "Fetch",
+      detail: "Notion",
+    });
+    expect(readToolName("mcp__google-drive__google_drive_search")).toEqual({
+      label: "Search",
+      detail: "Google Drive",
     });
   });
 
@@ -49,6 +73,16 @@ describe("naming a tool call", () => {
     // routines".
     expect(readToolName("mcp__routines__create_routine")).toEqual({
       label: "Create routine",
+    });
+  });
+
+  test("a goal's tools on the Routines app read as a goal's run reads them", () => {
+    // Asked for a goal in a conversation, the step read "Create goal" beside "routines".
+    expect(readToolName("mcp__routines__create_goal")).toEqual({
+      label: "Created a goal",
+    });
+    expect(readToolName("mcp__routines__list_goals", true)).toEqual({
+      label: "Checking goals",
     });
   });
 
@@ -99,9 +133,14 @@ describe("naming a tool call", () => {
     });
   });
 
-  test("a component the app registered is left alone", () => {
-    // These names were chosen by somebody and are already what the reader should see.
-    expect(readToolName("showBarChart")).toEqual({ label: "showBarChart" });
+  test("a name outside MCP and the label table still reads in words", () => {
+    // A component's line is drawn before its renderer may have loaded, and a model can call a name
+    // it was never offered. Either way the line says it in words, from the first frame.
+    expect(readToolName("showBarChart")).toEqual({ label: "Show bar chart" });
+    expect(readToolName("web_search", true)).toEqual({ label: "Web search" });
+    expect(readToolName("web_search")).toEqual({ label: "Web search" });
+    expect(readToolName("", true)).toEqual({ label: "Using a tool" });
+    expect(readToolName("__")).toEqual({ label: "Used a tool" });
   });
 
   test("the server is dropped when a hyphenated server's words are already in the label", () => {
@@ -160,7 +199,53 @@ describe("this deployment's own tools", () => {
     });
   });
 
-  test("any other bare name is left exactly as it is", () => {
-    expect(readToolName("run_command", true)).toEqual({ label: "run_command" });
+  test("any other bare name reads in words, never as its identifier", () => {
+    expect(readToolName("run_command", true)).toEqual({ label: "Run command" });
+  });
+});
+
+/**
+ * What an approval says it waits on, from the `toolRef` and `scope` the server asks under: an app's
+ * tool as `<app>/<tool>` on the app, a computer action on the site it acts on, a command on the
+ * computer it runs on.
+ */
+describe("naming what an approval asks to do", () => {
+  test("an app's tool reads as the action in words, on the app by its name", () => {
+    expect(
+      approvalWords({ toolRef: "requests/get_request", scope: "requests" }),
+    ).toEqual({ action: "get request", place: "Requests" });
+    expect(
+      approvalWords({
+        toolRef: "google-drive/createFile",
+        scope: "google-drive",
+      }),
+    ).toEqual({ action: "create file", place: "Google Drive" });
+  });
+
+  test("a brokered app is named as the app, and its action without the app's prefix", () => {
+    expect(
+      approvalWords({
+        toolRef: "composio-gmail/GMAIL_SEND_EMAIL",
+        scope: "composio-gmail",
+      }),
+    ).toEqual({ action: "send email", place: "Gmail" });
+    expect(
+      approvalWords({
+        toolRef: "arcade-Slack/SendMessage",
+        scope: "arcade-Slack",
+      }),
+    ).toEqual({ action: "send message", place: "Slack" });
+  });
+
+  test("a computer action keeps its words, and a file or a command reads as its step does", () => {
+    expect(
+      approvalWords({ toolRef: "computer_click", scope: "example.com" }),
+    ).toEqual({ action: "click", place: "example.com" });
+    expect(
+      approvalWords({ toolRef: "computer_write_file", scope: "workspace" }),
+    ).toEqual({ action: "save a file", place: "workspace" });
+    expect(
+      approvalWords({ toolRef: "host/run_command", scope: "grant-1" }),
+    ).toEqual({ action: "run a command", place: "grant-1" });
   });
 });

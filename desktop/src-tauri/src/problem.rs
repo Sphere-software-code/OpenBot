@@ -17,7 +17,8 @@ use serde::Serialize;
 pub enum Connection {
     Model,
     Intelligence,
-    Organization,
+    /// Not a credential: Install has to run again before Start can, and the window goes back to it.
+    Installation,
 }
 
 /// A failure, in both registers.
@@ -40,6 +41,9 @@ pub struct Problem {
     /// Boxed and flattened: the window reads `leftover_reset` and `leftover_containers`.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub leftover: Option<Box<LeftoverReset>>,
+    /// Only a Windows restart fixes this, so the window offers one instead of Try again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restart_windows: bool,
 }
 
 /// Exactly what one confirmed reset removes: the containers first, then the volumes.
@@ -62,6 +66,7 @@ impl Problem {
             connection: None,
             database_reset: None,
             leftover: None,
+            restart_windows: false,
         }
     }
 
@@ -74,6 +79,7 @@ impl Problem {
             connection: None,
             database_reset: None,
             leftover: None,
+            restart_windows: false,
         }
     }
 
@@ -146,12 +152,37 @@ pub fn said_about(output: &str) -> String {
                 space and try again."
             .into();
     }
+    // A registry that did not answer, while the engine did: the engine is what reports it, so the
+    // "connection refused" in it is the registry's, not the engine's. Podman's Docker API answers a
+    // pull that never started with only the root cause, so a refused registry reads, in full,
+    // "Error response from daemon: connection refused". A response is the engine answering.
+    if lower.contains("failed to resolve reference")
+        || lower.contains("failed to do request")
+        || lower.contains("error pulling")
+        || lower.contains("pinging container registry")
+        || (lower.contains("error response from daemon")
+            && [
+                "dial tcp",
+                "connection refused",
+                "no such host",
+                "i/o timeout",
+                "network is unreachable",
+                "no route to host",
+                "connection reset",
+            ]
+            .iter()
+            .any(|cause| lower.contains(cause)))
+    {
+        return "OpenBot couldn't download the software it needs. Check your internet connection, \
+                proxy or firewall, and try again."
+            .into();
+    }
     if lower.contains("cannot connect")
         || lower.contains("is the docker daemon running")
         || lower.contains("connection refused")
     {
-        return "OpenBot cannot reach the container engine. Start Docker or Podman, wait for it to \
-                finish starting, and try again."
+        return "OpenBot can't reach the software it runs on. If you use Docker Desktop, open it and \
+                wait for it to start. Then try again."
             .into();
     }
     if lower.contains("timeout") || lower.contains("timed out") {
@@ -187,6 +218,28 @@ mod tests {
         assert!(!said.contains("openbot-agent"), "{said}");
     }
 
+    /// Found upgrading a real Desktop with its registry stopped: the engine answered and the
+    /// registry did not, and the window said to start Docker, which was running.
+    #[test]
+    fn a_registry_that_does_not_answer_is_a_download_that_failed_not_a_stopped_engine() {
+        for raw in [
+            r#"{"id":"Image 127.0.0.1:5050/openbot-server@sha256:d6dcee1f","status":"Error","text":"Error","details":"failed to resolve reference \"127.0.0.1:5050/openbot-server@sha256:d6dcee1f\": failed to do request: Head \"http://127.0.0.1:5050/v2/openbot-server/manifests/sha256:d6dcee1f\": dial tcp 127.0.0.1:5050: connect: connection refused"}"#,
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp: lookup ghcr.io: no such host",
+            // Podman, whose answer is only the root cause. See `pull_metrics` for the whole output.
+            "Error response from daemon: connection refused",
+        ] {
+            let said = said_about(raw);
+            assert!(said.contains("couldn't download"), "{said}");
+            assert!(!said.contains("container engine"), "{said}");
+        }
+        // The engine itself not answering still says so.
+        let said = said_about("dial unix /var/run/docker.sock: connect: connection refused");
+        assert!(
+            said.contains("can't reach the software it runs on"),
+            "{said}"
+        );
+    }
+
     #[test]
     fn a_taken_port_says_so_in_words_somebody_can_act_on() {
         let said = said_about("Bind for 0.0.0.0:4202 failed: port is already allocated");
@@ -197,7 +250,10 @@ mod tests {
     fn an_engine_that_is_not_running_says_to_start_it() {
         let said =
             said_about("Cannot connect to the Docker daemon at unix:///var/run/docker.sock.");
-        assert!(said.contains("Start Docker or Podman"), "{said}");
+        assert!(
+            said.contains("can't reach the software it runs on"),
+            "{said}"
+        );
     }
 
     /// Unrecognised output keeps a general sentence. Guessing at somebody's machine is worse than

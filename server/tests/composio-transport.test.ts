@@ -96,6 +96,13 @@ const WHOLE_LISTING = 1000;
 const TRUNCATION_MARKER = "\n\n[truncated]";
 const CAPPED_LENGTH = RESULT_CAP + TRUNCATION_MARKER.length;
 
+/**
+ * What ends a RESULT cut as text: the same cut, saying how to read the rest. A refusal still ends
+ * in {@link TRUNCATION_MARKER}, because there is no rest of a refusal to ask for.
+ */
+const resultMarker = (tool: string, length: number) =>
+  `\n\n[truncated: ${tool} returned ${length} characters and only the first ${RESULT_CAP} are shown. To read the rest, call it again asking for less: fewer results per call, fewer fields, or a narrower search, then page through what is left.]`;
+
 /** The nesting `vendorSentence` reaches through, with whatever the vendor left at the bottom of it. */
 function nested(message: unknown): unknown {
   return { cause: { error: { error: { message } } } };
@@ -293,24 +300,26 @@ describe("what a label means", () => {
   });
 
   test("idempotent is not a read, because deleting is idempotent", () => {
+    // Nor does it say what the action does, so it is unclassified, as Arcade's silence is.
     expect(effectOf(["idempotentHint", "openWorldHint"])).toEqual({
       effect: "write",
       destructive: false,
+      unclassified: true,
     });
   });
 
-  test("no label at all is a write", () => {
+  test("no label at all is an unclassified write, not a destructive one", () => {
     // Measured across five apps and never seen, so this branch guards the future rather than the
-    // present: an app that labels nothing, or a label added later, must land on write.
-    expect(effectOf([])).toEqual({ effect: "write", destructive: false });
-    expect(effectOf(undefined)).toEqual({
+    // present: an app that labels nothing, or a label added later, must land on write. It is
+    // recorded as Arcade's action with no flags is: unclassified, which doesn't always ask.
+    const unlabelled = {
       effect: "write",
       destructive: false,
-    });
-    expect(effectOf(["gmail", "inbox"])).toEqual({
-      effect: "write",
-      destructive: false,
-    });
+      unclassified: true,
+    } as const;
+    expect(effectOf([])).toEqual(unlabelled);
+    expect(effectOf(undefined)).toEqual(unlabelled);
+    expect(effectOf(["gmail", "inbox"])).toEqual(unlabelled);
   });
 
   test("destructive wins over read-only when both are present", () => {
@@ -2195,14 +2204,14 @@ describe("calling one action", () => {
 
     const result = await callTool(
       { url: "composio://gmail", actorId: "user_asker" },
-      "GMAIL_FETCH_EMAILS",
+      "GMAIL_LIST_THREADS",
       { query: "is:unread", __version: "20260903_00" },
     );
 
     expect(calls).toEqual([
       {
         toolkit: "gmail",
-        slug: "GMAIL_FETCH_EMAILS",
+        slug: "GMAIL_LIST_THREADS",
         userId: "user_asker",
         version: "20260903_00",
         args: { query: "is:unread" },
@@ -2260,7 +2269,7 @@ describe("calling one action", () => {
     const args = { query: "is:unread", __version: "20260903_00" };
     await callTool(
       { url: "composio://gmail", actorId: "user_asker" },
-      "GMAIL_FETCH_EMAILS",
+      "GMAIL_LIST_THREADS",
       args,
     );
 
@@ -2371,7 +2380,7 @@ describe("calling one action", () => {
 
     await callTool(
       { url: "composio://gmail", actorId: "user_whose_mailbox_this_is" },
-      "GMAIL_FETCH_EMAILS",
+      "GMAIL_LIST_THREADS",
       { ...spelled, query: "is:unread", __version: "20260903_00" },
     );
 
@@ -2380,7 +2389,7 @@ describe("calling one action", () => {
     expect(calls).toEqual([
       {
         toolkit: "gmail",
-        slug: "GMAIL_FETCH_EMAILS",
+        slug: "GMAIL_LIST_THREADS",
         userId: "user_whose_mailbox_this_is",
         version: "20260903_00",
         args: { ...spelled, query: "is:unread" },
@@ -2605,7 +2614,7 @@ describe("calling one action", () => {
 
     const result = await callTool(
       { url: "composio://gmail", actorId: "user_asker" },
-      "GMAIL_FETCH_EMAILS",
+      "GMAIL_LIST_THREADS",
       { __version: "20260903_00" },
     );
 
@@ -2613,12 +2622,16 @@ describe("calling one action", () => {
     // flag. `truncated: true` beside text that just stops is exactly the silent cut the name
     // promises against: the model reads a JSON document that ends mid-token and completes it from
     // memory, because nothing in what it was handed says the ending is ours.
+    // And the marker says how to get the rest, which "[truncated]" alone never did: a Bot handed
+    // part of an inbox told the person it could not say whether its answer covered it.
+    const marker = resultMarker(
+      "GMAIL_LIST_THREADS",
+      JSON.stringify({ body: "x".repeat(60_000) }, null, 2).length,
+    );
     expect(result.isError).toBe(false);
     expect(result.truncated).toBe(true);
-    expect(result.text.slice(-TRUNCATION_MARKER.length)).toBe(
-      TRUNCATION_MARKER,
-    );
-    expect(result.text.length).toBe(CAPPED_LENGTH);
+    expect(result.text.slice(-marker.length)).toBe(marker);
+    expect(result.text.length).toBe(RESULT_CAP + marker.length);
   });
 
   test("a result or a failure over the cap is cut between characters, not through an emoji", async () => {
@@ -2653,13 +2666,12 @@ describe("calling one action", () => {
 
       const result = await callTool(
         { url: "composio://gmail", actorId: "user_asker" },
-        "GMAIL_FETCH_EMAILS",
+        "GMAIL_LIST_THREADS",
         { __version: "20260903_00" },
       );
 
-      const kept = result.text.endsWith(TRUNCATION_MARKER)
-        ? result.text.slice(0, -TRUNCATION_MARKER.length)
-        : result.text;
+      const at = result.text.lastIndexOf("\n\n[truncated");
+      const kept = at === -1 ? result.text : result.text.slice(0, at);
       const last = kept.charCodeAt(kept.length - 1);
       const lone = last >= 0xd800 && last <= 0xdbff;
       seen.push(
@@ -2733,7 +2745,7 @@ describe("calling one action", () => {
 
     const result = await callTool(
       { url: "composio://gmail", actorId: "user_asker" },
-      "GMAIL_FETCH_EMAILS",
+      "GMAIL_LIST_THREADS",
       { __version: "20260903_00" },
     );
 
@@ -3004,7 +3016,7 @@ describe("calling one action", () => {
 
       const result = await callTool(
         { url: "composio://gmail", actorId: "user_asker" },
-        "GMAIL_FETCH_EMAILS",
+        "GMAIL_LIST_THREADS",
         { __version: "20260903_00" },
       );
 

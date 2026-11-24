@@ -96,6 +96,8 @@ async function oneTurn(
     content: "What page is your browser on?",
   });
   let failure: string | undefined;
+  /** The provider's own words, behind the sentence a person reads. See provider-refusal.ts. */
+  let said: string | undefined;
   await agent
     .runAgent({
       tools: [
@@ -108,6 +110,10 @@ async function oneTurn(
     })
     .catch((error: unknown) => {
       failure = error instanceof Error ? error.message : String(error);
+      said =
+        error instanceof Error && error.cause instanceof Error
+          ? error.cause.message
+          : undefined;
     });
   const last = agent.messages.at(-1);
   return {
@@ -115,6 +121,7 @@ async function oneTurn(
     requests: endpoint.requests,
     answer: last?.role === "assistant" ? last.content : undefined,
     failure,
+    said,
   };
 }
 
@@ -181,7 +188,11 @@ describe("an operator who chose the API", () => {
     expect(turn.requests).toEqual([
       { api: "chat", model: "gpt-5.6-terra", tools: OFFERED },
     ]);
-    expect(turn.failure).toContain(
+    // The person is told in words; the provider's reason stays on the error for the log.
+    expect(turn.failure).toBe(
+      "Your model provider turned down the request. Try again, or ask an admin if it keeps happening.",
+    );
+    expect(turn.said).toContain(
       "Function tools with reasoning_effort are not supported for gpt-5.6-terra",
     );
   });
@@ -204,4 +215,54 @@ test("on OpenAI itself nothing is set: the runtime already calls the Responses A
     ),
   ).toBeUndefined();
   expect(environment.COPILOTKIT_OPENAI_API).toBeUndefined();
+});
+
+describe("the API chosen at boot, before any Bot runs", () => {
+  const GATEWAY = "https://gateway.internal/v1";
+
+  test.each(["gpt-6.1-terra", "gpt-5.6-terra", "openai/gpt-6.1-terra"])(
+    "behind a gateway, %s gets responses, and the environment says so",
+    (defaultModel) => {
+      const environment: Record<string, string | undefined> = {
+        OPENAI_BASE_URL: GATEWAY,
+      };
+      expect(
+        chooseOpenAIApi({ provider: "openai", defaultModel }, environment),
+      ).toBe("responses");
+      expect(environment.COPILOTKIT_OPENAI_API).toBe("responses");
+    },
+  );
+
+  test.each(["chat", "responses", "  chat  ", "something-else"])(
+    "an operator's COPILOTKIT_OPENAI_API=%p is left exactly as written",
+    (value) => {
+      const environment: Record<string, string | undefined> = {
+        OPENAI_BASE_URL: GATEWAY,
+        COPILOTKIT_OPENAI_API: value,
+      };
+      expect(
+        chooseOpenAIApi(
+          { provider: "openai", defaultModel: "gpt-6.1-terra" },
+          environment,
+        ),
+      ).toBeUndefined();
+      expect(environment.COPILOTKIT_OPENAI_API).toBe(value);
+    },
+  );
+
+  test.each([
+    ["a model Chat Completions takes tools on", "openai", "gpt-5.5"],
+    ["an Anthropic model", "anthropic", "claude-sonnet-5"],
+  ] as const)(
+    "behind a gateway, %s is left to the runtime",
+    (_, provider, defaultModel) => {
+      const environment: Record<string, string | undefined> = {
+        OPENAI_BASE_URL: GATEWAY,
+      };
+      expect(
+        chooseOpenAIApi({ provider, defaultModel }, environment),
+      ).toBeUndefined();
+      expect(environment.COPILOTKIT_OPENAI_API).toBeUndefined();
+    },
+  );
 });

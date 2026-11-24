@@ -40,6 +40,7 @@ pub fn is_secret(key: &str) -> bool {
             // Generated here, and no less a credential for it. These are what the services prove
             // themselves to each other with, and what a Bot's computer is driven with.
             | "MANAGED_AGENT_TOKEN"
+            | crate::learning_model::TOKEN
             | "AGENT_TOOL_TOKEN"
             | "COMPUTER_TOKEN"
             | "SUPERVISOR_TOKEN"
@@ -1492,6 +1493,7 @@ mod tests {
             "SERVER_PORT",
             "DATABASE_URL",
             "TRUSTED_ORIGINS",
+            "OPENBOT_PUBLIC_URL",
             "CHATGPT_AUTH_FILE",
         ] {
             assert!(
